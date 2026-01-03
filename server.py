@@ -16,6 +16,8 @@ from datetime import datetime, timezone, timedelta
 import jwt
 import bcrypt
 import json
+import httpx
+from urllib.parse import urlencode
 
 from passlib.context import CryptContext
 
@@ -25,16 +27,46 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+if os.path.exists(ROOT_DIR / ".env"):
+    load_dotenv(ROOT_DIR / ".env")
 
-from passlib.context import CryptContext
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-print(pwd_context.hash("admin123"))
+# Auth0 Config
+AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'probestack-usa-dev.us.auth0.com')
+AUTH0_CLIENT_ID = os.environ.get('AUTH0_CLIENT_ID', '')
+AUTH0_CLIENT_SECRET = os.environ.get('AUTH0_CLIENT_SECRET', '')
+AUTH0_CALLBACK_URI = os.environ.get('AUTH0_CALLBACK_URI', 'https://probestack.io/callback')
+from urllib.parse import quote_plus
 
-# Database connection - SQLite (can be switched to MySQL)
-DATABASE_URL = "mysql+aiomysql://root:@localhost:3306/admin_dashboard"
-engine = create_async_engine(DATABASE_URL, echo=False)
-async_session = async_sessionmaker(engine, expire_on_commit=False)
+DB_USER = os.environ.get("DB_USER")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+DB_NAME = os.environ.get("DB_NAME")
+INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
+
+if not all([DB_USER, DB_PASSWORD, DB_NAME]):
+    raise RuntimeError("Database environment variables not set")
+
+DB_PASSWORD = quote_plus(DB_PASSWORD)
+
+if INSTANCE_CONNECTION_NAME:
+    DATABASE_URL = (
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
+        f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
+    )
+else:
+    DATABASE_URL = (
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
+    )
+
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    echo=False,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    expire_on_commit=False,
+)
 
 # JWT Config
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
@@ -84,6 +116,9 @@ class OrganizationModel(Base):
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True) 
+    supported_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    auth0_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
 class SubscriptionModel(Base):
     __tablename__ = "subscriptions"
@@ -190,15 +225,36 @@ class PlanUpgradeRequestModel(Base):
     current_plan_name: Mapped[str] = mapped_column(String(255), nullable=False)
     requested_plan_id: Mapped[str] = mapped_column(String(100), nullable=False)
     requested_plan_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    requested_tools: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array
-    status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, approved, rejected
-    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Why they want to upgrade
+    requested_tools: Mapped[str] = mapped_column(Text, nullable=False) 
+    status: Mapped[str] = mapped_column(String(50), default="pending")
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    requested_by: Mapped[str] = mapped_column(String(36), nullable=False)  # Admin who requested
+    requested_by: Mapped[str] = mapped_column(String(36), nullable=False)
+
+class Auth0LoginRecordModel(Base):
+    """Model for storing Auth0 login records"""
+    __tablename__ = "auth0_login_records"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    auth0_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  
+    auth0_user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True) 
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    picture: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    access_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    id_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    token_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    expires_in: Mapped[Optional[int]] = mapped_column(nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    login_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ip_address: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 # ==================== PYDANTIC SCHEMAS ====================
 
@@ -253,6 +309,37 @@ class OrganizationUpdate(BaseModel):
     domain: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
+    external_org_id: Optional[str] = None
+    supported_domains: Optional[List[str]] = None
+    auth0_org_id: Optional[str] = None  # Auth0 organization ID
+
+class IdentifyOrgRequest(BaseModel):
+    """Request to identify organization from email"""
+    email: str
+
+class Auth0InitRequest(BaseModel):
+    """Request to initiate Auth0 authentication"""
+    email: str
+    state: Optional[str] = None  # Optional state parameter for CSRF protection
+    
+class Auth0CallbackRequest(BaseModel):
+    """Request to exchange Auth0 code for tokens"""
+    code: str
+    email: Optional[str] = None  # Original email for logging purposes
+
+class PasswordResetRequest(BaseModel):
+    """Request to reset password"""
+    email: str
+
+class PasswordChangeRequest(BaseModel):
+    """Request to change password"""
+    current_password: Optional[str] = None  # Not required for admin reset
+    new_password: str
+
+class AdminPasswordResetRequest(BaseModel):
+    """Request for admin to reset user password"""
+    admin_id: str
+    new_password: str
 
 class PlanCreate(BaseModel):
     name: str
@@ -335,7 +422,7 @@ def require_any_admin(payload: dict = Depends(verify_token)):
     return payload
 
 async def get_db():
-    async with async_session() as session:
+    async with AsyncSessionLocal() as session:
         yield session
 
 # ==================== AUTH ROUTES ====================
@@ -377,6 +464,108 @@ async def get_current_admin(payload: dict = Depends(verify_token), db: AsyncSess
         "organization_name": admin.organization_name,
         "is_active": admin.is_active
     }
+
+# ==================== PASSWORD MANAGEMENT ====================
+
+@api_router.post("/auth/forgot-password", tags=["Authentication"])
+async def forgot_password(data: PasswordResetRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Request password reset. In a production system, this would send an email.
+    For now, it generates a reset token that can be used to reset the password.
+    """
+    result = await db.execute(select(AdminModel).where(AdminModel.email == data.email))
+    admin = result.scalar_one_or_none()
+
+    if not admin:
+        # Don't reveal if email exists or not for security
+        return {"message": "If the email exists, a password reset link will be sent."}
+
+    # Generate a reset token (valid for 1 hour)
+    reset_token = jwt.encode(
+        {
+            "sub": admin.id,
+            "email": admin.email,
+            "type": "password_reset",
+            "exp": datetime.now(timezone.utc).timestamp() + 3600  # 1 hour
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
+
+    # In production, send email with reset link
+    # For now, return the token (for testing purposes)
+    return {
+        "message": "If the email exists, a password reset link will be sent.",
+        "reset_token": reset_token,  # Remove this in production
+        "note": "In production, this token would be sent via email"
+    }
+
+@api_router.post("/auth/reset-password", tags=["Authentication"])
+async def reset_password_with_token(reset_token: str, new_password: str, db: AsyncSession = Depends(get_db)):
+    """
+    Reset password using a reset token (from forgot password flow)
+    """
+    try:
+        payload = jwt.decode(reset_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "password_reset":
+            raise HTTPException(status_code=400, detail="Invalid reset token")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Reset token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+
+    result = await db.execute(select(AdminModel).where(AdminModel.id == payload["sub"]))
+    admin = result.scalar_one_or_none()
+
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+
+    # Update password
+    admin.password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    await db.commit()
+
+    return {"message": "Password has been reset successfully"}
+
+@api_router.post("/auth/change-password", tags=["Authentication"])
+async def change_password(data: PasswordChangeRequest, payload: dict = Depends(verify_token), db: AsyncSession = Depends(get_db)):
+    """
+    Change password for the currently logged in admin (requires current password)
+    """
+    result = await db.execute(select(AdminModel).where(AdminModel.id == payload["sub"]))
+    admin = result.scalar_one_or_none()
+
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+
+    # Verify current password
+    if not data.current_password:
+        raise HTTPException(status_code=400, detail="Current password is required")
+
+    if not bcrypt.checkpw(data.current_password.encode(), admin.password_hash.encode()):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    # Update password
+    admin.password_hash = bcrypt.hashpw(data.new_password.encode(), bcrypt.gensalt()).decode()
+    await db.commit()
+
+    return {"message": "Password changed successfully"}
+
+@api_router.post("/admins/{admin_id}/reset-password", tags=["Admin Management"])
+async def admin_reset_password(admin_id: str, data: PasswordChangeRequest, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """
+    Super Admin can reset password for any admin user
+    """
+    result = await db.execute(select(AdminModel).where(AdminModel.id == admin_id))
+    admin = result.scalar_one_or_none()
+
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+
+    # Update password
+    admin.password_hash = bcrypt.hashpw(data.new_password.encode(), bcrypt.gensalt()).decode()
+    await db.commit()
+
+    return {"message": f"Password reset successfully for {admin.email}"}
 
 # ==================== ADMIN MANAGEMENT (Super Admin Only) ====================
 
@@ -530,7 +719,7 @@ async def get_my_organization(payload: dict = Depends(require_any_admin), db: As
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    return model_to_dict(org, ["requested_tools"])
+    return model_to_dict(org, ["requested_tools", "supported_domains"])
 
 @api_router.get("/my-organization/subscription", tags=["Org Admin"])
 async def get_my_subscription(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -895,7 +1084,7 @@ async def get_my_organization_dashboard(payload: dict = Depends(require_any_admi
     ) or 0
     
     return {
-        "organization": model_to_dict(org, ["requested_tools"]) if org else None,
+        "organization": model_to_dict(org, ["requested_tools", "supported_domains"]) if org else None,
         "subscription": model_to_dict(subscription, ["tools"]) if subscription else None,
         "total_users": user_count or 0,
         "total_roles": role_count or 0,
@@ -1256,7 +1445,7 @@ async def get_dashboard_stats(payload: dict = Depends(require_super_admin), db: 
     total_revenue = await db.scalar(select(func.sum(BillingModel.amount)).where(BillingModel.status == "paid")) or 0
     
     result = await db.execute(select(OrganizationModel).order_by(OrganizationModel.created_at.desc()).limit(5))
-    recent_orgs = [model_to_dict(o, ["requested_tools"]) for o in result.scalars().all()]
+    recent_orgs = [model_to_dict(o, ["requested_tools", "supported_domains"]) for o in result.scalars().all()]
     
     result = await db.execute(select(SubscriptionModel).order_by(SubscriptionModel.created_at.desc()).limit(5))
     recent_subs = [model_to_dict(s, ["tools"]) for s in result.scalars().all()]
@@ -1337,12 +1526,12 @@ async def get_organizations(status: Optional[str] = None, search: Optional[str] 
         query = query.where((OrganizationModel.name.ilike(f"%{search}%")) | (OrganizationModel.email.ilike(f"%{search}%")))
     query = query.order_by(OrganizationModel.created_at.desc())
     result = await db.execute(query)
-    return [model_to_dict(o, ["requested_tools"]) for o in result.scalars().all()]
+    return [model_to_dict(o, ["requested_tools", "supported_domains"]) for o in result.scalars().all()]
 
 @api_router.get("/organizations/pending")
 async def get_pending_organizations(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(OrganizationModel).where(OrganizationModel.status == "pending").order_by(OrganizationModel.created_at.desc()))
-    return [model_to_dict(o, ["requested_tools"]) for o in result.scalars().all()]
+    return [model_to_dict(o, ["requested_tools", "supported_domains"]) for o in result.scalars().all()]
 
 @api_router.get("/organizations/{org_id}")
 async def get_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -1350,7 +1539,7 @@ async def get_organization(org_id: str, payload: dict = Depends(require_super_ad
     org = result.scalar_one_or_none()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
-    return model_to_dict(org, ["requested_tools"])
+    return model_to_dict(org, ["requested_tools", "supported_domains"])
 
 @api_router.post("/organizations")
 async def create_organization(data: OrganizationCreate, db: AsyncSession = Depends(get_db)):
@@ -1368,7 +1557,430 @@ async def create_organization(data: OrganizationCreate, db: AsyncSession = Depen
     )
     db.add(notif)
     await db.commit()
-    return model_to_dict(org, ["requested_tools"])
+    return model_to_dict(org, ["requested_tools", "supported_domains"])
+
+# ==================== PUBLIC API - Organization Identification ====================
+
+@api_router.post("/public/identify-org", tags=["Public API"])
+async def identify_organization(data: IdentifyOrgRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Public API to identify organization from email address.
+    Called by external apps to determine which organization a user belongs to.
+    
+    - Extracts domain from email (e.g., "user@kre.com" -> "@kre.com")
+    - Finds organization with matching supported_domains
+    - Returns external_org_id if found
+    """
+    if not data.email or "@" not in data.email:
+        raise HTTPException(status_code=400, detail="Invalid email format")
+
+    # Extract domain from email (e.g., "user@kre.com" -> "@kre.com")
+    email_domain = "@" + data.email.split("@")[1].lower()
+
+    # Find organization with this domain in supported_domains
+    result = await db.execute(
+        select(OrganizationModel).where(
+            OrganizationModel.status == "approved",
+            OrganizationModel.supported_domains.isnot(None)
+        )
+    )
+    organizations = result.scalars().all()
+
+    for org in organizations:
+        if org.supported_domains:
+            try:
+                supported = json.loads(org.supported_domains)
+                # Check if email domain matches any supported domain (case-insensitive)
+                if any(d.lower() == email_domain for d in supported):
+                    return {
+                        "found": True,
+                        "email": data.email,
+                        "domain": email_domain,
+                        "organization": {
+                            "external_org_id": org.external_org_id,
+                            "name": org.name,
+                            "id": org.id
+                        }
+                    }
+            except json.JSONDecodeError:
+                continue
+
+    # No matching organization found
+    return {
+        "found": False,
+        "email": data.email,
+        "domain": email_domain,
+        "organization": None,
+        "message": "No organization found for this email domain"
+    }
+
+# ==================== PUBLIC API - Auth0 Authentication ====================
+
+@api_router.post("/public/auth/init", tags=["Public API - Auth0"])
+async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Step 1: Initialize Auth0 authentication flow.
+    
+    - Takes user email
+    - Identifies organization from email domain
+    - Returns Auth0 authorize URL with the correct organization parameter
+    
+    The frontend should redirect the user to the returned authorize_url.
+    """
+    if not data.email or "@" not in data.email:
+        raise HTTPException(status_code=400, detail="Invalid email format")
+
+    # Extract domain from email
+    email_domain = "@" + data.email.split("@")[1].lower()
+
+    # Find organization with this domain
+    result = await db.execute(
+        select(OrganizationModel).where(
+            OrganizationModel.status == "approved",
+            OrganizationModel.supported_domains.isnot(None)
+        )
+    )
+    organizations = result.scalars().all()
+
+    found_org = None
+    for org in organizations:
+        if org.supported_domains:
+            try:
+                supported = json.loads(org.supported_domains)
+                if any(d.lower() == email_domain for d in supported):
+                    found_org = org
+                    break
+            except json.JSONDecodeError:
+                continue
+
+    if not found_org:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No organization found for email domain {email_domain}"
+        )
+
+    if not found_org.auth0_org_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Organization {found_org.name} does not have Auth0 organization configured"
+        )
+
+    # Build Auth0 authorize URL
+    auth0_params = {
+        "client_id": AUTH0_CLIENT_ID,
+        "response_type": "code",
+        "scope": "openid profile email",
+        "redirect_uri": AUTH0_CALLBACK_URI,
+        "organization": found_org.auth0_org_id,  # Auth0 org_id like org_SVFows90OrYpzdIs
+    }
+
+    # Add state if provided (for CSRF protection)
+    if data.state:
+        auth0_params["state"] = data.state
+
+    authorize_url = f"https://{AUTH0_DOMAIN}/authorize?{urlencode(auth0_params)}"
+
+    return {
+        "success": True,
+        "authorize_url": authorize_url,
+        "organization": {
+            "id": found_org.id,
+            "name": found_org.name,
+            "external_org_id": found_org.external_org_id,
+            "auth0_org_id": found_org.auth0_org_id
+        },
+        "email": data.email,
+        "domain": email_domain
+    }
+
+@api_router.post("/public/auth/callback", tags=["Public API - Auth0"])
+async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Step 2: Exchange Auth0 authorization code for tokens.
+    
+    - Takes the code from Auth0 callback
+    - Exchanges code for access_token, id_token
+    - Decodes id_token to extract user info
+    - Saves login record to database
+    - Returns tokens to the frontend
+    """
+    if not data.code:
+        raise HTTPException(status_code=400, detail="Authorization code is required")
+
+    # Exchange code for tokens
+    token_url = f"https://{AUTH0_DOMAIN}/oauth/token"
+    token_payload = {
+        "grant_type": "authorization_code",
+        "client_id": AUTH0_CLIENT_ID,
+        "client_secret": AUTH0_CLIENT_SECRET,
+        "code": data.code,
+        "redirect_uri": AUTH0_CALLBACK_URI
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                token_url,
+                json=token_payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30.0
+            )
+
+            if response.status_code != 200:
+                error_detail = response.text
+                try:
+                    error_json = response.json()
+                    error_detail = error_json.get("error_description", error_json.get("error", response.text))
+                except:
+                    pass
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Auth0 token exchange failed: {error_detail}"
+                )
+
+            tokens = response.json()
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to connect to Auth0: {str(e)}"
+            )
+
+    # Extract user info from id_token (JWT)
+    id_token = tokens.get("id_token")
+    user_info = {}
+    auth0_org_id = None
+    auth0_user_id = None
+
+    if id_token:
+        try:
+            # Decode JWT without verification (we trust Auth0)
+            # In production, you should verify the signature
+            decoded = jwt.decode(id_token, options={"verify_signature": False})
+            user_info = {
+                "email": decoded.get("email"),
+                "name": decoded.get("name"),
+                "nickname": decoded.get("nickname"),
+                "picture": decoded.get("picture"),
+                "email_verified": decoded.get("email_verified"),
+            }
+            auth0_org_id = decoded.get("org_id")
+            auth0_user_id = decoded.get("sub")
+        except Exception as e:
+            logging.warning(f"Failed to decode id_token: {e}")
+
+    # Find organization by Auth0 org_id
+    email = user_info.get("email") or data.email
+    org = None
+
+    if auth0_org_id:
+        result = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.auth0_org_id == auth0_org_id
+            )
+        )
+        org = result.scalar_one_or_none()
+
+    # If not found by org_id, try to find by email domain
+    if not org and email and "@" in email:
+        email_domain = "@" + email.split("@")[1].lower()
+        result = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.status == "approved",
+                OrganizationModel.supported_domains.isnot(None)
+            )
+        )
+        organizations = result.scalars().all()
+
+        for o in organizations:
+            if o.supported_domains:
+                try:
+                    supported = json.loads(o.supported_domains)
+                    if any(d.lower() == email_domain for d in supported):
+                        org = o
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+    # Save login record
+    expires_in = tokens.get("expires_in", 86400)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+    login_record = Auth0LoginRecordModel(
+        email=email or "unknown",
+        organization_id=org.id if org else "unknown",
+        organization_name=org.name if org else "Unknown",
+        external_org_id=org.external_org_id if org else auth0_org_id,
+        auth0_org_id=auth0_org_id,
+        auth0_user_id=auth0_user_id,
+        name=user_info.get("name"),
+        picture=user_info.get("picture"),
+        access_token=tokens.get("access_token"),
+        id_token=id_token,
+        token_type=tokens.get("token_type"),
+        expires_in=expires_in,
+        expires_at=expires_at
+    )
+    db.add(login_record)
+    # Extract roles from Auth0 token (custom claim)
+    auth0_roles = []
+    if id_token:
+        try:
+            decoded = jwt.decode(id_token, options={"verify_signature": False})
+            # Auth0 roles are typically in a custom claim like "https://probestack.io/claims/roles"
+            auth0_roles = decoded.get("https://probestack.io/claims/roles", [])
+            if not auth0_roles:
+                # Try other common role claim names
+                auth0_roles = decoded.get("roles", [])
+                if not auth0_roles:
+                    auth0_roles = decoded.get("https://auth0.com/claims/roles", [])
+        except Exception as e:
+            logging.warning(f"Failed to extract roles from id_token: {e}")
+
+    # Sync user to database if organization exists
+    synced_user = None
+    synced_roles = []
+
+    if org and email:
+        # Check if user already exists
+        result = await db.execute(
+            select(UserModel).where(
+                UserModel.email == email,
+                UserModel.organization_id == org.id
+            )
+        )
+        existing_user = result.scalar_one_or_none()
+
+        # Process Auth0 roles - create if not exists
+        for role_name in auth0_roles:
+            if not role_name:
+                continue
+            # Check if role exists in the organization
+            result = await db.execute(
+                select(RoleModel).where(
+                    RoleModel.name == role_name,
+                    RoleModel.organization_id == org.id
+                )
+            )
+            role = result.scalar_one_or_none()
+
+            if not role:
+                # Create new role
+                role = RoleModel(
+                    name=role_name,
+                    organization_id=org.id,
+                    permissions=json.dumps(["read"]),  # Default permissions
+                    description=f"Auto-created from Auth0 role: {role_name}"
+                )
+                db.add(role)
+                await db.flush()
+
+            synced_roles.append({"id": role.id, "name": role.name})
+
+        # Determine the primary role (first role or default)
+        primary_role = synced_roles[0] if synced_roles else None
+
+        if existing_user:
+            # Update existing user
+            existing_user.name = user_info.get("name") or existing_user.name
+            if primary_role:
+                existing_user.role_id = primary_role["id"]
+                existing_user.role_name = primary_role["name"]
+            existing_user.last_login = datetime.now(timezone.utc)
+            synced_user = existing_user
+        else:
+            # Create new user
+            # If no role from Auth0, create/get a default "User" role
+            if not primary_role:
+                result = await db.execute(
+                    select(RoleModel).where(
+                        RoleModel.name == "User",
+                        RoleModel.organization_id == org.id
+                    )
+                )
+                default_role = result.scalar_one_or_none()
+
+                if not default_role:
+                    default_role = RoleModel(
+                        name="User",
+                        organization_id=org.id,
+                        permissions=json.dumps(["read"]),
+                        description="Default user role"
+                    )
+                    db.add(default_role)
+                    await db.flush()
+
+                primary_role = {"id": default_role.id, "name": default_role.name}
+
+            new_user = UserModel(
+                email=email,
+                name=user_info.get("name") or user_info.get("nickname") or email.split("@")[0],
+                organization_id=org.id,
+                organization_name=org.name,
+                role_id=primary_role["id"],
+                role_name=primary_role["name"],
+                status="active",
+                last_login=datetime.now(timezone.utc)
+            )
+            db.add(new_user)
+            synced_user = new_user
+    await db.commit()
+
+    return {
+        "success": True,
+        "access_token": tokens.get("access_token"),
+        "id_token": id_token,
+        "token_type": tokens.get("token_type"),
+        "expires_in": expires_in,
+        "scope": tokens.get("scope"),
+        "user": user_info,
+        "organization": {
+            "id": org.id if org else None,
+            "name": org.name if org else None,
+            "external_org_id": org.external_org_id if org else auth0_org_id
+        },
+        "login_record_id": login_record.id,
+        "synced_user": {
+            "id": synced_user.id if synced_user else None,
+            "email": synced_user.email if synced_user else None,
+            "name": synced_user.name if synced_user else None,
+            "role": synced_user.role_name if synced_user else None
+        } if synced_user else None,
+        "synced_roles": synced_roles,
+        "auth0_roles": auth0_roles
+    }
+
+@api_router.get("/auth0-logins", tags=["Admin - Auth0"])
+async def get_auth0_logins(
+    organization_id: Optional[str] = None,
+    limit: int = 100,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get Auth0 login records (Super Admin only)"""
+    query = select(Auth0LoginRecordModel).order_by(Auth0LoginRecordModel.login_at.desc())
+
+    if organization_id:
+        query = query.where(Auth0LoginRecordModel.organization_id == organization_id)
+
+    query = query.limit(limit)
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    return [
+        {
+            "id": r.id,
+            "email": r.email,
+            "organization_id": r.organization_id,
+            "organization_name": r.organization_name,
+            "external_org_id": r.external_org_id,
+            "auth0_org_id": r.auth0_org_id,
+            "auth0_user_id": r.auth0_user_id,
+            "name": r.name,
+            "login_at": r.login_at.isoformat() if r.login_at else None,
+            "expires_at": r.expires_at.isoformat() if r.expires_at else None
+        }
+        for r in records
+    ]
 
 @api_router.put("/organizations/{org_id}")
 async def update_organization(org_id: str, data: OrganizationUpdate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -1378,6 +1990,18 @@ async def update_organization(org_id: str, data: OrganizationUpdate, payload: di
         raise HTTPException(status_code=404, detail="Organization not found")
     
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    if 'supported_domains' in update_data and isinstance(update_data['supported_domains'], list):
+        update_data['supported_domains'] = json.dumps(update_data['supported_domains'])
+
+    if 'external_org_id' in update_data and update_data['external_org_id']:
+        existing = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.external_org_id == update_data['external_org_id'],
+                OrganizationModel.id != org_id
+            )
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="External Org ID already in use by another organization")
     for key, value in update_data.items():
         setattr(org, key, value)
     org.updated_at = datetime.now(timezone.utc)
@@ -2442,10 +3066,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+#@app.on_event("startup")
+#async def startup():
+#    async with engine.begin() as conn:
+#        await conn.run_sync(Base.metadata.create_all)
 
 @app.on_event("shutdown")
 async def shutdown():
