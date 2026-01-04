@@ -11,8 +11,8 @@ env:
   GKE_CLUSTER: 'probestack-nonprod' # TODO: update to your cluster name
   GKE_ZONE: 'us-central1-a' # TODO: update to your cluster zone
   DEPLOYMENT_NAME: 'ps-admin-be' # TODO: update to your deployment name
-  REPOSITORY: 'samples' # TODO: update to your Artifact Registry docker repository name
-  IMAGE: 'static-site'
+  REPOSITORY: 'ps-admin-be' # TODO: update to your Artifact Registry docker repository name
+  IMAGE: 'ps-admin-be'
   WORKLOAD_IDENTITY_PROVIDER: 'projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider' # TODO: update to your workload identity provider
 
 jobs:
