@@ -1,0 +1,3065 @@
+{
+	"info": {
+		"_postman_id": "2a9c5eaf-cb38-4599-9e2e-d716bb4170d2",
+		"name": "ProbeStack Admin Dashboard API Copy 2",
+		"description": "Complete API collection for ProbeStack Admin Dashboard including Authentication, Organization Management, User Management, Auth0 Integration, and more.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "12286160"
+	},
+	"item": [
+		{
+			"name": "🔓 Public APIs",
+			"item": [
+				{
+					"name": "Authentication",
+					"item": [
+						{
+							"name": "Login",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"superadmin@probestack.io\",\n  \"password\": \"admin123\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/auth/login",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"auth",
+										"login"
+									]
+								},
+								"description": "Login to get JWT token. Use this token for authenticated endpoints."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"email\": \"superadmin@probestack.io\",\n  \"password\": \"admin123\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/auth/login",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"auth",
+												"login"
+											]
+										},
+										"description": "Login to get JWT token. Use this token for authenticated endpoints."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\",\n  \"admin\": {\n    \"id\": \"admin_super_1\",\n    \"email\": \"superadmin@probestack.io\",\n    \"name\": \"Super Admin\",\n    \"role\": \"super_admin\",\n    \"organization_id\": null,\n    \"organization_name\": null\n  }\n}"
+								}
+							]
+						},
+						{
+							"name": "Forgot Password",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"admin@example.com\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/auth/forgot-password",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"auth",
+										"forgot-password"
+									]
+								},
+								"description": "Request password reset token. In production, token is sent via email."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"email\": \"admin@example.com\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/auth/forgot-password",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"auth",
+												"forgot-password"
+											]
+										},
+										"description": "Request password reset token. In production, token is sent via email."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"message\": \"If the email exists, a password reset link will be sent.\",\n  \"reset_token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\",\n  \"note\": \"In production, this token would be sent via email\"\n}"
+								}
+							]
+						},
+						{
+							"name": "Reset Password with Token",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/auth/reset-password?reset_token=YOUR_RESET_TOKEN&new_password=newpassword123",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"auth",
+										"reset-password"
+									],
+									"query": [
+										{
+											"key": "reset_token",
+											"value": "YOUR_RESET_TOKEN"
+										},
+										{
+											"key": "new_password",
+											"value": "newpassword123"
+										}
+									]
+								},
+								"description": "Reset password using the token from forgot password."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [],
+										"url": {
+											"raw": "{{baseUrl}}/auth/reset-password?reset_token=YOUR_RESET_TOKEN&new_password=newpassword123",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"auth",
+												"reset-password"
+											],
+											"query": [
+												{
+													"key": "reset_token",
+													"value": "YOUR_RESET_TOKEN"
+												},
+												{
+													"key": "new_password",
+													"value": "newpassword123"
+												}
+											]
+										},
+										"description": "Reset password using the token from forgot password."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"message\": \"Password has been reset successfully\"\n}"
+								}
+							]
+						},
+						{
+							"name": "Check Setup Status",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/auth/check-setup",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"auth",
+										"check-setup"
+									]
+								},
+								"description": "Check if the system has been set up with initial admin."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Organization Requests",
+					"item": [
+						{
+							"name": "Create Organization Request",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"name\": \"Acme Corporation\",\n  \"email\": \"admin@acme.com\",\n  \"domain\": \"acme.com\",\n  \"requested_plan\": \"plan_api_pro\",\n  \"requested_tools\": [\"api_platform\"],\n  \"contact_person\": \"John Doe\",\n  \"phone\": \"+1-555-1234\",\n  \"address\": \"123 Main St, San Francisco, CA\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/organizations",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations"
+									]
+								},
+								"description": "Submit a new organization subscription request. Status will be 'pending' until approved by Super Admin."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"name\": \"Acme Corporation\",\n  \"email\": \"admin@acme.com\",\n  \"domain\": \"acme.com\",\n  \"requested_plan\": \"plan_api_pro\",\n  \"requested_tools\": [\"api_platform\"],\n  \"contact_person\": \"John Doe\",\n  \"phone\": \"+1-555-1234\",\n  \"address\": \"123 Main St, San Francisco, CA\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/organizations",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"organizations"
+											]
+										},
+										"description": "Submit a new organization subscription request. Status will be 'pending' until approved by Super Admin."
+									},
+									"status": "Created",
+									"code": 201,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"id\": \"534b7555-d991-405f-928e-925c6b0d5b1e\",\n  \"name\": \"Acme Corporation\",\n  \"email\": \"admin@acme.com\",\n  \"domain\": \"acme.com\",\n  \"status\": \"pending\",\n  \"requested_plan\": \"plan_api_pro\",\n  \"requested_tools\": [\"api_platform\"],\n  \"contact_person\": \"John Doe\",\n  \"phone\": \"+1-555-1234\",\n  \"address\": \"123 Main St, San Francisco, CA\",\n  \"created_at\": \"2025-12-29T21:03:32.455203+00:00\",\n  \"external_org_id\": null,\n  \"supported_domains\": null,\n  \"auth0_org_id\": null\n}"
+								}
+							]
+						},
+						{
+							"name": "Check Organization Request Status",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/public/organizations/status/:request_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"organizations",
+										"status",
+										":request_id"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "534b7555-d991-405f-928e-925c6b0d5b1e"
+										}
+									]
+								},
+								"description": "Check the status of an organization request."
+							},
+							"response": []
+						},
+						{
+							"name": "Get Organization Roles (Public)",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/public/organizations/:org_id/roles",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"organizations",
+										":org_id",
+										"roles"
+									],
+									"variable": [
+										{
+											"key": "org_id",
+											"value": "org_1"
+										}
+									]
+								},
+								"description": "Get available roles for an organization (for user request form)."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Individual User Requests",
+					"item": [
+						{
+							"name": "Create Individual User Request",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"john.doe@gmail.com\",\n  \"name\": \"John Doe\",\n  \"requested_tools\": [\"api_platform\"],\n  \"requested_plan\": \"plan_api_starter\",\n  \"purpose\": \"I want to build personal projects using the API platform\",\n  \"company_name\": \"Freelancer\",\n  \"job_title\": \"Software Developer\",\n  \"phone\": \"+1-555-9999\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/individual-user-requests",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"individual-user-requests"
+									]
+								},
+								"description": "Submit a request for individual user access (users without organization)."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"email\": \"john.doe@gmail.com\",\n  \"name\": \"John Doe\",\n  \"requested_tools\": [\"api_platform\"],\n  \"requested_plan\": \"plan_api_starter\",\n  \"purpose\": \"I want to build personal projects using the API platform\",\n  \"company_name\": \"Freelancer\",\n  \"job_title\": \"Software Developer\",\n  \"phone\": \"+1-555-9999\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/individual-user-requests",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"individual-user-requests"
+											]
+										},
+										"description": "Submit a request for individual user access (users without organization)."
+									},
+									"status": "Created",
+									"code": 201,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"id\": \"758dc10d-e21c-43a3-810a-fa94b4227b0f\",\n  \"email\": \"john.doe@gmail.com\",\n  \"name\": \"John Doe\",\n  \"requested_tools\": [\"api_platform\"],\n  \"requested_plan\": \"plan_api_starter\",\n  \"purpose\": \"I want to build personal projects using the API platform\",\n  \"company_name\": \"Freelancer\",\n  \"job_title\": \"Software Developer\",\n  \"phone\": \"+1-555-9999\",\n  \"status\": \"pending\",\n  \"created_at\": \"2026-01-05T03:14:25.905427\",\n  \"message\": \"Your request has been submitted and is pending approval\"\n}"
+								}
+							]
+						}
+					]
+				},
+				{
+					"name": "User Requests (Join Organization)",
+					"item": [
+						{
+							"name": "Create User Request to Join Org",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"newuser@acme.com\",\n  \"name\": \"Jane Smith\",\n  \"organization_id\": \"org_1\",\n  \"requested_role\": \"Developer\",\n  \"job_title\": \"Senior Developer\",\n  \"department\": \"Engineering\",\n  \"phone\": \"+1-555-8888\",\n  \"notes\": \"Referred by John Doe\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/public/users/request",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"users",
+										"request"
+									]
+								},
+								"description": "Request to join an existing organization as a user."
+							},
+							"response": []
+						},
+						{
+							"name": "Check User Request Status",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/public/users/status/:request_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"users",
+										"status",
+										":request_id"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "request_123"
+										}
+									]
+								},
+								"description": "Check the status of a user request."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Plans",
+					"item": [
+						{
+							"name": "Get All Plans (Public)",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/public/plans",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"plans"
+									]
+								},
+								"description": "Get all available subscription plans."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "GET",
+										"header": [],
+										"url": {
+											"raw": "{{baseUrl}}/public/plans",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"public",
+												"plans"
+											]
+										},
+										"description": "Get all available subscription plans."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "[\n  {\n    \"id\": \"plan_api_starter\",\n    \"name\": \"Starter\",\n    \"tool\": \"api_platform\",\n    \"description\": \"Perfect for small teams\",\n    \"features\": [\"5 APIs\", \"1000 requests/day\", \"Basic analytics\"],\n    \"price_monthly\": 29.0,\n    \"price_yearly\": 290.0,\n    \"is_active\": true\n  },\n  {\n    \"id\": \"plan_api_pro\",\n    \"name\": \"Professional\",\n    \"tool\": \"api_platform\",\n    \"description\": \"For growing teams\",\n    \"features\": [\"25 APIs\", \"10000 requests/day\", \"Advanced analytics\"],\n    \"price_monthly\": 99.0,\n    \"price_yearly\": 990.0,\n    \"is_active\": true\n  }\n]"
+								}
+							]
+						}
+					]
+				},
+				{
+					"name": "Auth0 Integration",
+					"item": [
+						{
+							"name": "Identify Organization from Email",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"user@acme.com\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/public/identify-org",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"identify-org"
+									]
+								},
+								"description": "Identify which organization an email belongs to based on configured domains."
+							},
+							"response": [
+								{
+									"name": "Found",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"email\": \"user@acme.com\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/public/identify-org",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"public",
+												"identify-org"
+											]
+										},
+										"description": "Identify which organization an email belongs to based on configured domains."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"found\": true,\n  \"email\": \"user@acme.com\",\n  \"domain\": \"@acme.com\",\n  \"organization\": {\n    \"external_org_id\": \"ACME\",\n    \"name\": \"Acme Corporation\",\n    \"id\": \"org_1\"\n  }\n}"
+								},
+								{
+									"name": "Not Found",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"email\": \"user@acme.com\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/public/identify-org",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"public",
+												"identify-org"
+											]
+										},
+										"description": "Identify which organization an email belongs to based on configured domains."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"found\": false,\n  \"email\": \"user@unknown.com\",\n  \"domain\": \"@unknown.com\",\n  \"organization\": null,\n  \"message\": \"No organization found for this email domain\"\n}"
+								}
+							]
+						},
+						{
+							"name": "Initialize Auth0 Login",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"user@acme.com\",\n  \"state\": \"optional-csrf-token\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/public/auth/init",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"auth",
+										"init"
+									]
+								},
+								"description": "Initialize Auth0 SSO flow. Returns the Auth0 authorize URL to redirect the user to."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"email\": \"user@acme.com\",\n  \"state\": \"optional-csrf-token\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/public/auth/init",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"public",
+												"auth",
+												"init"
+											]
+										},
+										"description": "Initialize Auth0 SSO flow. Returns the Auth0 authorize URL to redirect the user to."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"success\": true,\n  \"authorize_url\": \"https://probestack-usa-dev.us.auth0.com/authorize?client_id=rV9Ihy7REI9vFE7Uclelwp89wQfg3a4S&response_type=code&scope=openid+profile+email&redirect_uri=https%3A%2F%2Fprobestack.io%2Fcallback&organization=org_SVFows90OrYpzdIs\",\n  \"organization\": {\n    \"id\": \"org_1\",\n    \"name\": \"Acme Corporation\",\n    \"external_org_id\": \"ACME\",\n    \"auth0_org_id\": \"org_SVFows90OrYpzdIs\"\n  },\n  \"email\": \"user@acme.com\",\n  \"domain\": \"@acme.com\"\n}"
+								}
+							]
+						},
+						{
+							"name": "Auth0 Callback - Exchange Code for Tokens",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"code\": \"QkGiWpCyHleM10y7WnwYBWtm6os89QgIqs5pLvoKTmh_S\",\n  \"email\": \"user@acme.com\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/public/auth/callback",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"public",
+										"auth",
+										"callback"
+									]
+								},
+								"description": "Exchange Auth0 authorization code for access tokens. Also syncs user and roles to database."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [
+											{
+												"key": "Content-Type",
+												"value": "application/json"
+											}
+										],
+										"body": {
+											"mode": "raw",
+											"raw": "{\n  \"code\": \"QkGiWpCyHleM10y7WnwYBWtm6os89QgIqs5pLvoKTmh_S\",\n  \"email\": \"user@acme.com\"\n}"
+										},
+										"url": {
+											"raw": "{{baseUrl}}/public/auth/callback",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"public",
+												"auth",
+												"callback"
+											]
+										},
+										"description": "Exchange Auth0 authorization code for access tokens. Also syncs user and roles to database."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"success\": true,\n  \"access_token\": \"eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0...\",\n  \"id_token\": \"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...\",\n  \"token_type\": \"Bearer\",\n  \"expires_in\": 86400,\n  \"scope\": \"openid profile email\",\n  \"user\": {\n    \"email\": \"user@acme.com\",\n    \"name\": \"John Doe\",\n    \"nickname\": \"john\",\n    \"picture\": \"https://s.gravatar.com/avatar/...\",\n    \"email_verified\": true\n  },\n  \"organization\": {\n    \"id\": \"org_1\",\n    \"name\": \"Acme Corporation\",\n    \"external_org_id\": \"ACME\"\n  },\n  \"login_record_id\": \"abc-123\",\n  \"synced_user\": {\n    \"id\": \"user-123\",\n    \"email\": \"user@acme.com\",\n    \"name\": \"John Doe\",\n    \"role\": \"User\"\n  },\n  \"synced_roles\": [{\"id\": \"role-123\", \"name\": \"User\"}],\n  \"auth0_roles\": [\"User\", \"Developer\"]\n}"
+								}
+							]
+						}
+					]
+				},
+				{
+					"name": "Seed Demo Data",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/seed",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"seed"
+							]
+						},
+						"description": "Seed the database with demo data."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "🔐 Authenticated APIs",
+			"item": [
+				{
+					"name": "Current User",
+					"item": [
+						{
+							"name": "Get Current Admin Info",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/auth/me",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"auth",
+										"me"
+									]
+								},
+								"description": "Get information about the currently logged in admin."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "GET",
+										"header": [],
+										"url": {
+											"raw": "{{baseUrl}}/auth/me",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"auth",
+												"me"
+											]
+										},
+										"description": "Get information about the currently logged in admin."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"id\": \"admin_super_1\",\n  \"email\": \"superadmin@probestack.io\",\n  \"name\": \"Super Admin\",\n  \"role\": \"super_admin\",\n  \"organization_id\": null,\n  \"organization_name\": null,\n  \"is_active\": true\n}"
+								}
+							]
+						},
+						{
+							"name": "Change Password",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"current_password\": \"admin123\",\n  \"new_password\": \"newpassword123\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/auth/change-password",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"auth",
+										"change-password"
+									]
+								},
+								"description": "Change password for currently logged in admin."
+							},
+							"response": []
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "👑 Super Admin APIs",
+			"item": [
+				{
+					"name": "Dashboard",
+					"item": [
+						{
+							"name": "Get Dashboard Statistics",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/dashboard/stats",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"dashboard",
+										"stats"
+									]
+								},
+								"description": "Get dashboard statistics including org counts, revenue, etc."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "GET",
+										"header": [],
+										"url": {
+											"raw": "{{baseUrl}}/dashboard/stats",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"dashboard",
+												"stats"
+											]
+										},
+										"description": "Get dashboard statistics including org counts, revenue, etc."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"total_organizations\": 5,\n  \"pending_organizations\": 2,\n  \"approved_organizations\": 3,\n  \"active_subscriptions\": 3,\n  \"total_users\": 10,\n  \"total_revenue\": 995.0,\n  \"recent_organizations\": [],\n  \"recent_subscriptions\": [],\n  \"monthly_revenue\": [{\"month\": \"Dec\", \"revenue\": 995.0}],\n  \"subscription_distribution\": [{\"name\": \"API Platform\", \"value\": 3}]\n}"
+								}
+							]
+						}
+					]
+				},
+				{
+					"name": "Organization Management",
+					"item": [
+						{
+							"name": "List All Organizations",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/organizations?status=all",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations"
+									],
+									"query": [
+										{
+											"key": "status",
+											"value": "all",
+											"description": "Filter: all, pending, approved, rejected"
+										}
+									]
+								},
+								"description": "List all organizations with optional status filter."
+							},
+							"response": []
+						},
+						{
+							"name": "List Pending Organizations",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/organizations/pending",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations",
+										"pending"
+									]
+								},
+								"description": "List organizations pending approval."
+							},
+							"response": []
+						},
+						{
+							"name": "Get Organization Details",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/organizations/:org_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations",
+										":org_id"
+									],
+									"variable": [
+										{
+											"key": "org_id",
+											"value": "org_1"
+										}
+									]
+								},
+								"description": "Get details of a specific organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Update Organization",
+							"request": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"name\": \"Acme Corp Updated\",\n  \"email\": \"contact@acme.com\",\n  \"domain\": \"acme.com\",\n  \"phone\": \"+1-555-0000\",\n  \"address\": \"456 New St\",\n  \"external_org_id\": \"ACME\",\n  \"supported_domains\": [\"@acme.com\", \"@acme.io\"],\n  \"auth0_org_id\": \"org_SVFows90OrYpzdIs\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/organizations/:org_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations",
+										":org_id"
+									],
+									"variable": [
+										{
+											"key": "org_id",
+											"value": "org_1"
+										}
+									]
+								},
+								"description": "Update organization details including Auth0 integration settings."
+							},
+							"response": []
+						},
+						{
+							"name": "Delete Organization",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/organizations/:org_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations",
+										":org_id"
+									],
+									"variable": [
+										{
+											"key": "org_id",
+											"value": "org_1"
+										}
+									]
+								},
+								"description": "Delete an organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Approve Organization",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"admin_email\": \"admin@acme.com\",\n  \"admin_password\": \"admin123\",\n  \"admin_name\": \"Acme Admin\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/organizations/:org_id/approve",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations",
+										":org_id",
+										"approve"
+									],
+									"variable": [
+										{
+											"key": "org_id",
+											"value": "org_1"
+										}
+									]
+								},
+								"description": "Approve organization and create org admin account."
+							},
+							"response": []
+						},
+						{
+							"name": "Reject Organization",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"reason\": \"Incomplete information provided\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/organizations/:org_id/reject",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"organizations",
+										":org_id",
+										"reject"
+									],
+									"variable": [
+										{
+											"key": "org_id",
+											"value": "org_1"
+										}
+									]
+								},
+								"description": "Reject organization request with reason."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Admin Account Management",
+					"item": [
+						{
+							"name": "List All Admins",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/admins",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"admins"
+									]
+								},
+								"description": "List all admin accounts."
+							},
+							"response": []
+						},
+						{
+							"name": "Create Org Admin",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"newadmin@acme.com\",\n  \"password\": \"admin123\",\n  \"name\": \"New Admin\",\n  \"organization_id\": \"org_1\",\n  \"role\": \"org_admin\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/admins",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"admins"
+									]
+								},
+								"description": "Create a new organization admin account."
+							},
+							"response": []
+						},
+						{
+							"name": "Toggle Admin Status",
+							"request": {
+								"method": "PUT",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/admins/:admin_id/toggle-status",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"admins",
+										":admin_id",
+										"toggle-status"
+									],
+									"variable": [
+										{
+											"key": "admin_id",
+											"value": "admin_org_1"
+										}
+									]
+								},
+								"description": "Toggle admin active/inactive status."
+							},
+							"response": []
+						},
+						{
+							"name": "Reset Admin Password",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"new_password\": \"newpassword123\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/admins/:admin_id/reset-password",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"admins",
+										":admin_id",
+										"reset-password"
+									],
+									"variable": [
+										{
+											"key": "admin_id",
+											"value": "admin_org_1"
+										}
+									]
+								},
+								"description": "Reset password for an admin account."
+							},
+							"response": []
+						},
+						{
+							"name": "Delete Admin",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/admins/:admin_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"admins",
+										":admin_id"
+									],
+									"variable": [
+										{
+											"key": "admin_id",
+											"value": "admin_org_1"
+										}
+									]
+								},
+								"description": "Delete an admin account."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Subscription Management",
+					"item": [
+						{
+							"name": "List All Subscriptions",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/subscriptions?status=active",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"subscriptions"
+									],
+									"query": [
+										{
+											"key": "status",
+											"value": "active",
+											"description": "Filter: active, paused, cancelled"
+										}
+									]
+								},
+								"description": "List all subscriptions with optional status filter."
+							},
+							"response": []
+						},
+						{
+							"name": "Get Subscription Details",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/subscriptions/:sub_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"subscriptions",
+										":sub_id"
+									],
+									"variable": [
+										{
+											"key": "sub_id",
+											"value": "sub_1"
+										}
+									]
+								},
+								"description": "Get details of a specific subscription."
+							},
+							"response": []
+						},
+						{
+							"name": "Pause Subscription",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/subscriptions/:sub_id/pause",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"subscriptions",
+										":sub_id",
+										"pause"
+									],
+									"variable": [
+										{
+											"key": "sub_id",
+											"value": "sub_1"
+										}
+									]
+								},
+								"description": "Pause a subscription."
+							},
+							"response": []
+						},
+						{
+							"name": "Resume Subscription",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/subscriptions/:sub_id/resume",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"subscriptions",
+										":sub_id",
+										"resume"
+									],
+									"variable": [
+										{
+											"key": "sub_id",
+											"value": "sub_1"
+										}
+									]
+								},
+								"description": "Resume a paused subscription."
+							},
+							"response": []
+						},
+						{
+							"name": "Cancel Subscription",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/subscriptions/:sub_id/cancel",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"subscriptions",
+										":sub_id",
+										"cancel"
+									],
+									"variable": [
+										{
+											"key": "sub_id",
+											"value": "sub_1"
+										}
+									]
+								},
+								"description": "Cancel a subscription."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Plan Management",
+					"item": [
+						{
+							"name": "List All Plans",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/plans?tool=api_platform",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"plans"
+									],
+									"query": [
+										{
+											"key": "tool",
+											"value": "api_platform",
+											"description": "Filter by tool: api_platform, ai_agentic, migration_tool"
+										}
+									]
+								},
+								"description": "List all plans with optional tool filter."
+							},
+							"response": []
+						},
+						{
+							"name": "Create Plan",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"name\": \"Custom Plan\",\n  \"tool\": \"api_platform\",\n  \"description\": \"Custom plan for special clients\",\n  \"features\": [\"Custom feature 1\", \"Custom feature 2\"],\n  \"price_monthly\": 199.00,\n  \"price_yearly\": 1990.00\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/plans",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"plans"
+									]
+								},
+								"description": "Create a new subscription plan."
+							},
+							"response": []
+						},
+						{
+							"name": "Get Plan Details",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/plans/:plan_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"plans",
+										":plan_id"
+									],
+									"variable": [
+										{
+											"key": "plan_id",
+											"value": "plan_api_pro"
+										}
+									]
+								},
+								"description": "Get details of a specific plan."
+							},
+							"response": []
+						},
+						{
+							"name": "Update Plan",
+							"request": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"name\": \"Professional Plus\",\n  \"description\": \"Updated description\",\n  \"features\": [\"Updated feature 1\", \"Updated feature 2\"],\n  \"price_monthly\": 149.00,\n  \"price_yearly\": 1490.00,\n  \"is_active\": true\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/plans/:plan_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"plans",
+										":plan_id"
+									],
+									"variable": [
+										{
+											"key": "plan_id",
+											"value": "plan_api_pro"
+										}
+									]
+								},
+								"description": "Update an existing plan."
+							},
+							"response": []
+						},
+						{
+							"name": "Delete Plan",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/plans/:plan_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"plans",
+										":plan_id"
+									],
+									"variable": [
+										{
+											"key": "plan_id",
+											"value": "plan_custom"
+										}
+									]
+								},
+								"description": "Delete a plan."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "User Management",
+					"item": [
+						{
+							"name": "List All Users",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/users?organization_id=org_1",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"users"
+									],
+									"query": [
+										{
+											"key": "organization_id",
+											"value": "org_1",
+											"description": "Filter by organization"
+										}
+									]
+								},
+								"description": "List all users with optional org filter."
+							},
+							"response": []
+						},
+						{
+							"name": "Create User",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"newuser@acme.com\",\n  \"name\": \"New User\",\n  \"organization_id\": \"org_1\",\n  \"role_id\": \"role_1\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/users",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"users"
+									]
+								},
+								"description": "Create a new user."
+							},
+							"response": []
+						},
+						{
+							"name": "Get User Details",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/users/:user_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"users",
+										":user_id"
+									],
+									"variable": [
+										{
+											"key": "user_id",
+											"value": "user_1"
+										}
+									]
+								},
+								"description": "Get details of a specific user."
+							},
+							"response": []
+						},
+						{
+							"name": "Update User",
+							"request": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"name\": \"Updated Name\",\n  \"role_id\": \"role_2\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/users/:user_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"users",
+										":user_id"
+									],
+									"variable": [
+										{
+											"key": "user_id",
+											"value": "user_1"
+										}
+									]
+								},
+								"description": "Update a user."
+							},
+							"response": []
+						},
+						{
+							"name": "Update User Status",
+							"request": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"status\": \"inactive\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/users/:user_id/status",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"users",
+										":user_id",
+										"status"
+									],
+									"variable": [
+										{
+											"key": "user_id",
+											"value": "user_1"
+										}
+									]
+								},
+								"description": "Update user status (active/inactive/suspended)."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Role Management",
+					"item": [
+						{
+							"name": "List All Roles",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/roles?organization_id=org_1",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"roles"
+									],
+									"query": [
+										{
+											"key": "organization_id",
+											"value": "org_1"
+										}
+									]
+								},
+								"description": "List all roles with optional org filter."
+							},
+							"response": []
+						},
+						{
+							"name": "Create Role",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"name\": \"Developer\",\n  \"organization_id\": \"org_1\",\n  \"permissions\": [\"read\", \"write\", \"test\"],\n  \"description\": \"Developer role with read/write access\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/roles",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"roles"
+									]
+								},
+								"description": "Create a new role."
+							},
+							"response": []
+						},
+						{
+							"name": "Get Role Details",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/roles/:role_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"roles",
+										":role_id"
+									],
+									"variable": [
+										{
+											"key": "role_id",
+											"value": "role_1"
+										}
+									]
+								},
+								"description": "Get details of a specific role."
+							},
+							"response": []
+						},
+						{
+							"name": "Update Role",
+							"request": {
+								"method": "PUT",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"name\": \"Senior Developer\",\n  \"permissions\": [\"read\", \"write\", \"test\", \"deploy\"],\n  \"description\": \"Updated description\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/roles/:role_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"roles",
+										":role_id"
+									],
+									"variable": [
+										{
+											"key": "role_id",
+											"value": "role_1"
+										}
+									]
+								},
+								"description": "Update a role."
+							},
+							"response": []
+						},
+						{
+							"name": "Delete Role",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/roles/:role_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"roles",
+										":role_id"
+									],
+									"variable": [
+										{
+											"key": "role_id",
+											"value": "role_1"
+										}
+									]
+								},
+								"description": "Delete a role."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Billing Management",
+					"item": [
+						{
+							"name": "List All Billing Records",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/billing?organization_id=org_1&status=pending&month=2025-01",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"billing"
+									],
+									"query": [
+										{
+											"key": "organization_id",
+											"value": "org_1"
+										},
+										{
+											"key": "status",
+											"value": "pending",
+											"description": "Filter: pending, paid, failed"
+										},
+										{
+											"key": "month",
+											"value": "2025-01",
+											"description": "Filter by month (YYYY-MM)"
+										}
+									]
+								},
+								"description": "List all billing records with filters."
+							},
+							"response": []
+						},
+						{
+							"name": "Get Billing Details",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/billing/:billing_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"billing",
+										":billing_id"
+									],
+									"variable": [
+										{
+											"key": "billing_id",
+											"value": "bill_1"
+										}
+									]
+								},
+								"description": "Get details of a specific billing record."
+							},
+							"response": []
+						},
+						{
+							"name": "Generate Monthly Bills",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/billing/generate-monthly",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"billing",
+										"generate-monthly"
+									]
+								},
+								"description": "Generate monthly bills for all active subscriptions."
+							},
+							"response": []
+						},
+						{
+							"name": "Mark Invoice as Paid",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/billing/:billing_id/mark-paid",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"billing",
+										":billing_id",
+										"mark-paid"
+									],
+									"variable": [
+										{
+											"key": "billing_id",
+											"value": "bill_1"
+										}
+									]
+								},
+								"description": "Mark an invoice as paid."
+							},
+							"response": []
+						},
+						{
+							"name": "Mark Invoice as Unpaid",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/billing/:billing_id/mark-unpaid",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"billing",
+										":billing_id",
+										"mark-unpaid"
+									],
+									"variable": [
+										{
+											"key": "billing_id",
+											"value": "bill_1"
+										}
+									]
+								},
+								"description": "Mark an invoice as unpaid."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Notification Management",
+					"item": [
+						{
+							"name": "List All Notifications",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/notifications?is_read=false",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"notifications"
+									],
+									"query": [
+										{
+											"key": "is_read",
+											"value": "false"
+										}
+									]
+								},
+								"description": "List all notifications."
+							},
+							"response": []
+						},
+						{
+							"name": "Mark Notification as Read",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/notifications/:notif_id/read",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"notifications",
+										":notif_id",
+										"read"
+									],
+									"variable": [
+										{
+											"key": "notif_id",
+											"value": "notif_1"
+										}
+									]
+								},
+								"description": "Mark a notification as read."
+							},
+							"response": []
+						},
+						{
+							"name": "Mark All as Read",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/notifications/read-all",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"notifications",
+										"read-all"
+									]
+								},
+								"description": "Mark all notifications as read."
+							},
+							"response": []
+						},
+						{
+							"name": "Delete Notification",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/notifications/:notif_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"notifications",
+										":notif_id"
+									],
+									"variable": [
+										{
+											"key": "notif_id",
+											"value": "notif_1"
+										}
+									]
+								},
+								"description": "Delete a notification."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "User Request Management",
+					"item": [
+						{
+							"name": "List All User Requests",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/user-requests",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"user-requests"
+									]
+								},
+								"description": "List all user requests to join organizations."
+							},
+							"response": []
+						},
+						{
+							"name": "List Pending User Requests",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/user-requests/pending",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"user-requests",
+										"pending"
+									]
+								},
+								"description": "List pending user requests."
+							},
+							"response": []
+						},
+						{
+							"name": "Get User Request Details",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/user-requests/:request_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"user-requests",
+										":request_id"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "req_1"
+										}
+									]
+								},
+								"description": "Get details of a user request."
+							},
+							"response": []
+						},
+						{
+							"name": "Approve User Request",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"role_id\": \"role_1\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/user-requests/:request_id/approve",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"user-requests",
+										":request_id",
+										"approve"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "req_1"
+										}
+									]
+								},
+								"description": "Approve a user request and assign role."
+							},
+							"response": []
+						},
+						{
+							"name": "Reject User Request",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"reason\": \"Position not available\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/user-requests/:request_id/reject",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"user-requests",
+										":request_id",
+										"reject"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "req_1"
+										}
+									]
+								},
+								"description": "Reject a user request with reason."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Plan Upgrade Request Management",
+					"item": [
+						{
+							"name": "List All Upgrade Requests",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/upgrade-requests",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"upgrade-requests"
+									]
+								},
+								"description": "List all plan upgrade requests."
+							},
+							"response": []
+						},
+						{
+							"name": "List Pending Upgrade Requests",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/upgrade-requests/pending",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"upgrade-requests",
+										"pending"
+									]
+								},
+								"description": "List pending upgrade requests."
+							},
+							"response": []
+						},
+						{
+							"name": "Approve Upgrade Request",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/upgrade-requests/:request_id/approve",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"upgrade-requests",
+										":request_id",
+										"approve"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "upgrade_1"
+										}
+									]
+								},
+								"description": "Approve a plan upgrade request."
+							},
+							"response": []
+						},
+						{
+							"name": "Reject Upgrade Request",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"reason\": \"Current usage does not justify upgrade\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/upgrade-requests/:request_id/reject",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"upgrade-requests",
+										":request_id",
+										"reject"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "upgrade_1"
+										}
+									]
+								},
+								"description": "Reject a plan upgrade request."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Individual User Request Management",
+					"item": [
+						{
+							"name": "List All Individual User Requests",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/individual-user-requests?status=pending",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"individual-user-requests"
+									],
+									"query": [
+										{
+											"key": "status",
+											"value": "pending",
+											"description": "Filter: pending, approved, rejected"
+										}
+									]
+								},
+								"description": "List all individual user requests."
+							},
+							"response": []
+						},
+						{
+							"name": "List Pending Individual Requests",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/individual-user-requests/pending",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"individual-user-requests",
+										"pending"
+									]
+								},
+								"description": "List pending individual user requests."
+							},
+							"response": []
+						},
+						{
+							"name": "Approve Individual User Request",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/individual-user-requests/:request_id/approve",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"individual-user-requests",
+										":request_id",
+										"approve"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "ind_req_1"
+										}
+									]
+								},
+								"description": "Approve individual user request. Creates user with 'No Organization' and assigns subscription."
+							},
+							"response": [
+								{
+									"name": "Success",
+									"originalRequest": {
+										"method": "POST",
+										"header": [],
+										"url": {
+											"raw": "{{baseUrl}}/individual-user-requests/:request_id/approve",
+											"host": [
+												"{{baseUrl}}"
+											],
+											"path": [
+												"individual-user-requests",
+												":request_id",
+												"approve"
+											],
+											"variable": [
+												{
+													"key": "request_id",
+													"value": "ind_req_1"
+												}
+											]
+										},
+										"description": "Approve individual user request. Creates user with 'No Organization' and assigns subscription."
+									},
+									"status": "OK",
+									"code": 200,
+									"_postman_previewlanguage": "Text",
+									"header": [],
+									"cookie": [],
+									"body": "{\n  \"message\": \"Individual user request approved for John Doe\",\n  \"user\": {\n    \"id\": \"user-123\",\n    \"email\": \"john.doe@gmail.com\",\n    \"name\": \"John Doe\",\n    \"organization_name\": \"Individual Users\"\n  },\n  \"subscription\": {\n    \"id\": \"sub-123\",\n    \"plan\": \"Starter\",\n    \"tools\": [\"api_platform\"]\n  }\n}"
+								}
+							]
+						},
+						{
+							"name": "Reject Individual User Request",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/individual-user-requests/:request_id/reject?reason=Not enough information provided",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"individual-user-requests",
+										":request_id",
+										"reject"
+									],
+									"query": [
+										{
+											"key": "reason",
+											"value": "Not enough information provided"
+										}
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "ind_req_1"
+										}
+									]
+								},
+								"description": "Reject individual user request."
+							},
+							"response": []
+						},
+						{
+							"name": "Delete Individual User Request",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/individual-user-requests/:request_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"individual-user-requests",
+										":request_id"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "ind_req_1"
+										}
+									]
+								},
+								"description": "Delete an individual user request."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Auth0 Login Records",
+					"item": [
+						{
+							"name": "List Auth0 Login Records",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/auth0-logins?organization_id=org_1&limit=100",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"auth0-logins"
+									],
+									"query": [
+										{
+											"key": "organization_id",
+											"value": "org_1",
+											"description": "Filter by organization"
+										},
+										{
+											"key": "limit",
+											"value": "100"
+										}
+									]
+								},
+								"description": "List Auth0 SSO login records."
+							},
+							"response": []
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "🏢 Org Admin APIs",
+			"item": [
+				{
+					"name": "My Organization",
+					"item": [
+						{
+							"name": "Get My Organization",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization"
+									]
+								},
+								"description": "Get details of the logged-in admin's organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Get My Dashboard Stats",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/dashboard",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"dashboard"
+									]
+								},
+								"description": "Get dashboard statistics for my organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Get My Subscription",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/subscription",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"subscription"
+									]
+								},
+								"description": "Get my organization's subscription details."
+							},
+							"response": []
+						},
+						{
+							"name": "Get My Billing",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/billing",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"billing"
+									]
+								},
+								"description": "Get my organization's billing records."
+							},
+							"response": []
+						},
+						{
+							"name": "Get My Roles",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/roles",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"roles"
+									]
+								},
+								"description": "Get roles in my organization."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Team Management",
+					"item": [
+						{
+							"name": "List My Team Members",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/team",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"team"
+									]
+								},
+								"description": "List admin team members in my organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Add Team Member",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"email\": \"teammate@acme.com\",\n  \"password\": \"password123\",\n  \"name\": \"Team Mate\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/team",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"team"
+									]
+								},
+								"description": "Add a new admin team member to my organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Toggle Team Member Status",
+							"request": {
+								"method": "PUT",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/team/:admin_id/toggle-status",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"team",
+										":admin_id",
+										"toggle-status"
+									],
+									"variable": [
+										{
+											"key": "admin_id",
+											"value": "admin_123"
+										}
+									]
+								},
+								"description": "Toggle team member active/inactive status."
+							},
+							"response": []
+						},
+						{
+							"name": "Remove Team Member",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/team/:admin_id",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"team",
+										":admin_id"
+									],
+									"variable": [
+										{
+											"key": "admin_id",
+											"value": "admin_123"
+										}
+									]
+								},
+								"description": "Remove a team member from my organization."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "User Management",
+					"item": [
+						{
+							"name": "List My Organization Users",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/users",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"users"
+									]
+								},
+								"description": "List all users in my organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Remove User from My Org",
+							"request": {
+								"method": "DELETE",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/users/:user_id/remove",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"users",
+										":user_id",
+										"remove"
+									],
+									"variable": [
+										{
+											"key": "user_id",
+											"value": "user_123"
+										}
+									]
+								},
+								"description": "Remove a user from my organization."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "User Requests",
+					"item": [
+						{
+							"name": "List User Requests for My Org",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/user-requests",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"user-requests"
+									]
+								},
+								"description": "List user requests to join my organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Approve User Request",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"role_id\": \"role_1\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/user-requests/:request_id/approve",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"user-requests",
+										":request_id",
+										"approve"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "req_123"
+										}
+									]
+								},
+								"description": "Approve a user request to join my organization."
+							},
+							"response": []
+						},
+						{
+							"name": "Reject User Request",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"reason\": \"No open positions\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/user-requests/:request_id/reject",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"user-requests",
+										":request_id",
+										"reject"
+									],
+									"variable": [
+										{
+											"key": "request_id",
+											"value": "req_123"
+										}
+									]
+								},
+								"description": "Reject a user request to join my organization."
+							},
+							"response": []
+						}
+					]
+				},
+				{
+					"name": "Plan Upgrades",
+					"item": [
+						{
+							"name": "Request Plan Upgrade",
+							"request": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"requested_plan_id\": \"plan_api_enterprise\",\n  \"requested_tools\": [\"api_platform\", \"ai_agentic\"],\n  \"reason\": \"We need more API capacity and AI features\"\n}"
+								},
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/request-upgrade",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"request-upgrade"
+									]
+								},
+								"description": "Request a plan upgrade for my organization."
+							},
+							"response": []
+						},
+						{
+							"name": "View My Upgrade Requests",
+							"request": {
+								"method": "GET",
+								"header": [],
+								"url": {
+									"raw": "{{baseUrl}}/my-organization/upgrade-requests",
+									"host": [
+										"{{baseUrl}}"
+									],
+									"path": [
+										"my-organization",
+										"upgrade-requests"
+									]
+								},
+								"description": "View my organization's upgrade requests."
+							},
+							"response": []
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "🔑 Direct Auth0 APIs",
+			"item": [
+				{
+					"name": "Auth0 Authorize URL",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "https://{{auth0Domain}}/authorize?client_id={{auth0ClientId}}&response_type=code&scope=openid profile email&redirect_uri={{auth0CallbackUri}}&organization=org_SVFows90OrYpzdIs",
+							"protocol": "https",
+							"host": [
+								"{{auth0Domain}}"
+							],
+							"path": [
+								"authorize"
+							],
+							"query": [
+								{
+									"key": "client_id",
+									"value": "{{auth0ClientId}}"
+								},
+								{
+									"key": "response_type",
+									"value": "code"
+								},
+								{
+									"key": "scope",
+									"value": "openid profile email"
+								},
+								{
+									"key": "redirect_uri",
+									"value": "{{auth0CallbackUri}}"
+								},
+								{
+									"key": "organization",
+									"value": "org_SVFows90OrYpzdIs",
+									"description": "Auth0 Organization ID"
+								}
+							]
+						},
+						"description": "Direct Auth0 authorization URL. Open in browser to login. Replace organization with actual Auth0 org ID."
+					},
+					"response": []
+				},
+				{
+					"name": "Auth0 Token Exchange",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"grant_type\": \"authorization_code\",\n  \"client_id\": \"{{auth0ClientId}}\",\n  \"client_secret\": \"{{auth0ClientSecret}}\",\n  \"code\": \"YOUR_AUTHORIZATION_CODE\",\n  \"redirect_uri\": \"{{auth0CallbackUri}}\"\n}"
+						},
+						"url": {
+							"raw": "https://{{auth0Domain}}/oauth/token",
+							"protocol": "https",
+							"host": [
+								"{{auth0Domain}}"
+							],
+							"path": [
+								"oauth",
+								"token"
+							]
+						},
+						"description": "Exchange Auth0 authorization code for access tokens directly."
+					},
+					"response": [
+						{
+							"name": "Success",
+							"originalRequest": {
+								"method": "POST",
+								"header": [
+									{
+										"key": "Content-Type",
+										"value": "application/json"
+									}
+								],
+								"body": {
+									"mode": "raw",
+									"raw": "{\n  \"grant_type\": \"authorization_code\",\n  \"client_id\": \"{{auth0ClientId}}\",\n  \"client_secret\": \"{{auth0ClientSecret}}\",\n  \"code\": \"YOUR_AUTHORIZATION_CODE\",\n  \"redirect_uri\": \"{{auth0CallbackUri}}\"\n}"
+								},
+								"url": {
+									"raw": "https://{{auth0Domain}}/oauth/token",
+									"protocol": "https",
+									"host": [
+										"{{auth0Domain}}"
+									],
+									"path": [
+										"oauth",
+										"token"
+									]
+								},
+								"description": "Exchange Auth0 authorization code for access tokens directly."
+							},
+							"status": "OK",
+							"code": 200,
+							"_postman_previewlanguage": "Text",
+							"header": [],
+							"cookie": [],
+							"body": "{\n  \"access_token\": \"eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0...\",\n  \"id_token\": \"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...\",\n  \"scope\": \"openid profile email\",\n  \"expires_in\": 86400,\n  \"token_type\": \"Bearer\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Auth0 User Info",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer YOUR_ACCESS_TOKEN"
+							}
+						],
+						"url": {
+							"raw": "https://{{auth0Domain}}/userinfo",
+							"protocol": "https",
+							"host": [
+								"{{auth0Domain}}"
+							],
+							"path": [
+								"userinfo"
+							]
+						},
+						"description": "Get user info from Auth0 using access token."
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"auth": {
+		"type": "bearer",
+		"bearer": [
+			{
+				"key": "token",
+				"value": "{{token}}",
+				"type": "string"
+			}
+		]
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "https://admin-backend-784673707621.us-central1.run.app/api",
+			"type": "string"
+		},
+		{
+			"key": "token",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "auth0Domain",
+			"value": "probestack-usa-dev.us.auth0.com",
+			"type": "string"
+		},
+		{
+			"key": "auth0ClientId",
+			"value": "rV9Ihy7REI9vFE7Uclelwp89wQfg3a4S",
+			"type": "string"
+		},
+		{
+			"key": "auth0ClientSecret",
+			"value": "WzmmkzuZF7PWk5L47fXQVZ7B3dA337Mf5sUwLVrXU-aQ8r327wTVhM4tOUNOzBRV",
+			"type": "string"
+		},
+		{
+			"key": "auth0CallbackUri",
+			"value": "https://probestack.io/callback",
+			"type": "string"
+		}
+	]
+}
