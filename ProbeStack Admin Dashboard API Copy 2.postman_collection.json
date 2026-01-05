@@ -8,7 +8,7 @@
 	},
 	"item": [
 		{
-			"name": "🔓 Public APIs",
+			"name": "Public APIs",
 			"item": [
 				{
 					"name": "Authentication",
@@ -765,7 +765,7 @@
 			]
 		},
 		{
-			"name": "🔐 Authenticated APIs",
+			"name": "Authenticated APIs",
 			"item": [
 				{
 					"name": "Current User",
@@ -847,7 +847,7 @@
 			]
 		},
 		{
-			"name": "👑 Super Admin APIs",
+			"name": "Super Admin APIs",
 			"item": [
 				{
 					"name": "Dashboard",
@@ -2477,7 +2477,7 @@
 			]
 		},
 		{
-			"name": "🏢 Org Admin APIs",
+			"name": "Org Admin APIs",
 			"item": [
 				{
 					"name": "My Organization",
@@ -2885,7 +2885,7 @@
 			]
 		},
 		{
-			"name": "🔑 Direct Auth0 APIs",
+			"name": "Direct Auth0 APIs",
 			"item": [
 				{
 					"name": "Auth0 Authorize URL",
