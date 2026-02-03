@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON
 from sqlalchemy.dialects.mysql import LONGTEXT
+
 import os
 import logging
 from pathlib import Path
@@ -18,6 +19,7 @@ import bcrypt
 import json
 import httpx
 from urllib.parse import urlencode
+import secrets
 
 from passlib.context import CryptContext
 
@@ -35,6 +37,12 @@ AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'probestack-usa-dev.us.auth0.com')
 AUTH0_CLIENT_ID = os.environ.get('AUTH0_CLIENT_ID', '')
 AUTH0_CLIENT_SECRET = os.environ.get('AUTH0_CLIENT_SECRET', '')
 AUTH0_CALLBACK_URI = os.environ.get('AUTH0_CALLBACK_URI', 'https://probestack.io/callback')
+AUTH0_MGMT_DOMAIN = os.environ.get('AUTH0_MGMT_DOMAIN', 'probestack-usa-dev.us.auth0.com')
+AUTH0_MGMT_CLIENT_ID = os.environ.get('AUTH0_MGMT_CLIENT_ID', '')
+AUTH0_MGMT_CLIENT_SECRET = os.environ.get('AUTH0_MGMT_CLIENT_SECRET', '')
+AUTH0_DB_CONNECTION_NAME = os.environ.get('AUTH0_DB_CONNECTION_NAME', 'Username-Password-Authentication')
+AUTH0_DB_CONNECTION_ID = os.environ.get('AUTH0_DB_CONNECTION_ID', '')
+
 from urllib.parse import quote_plus
 
 DB_USER = os.environ.get("DB_USER")
@@ -81,6 +89,213 @@ security = HTTPBearer()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+class Auth0ManagementAPI:
+    """Helper class for Auth0 Management API operations"""
+    if not all([
+        AUTH0_MGMT_CLIENT_ID,
+        AUTH0_MGMT_CLIENT_SECRET,
+        AUTH0_MGMT_DOMAIN,
+    ]):
+        raise RuntimeError("Auth0 Management API env vars missing")
+    
+    def __init__(self):
+        self.domain = AUTH0_MGMT_DOMAIN
+        self.client_id = AUTH0_MGMT_CLIENT_ID
+        self.client_secret = AUTH0_MGMT_CLIENT_SECRET
+        self.connection = AUTH0_DB_CONNECTION_NAME
+        self.connection_id = AUTH0_DB_CONNECTION_ID
+        self._access_token = None
+        self._token_expires_at = None
+    
+    async def _get_access_token(self) -> str:
+        """Get or refresh Management API access token"""
+        if self._access_token and self._token_expires_at and datetime.now() < self._token_expires_at:
+            return self._access_token
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/oauth/token",
+                json={
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "audience": f"https://{self.domain}/api/v2/",
+                    "grant_type": "client_credentials"
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Auth0 token error: {response.text}")
+                raise HTTPException(status_code=500, detail="Failed to get Auth0 Management API token")
+            
+            data = response.json()
+            self._access_token = data["access_token"]
+            self._token_expires_at = datetime.now() + timedelta(seconds=data.get("expires_in", 86400) - 300)
+            return self._access_token
+    
+    async def create_user(self, email: str, name: str, user_metadata: dict = None) -> dict:
+        """Create a new user in Auth0 with no password (user will set it later)"""
+        token = await self._get_access_token()
+        
+        temp_password = secrets.token_urlsafe(32) + "Aa1!"
+        
+        payload = {
+            "email": email,
+            "name": name,
+            "connection": self.connection,
+            "password": temp_password,
+            "email_verified": False,
+            "verify_email": True,
+            "user_metadata": user_metadata or {}
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/api/v2/users",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload
+            )
+            
+            if response.status_code == 201:
+                user_data = response.json()
+                logger.info(f"Auth0 user created: {email}")
+                return {"success": True, "auth0_user_id": user_data.get("user_id"), "data": user_data}
+            elif response.status_code == 409:
+                logger.warning(f"Auth0 user already exists: {email}")
+                return {"success": False, "error": "User already exists in Auth0", "exists": True}
+            else:
+                logger.error(f"Auth0 create user error: {response.text}")
+                return {"success": False, "error": response.text}
+    
+    async def get_user_by_email(self, email: str) -> dict:
+        """Get user from Auth0 by email"""
+        token = await self._get_access_token()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://{self.domain}/api/v2/users-by-email",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"email": email}
+            )
+            
+            if response.status_code == 200:
+                users = response.json()
+                if users:
+                    return {"success": True, "user": users[0]}
+                return {"success": False, "error": "User not found"}
+            else:
+                logger.error(f"Auth0 get user error: {response.text}")
+                return {"success": False, "error": response.text}
+    
+    async def update_user_password(self, user_id: str, password: str) -> dict:
+        """Update user's password in Auth0"""
+        token = await self._get_access_token()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"https://{self.domain}/api/v2/users/{user_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"password": password, "connection": self.connection}
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Auth0 password updated for user: {user_id}")
+                return {"success": True}
+            else:
+                logger.error(f"Auth0 update password error: {response.text}")
+                return {"success": False, "error": response.text}
+    
+    async def verify_user_email(self, user_id: str) -> dict:
+        """Mark user's email as verified in Auth0"""
+        token = await self._get_access_token()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"https://{self.domain}/api/v2/users/{user_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"email_verified": True}
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Auth0 email verified for user: {user_id}")
+                return {"success": True}
+            else:
+                logger.error(f"Auth0 verify email error: {response.text}")
+                return {"success": False, "error": response.text}
+    
+    async def send_verification_email(self, user_id: str) -> dict:
+        """Send verification email to user"""
+        token = await self._get_access_token()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/api/v2/jobs/verification-email",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"user_id": user_id}
+            )
+            
+            if response.status_code in [200, 201]:
+                logger.info(f"Auth0 verification email sent to user: {user_id}")
+                return {"success": True}
+            else:
+                logger.error(f"Auth0 send verification email error: {response.text}")
+                return {"success": False, "error": response.text}
+    
+    async def send_password_reset_email(self, email: str) -> dict:
+        """Send password reset email to user via Auth0"""
+        # IMPORTANT: Must use the regular Auth0 application client_id (AUTH0_CLIENT_ID),
+        # NOT the Management API client_id
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/dbconnections/change_password",
+                json={
+                    "client_id": AUTH0_CLIENT_ID,  # Use regular app client ID, not management API client ID
+                    "email": email,
+                    "connection": self.connection
+                }
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Auth0 password reset email sent to: {email}")
+                return {"success": True}
+            else:
+                logger.error(f"Auth0 send password reset email error: {response.text}")
+                return {"success": False, "error": response.text}
+    
+    async def authenticate_user(self, email: str, password: str) -> dict:
+        """
+        Authenticate a user against Auth0.
+        Uses the Resource Owner Password Grant flow.
+        """
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/oauth/token",
+                json={
+                    "grant_type": "password",
+                    "username": email,
+                    "password": password,
+                    "client_id": AUTH0_CLIENT_ID,
+                    "client_secret": AUTH0_CLIENT_SECRET,
+                    "audience": "https://probestack.io/api",
+                    "scope": "openid profile email"
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                logger.info(f"Auth0 authentication successful for: {email}")
+                return {
+                    "success": True,
+                    "access_token": data.get("access_token"),
+                    "id_token": data.get("id_token"),
+                    "token_type": data.get("token_type")
+                }
+            else:
+                logger.warning(f"Auth0 authentication failed for {email}: {response.text}")
+                return {"success": False, "error": response.text}
+
+# Initialize Auth0 Management API helper
+auth0_mgmt = Auth0ManagementAPI()
+
 # ==================== DATABASE MODELS ====================
 
 class Base(DeclarativeBase):
@@ -111,6 +326,7 @@ class OrganizationModel(Base):
     contact_person: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -147,10 +363,23 @@ class PlanModel(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+class PlanToolModel(Base):
+    """Model for individual tools within a plan with their own pricing"""
+    __tablename__ = "plan_tools"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    plan_id: Mapped[str] = mapped_column(String(36), nullable=False)  # FK to plans
+    name: Mapped[str] = mapped_column(String(255), nullable=False)  # e.g., "API Design Studio"
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    price_monthly: Mapped[float] = mapped_column(Float, default=0)  # Monthly price for this tool
+    price_yearly: Mapped[float] = mapped_column(Float, default=0)  # Yearly price for this tool
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    display_order: Mapped[int] = mapped_column(default=0)  # For ordering tools in UI
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 class UserModel(Base):
     __tablename__ = "users"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
     organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -159,6 +388,12 @@ class UserModel(Base):
     status: Mapped[str] = mapped_column(String(50), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_login: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    theme_preference: Mapped[str] = mapped_column(String(20), default="system")  # light, dark, system
+    # Auth0 integration fields
+    auth0_user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Auth0 user ID
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False)  # Email verification status
+    password_set: Mapped[bool] = mapped_column(Boolean, default=False)  # Has user set their password
+    first_login_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
 class RoleModel(Base):
     __tablename__ = "roles"
@@ -215,25 +450,51 @@ class UserRequestModel(Base):
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     approved_role_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
+class IndividualUserRequestModel(Base):
+    """Model for individual user requests (users without organization)"""
+    __tablename__ = "individual_user_requests"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    requested_tools: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array of tools
+    requested_plan: Mapped[str] = mapped_column(String(100), nullable=False)
+    purpose: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Why they need access
+    company_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Optional company name
+    job_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, approved, rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # When approved, these fields are populated
+    assigned_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    assigned_subscription_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
 class PlanUpgradeRequestModel(Base):
     """Model for plan upgrade requests from organization admins"""
     __tablename__ = "plan_upgrade_requests"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
     organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    current_plan_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    current_plan_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    requested_plan_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    requested_plan_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    requested_tools: Mapped[str] = mapped_column(Text, nullable=False) 
-    status: Mapped[str] = mapped_column(String(50), default="pending")
-    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    current_plan_id: Mapped[str] = mapped_column(String(100), nullable=False)  # JSON array of current plan IDs
+    current_plan_name: Mapped[str] = mapped_column(String(255), nullable=False)  # JSON array or comma-separated
+    # Old single-plan columns (for backward compatibility)
+    requested_plan_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    requested_plan_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # New multi-plan columns
+    requested_plan_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of plan IDs
+    requested_plans_details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON: [{plan_id, plan_name, tools}]
+    requested_tools: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array (all tools combined)
+    status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, approved, rejected
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Why they want to upgrade
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    requested_by: Mapped[str] = mapped_column(String(36), nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(36), nullable=False)  # Admin who requested
 
 class Auth0LoginRecordModel(Base):
     """Model for storing Auth0 login records"""
@@ -275,33 +536,44 @@ class AdminCreate(BaseModel):
     role: str  # super_admin, org_admin
     organization_id: Optional[str] = None  # Required for org_admin
 
+class PlanSelectionItem(BaseModel):
+    """Schema for a single plan selection with its tools"""
+    plan_id: str
+    tool_ids: List[str]  # List of tool IDs/names for this plan
+
 class PlanUpgradeCreate(BaseModel):
-    """Schema for org admin to request plan upgrade"""
-    requested_plan_id: str
-    requested_tools: List[str]
+    """Schema for org admin to request plan upgrade - supports multiple plans"""
+    requested_plans: List[PlanSelectionItem]  # Multiple plans with their tools
     reason: Optional[str] = None
+
+class SubscriptionUpdateRequest(BaseModel):
+    """Schema for super admin to update org/user subscription"""
+    plan_selections: List[PlanSelectionItem]  # Plans with their tools
+    billing_cycle: Optional[str] = "monthly"  # monthly or yearly
 
 class OrganizationCreate(BaseModel):
     name: str
     email: str
     domain: Optional[str] = None
-    requested_plan: str
+    requested_plans: List[str]
     requested_tools: List[str]
     contact_person: str
     phone: Optional[str] = None
     address: Optional[str] = None
+    description: Optional[str] = None
 
 class OrganizationRequest(BaseModel):
     """Schema for external API requests to register an organization"""
     name: str
     email: str
     domain: Optional[str] = None
-    plan_id: str  # Plan ID like 'plan_api_pro', 'plan_ai_starter', etc.
-    tools: List[str]  # List of tools: 'api_platform', 'ai_agentic', 'migration_tool'
+    plan_ids: List[str]  # List of Plan IDs like ["plan_api_enterprise", "plan_ai_enterprise"]
+    selected_tools: List[str]
     contact_person: str
     contact_phone: Optional[str] = None
     company_address: Optional[str] = None
     additional_notes: Optional[str] = None
+    description: Optional[str] = None
 
 class OrganizationUpdate(BaseModel):
     name: Optional[str] = None
@@ -341,6 +613,17 @@ class AdminPasswordResetRequest(BaseModel):
     admin_id: str
     new_password: str
 
+class IndividualUserRequestCreate(BaseModel):
+    """Schema for creating individual user request (no organization)"""
+    email: str
+    name: str
+    selected_tools: List[str]
+    requested_plans: List[str]  # Plan ID
+    purpose: Optional[str] = None  # Why they need access
+    company_name: Optional[str] = None
+    job_title: Optional[str] = None
+    phone: Optional[str] = None
+
 class PlanCreate(BaseModel):
     name: str
     tool: str
@@ -348,6 +631,23 @@ class PlanCreate(BaseModel):
     features: List[str]
     price_monthly: float
     price_yearly: float
+
+class PlanToolCreate(BaseModel):
+    """Schema for creating a tool within a plan"""
+    name: str
+    description: Optional[str] = None
+    price_monthly: float = 0
+    price_yearly: float = 0
+    display_order: int = 0
+
+class PlanToolUpdate(BaseModel):
+    """Schema for updating a tool within a plan"""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price_monthly: Optional[float] = None
+    price_yearly: Optional[float] = None
+    is_active: Optional[bool] = None
+    display_order: Optional[int] = None
 
 class UserCreate(BaseModel):
     email: str
@@ -373,6 +673,86 @@ class UserRequestCreate(BaseModel):
     notes: Optional[str] = None
 
 # ==================== HELPERS ====================
+
+async def sync_user_from_auth0(
+    user: UserModel,
+    db: AsyncSession,
+    *,
+    allow_password_sync: bool = True,
+    allow_status_activation: bool = True
+) -> bool:
+    """
+    Synchronize user state from Auth0 into local DB.
+
+    Rules:
+    - Auth0 is source of truth for email_verified
+    - If Auth0 has email_verified=True → DB is updated
+    - If Auth0 user exists → password_set=True
+    - Clears first_login_token when account becomes active
+    - Safe to call multiple times (idempotent)
+
+    Returns:
+        True  -> user state was changed
+        False -> no changes
+    """
+
+    # No Auth0 user → nothing to sync
+    if not user.auth0_user_id:
+        return False
+
+    try:
+        auth0_result = await auth0_mgmt.get_user_by_email(user.email)
+    except Exception as e:
+        logger.warning(f"Auth0 sync skipped for {user.email}: {e}")
+        return False
+
+    if not auth0_result.get("success"):
+        return False
+
+    auth0_user = auth0_result.get("user", {})
+    updated = False
+
+    # ----------------------------
+    # Email verification sync
+    # ----------------------------
+    auth0_email_verified = auth0_user.get("email_verified")
+
+    if auth0_email_verified and not user.email_verified:
+        user.email_verified = True
+        updated = True
+
+    # ----------------------------
+    # Password existence sync
+    # ----------------------------
+    # If Auth0 user exists, password must exist
+    if allow_password_sync and not user.password_set:
+        user.password_set = True
+        updated = True
+
+    # ----------------------------
+    # Status activation
+    # ----------------------------
+    if (
+        allow_status_activation
+        and user.email_verified
+        and user.password_set
+        and user.status != "active"
+    ):
+        user.status = "active"
+        updated = True
+
+    # ----------------------------
+    # Cleanup first-login token
+    # ----------------------------
+    if user.status == "active" and user.first_login_token:
+        user.first_login_token = None
+        updated = True
+
+    if updated:
+        await db.commit()
+
+    return updated
+
 
 def model_to_dict(model, json_fields=None):
     """Convert SQLAlchemy model to dict, parsing JSON fields"""
@@ -424,6 +804,76 @@ def require_any_admin(payload: dict = Depends(verify_token)):
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+# ==================== UNIQUENESS HELPERS ====================
+
+async def assert_unique_email(db: AsyncSession, email: str):
+    """
+    Enforces global uniqueness of email across:
+    - users
+    - admins
+    - user requests
+    - individual user requests
+    """
+    checks = [
+        select(UserModel).where(UserModel.email == email),
+        select(AdminModel).where(AdminModel.email == email),
+        select(UserRequestModel).where(
+            UserRequestModel.email == email,
+            UserRequestModel.status == "pending"
+        ),
+        select(IndividualUserRequestModel).where(
+            IndividualUserRequestModel.email == email,
+            IndividualUserRequestModel.status == "pending"
+        ),
+    ]
+
+    for stmt in checks:
+        result = await db.execute(stmt)
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail="An account or request with this email already exists"
+            )
+
+
+async def assert_unique_organization(
+    db: AsyncSession,
+    *,
+    external_org_id: str | None = None,
+    domain: str | None = None
+):
+    """
+    Enforces one account per organization.
+    Priority:
+    1. external_org_id (strongest)
+    2. domain (fallback)
+    """
+
+    if external_org_id:
+        result = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.external_org_id == external_org_id
+            )
+        )
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail="An organization account already exists for this organization"
+            )
+
+    if domain:
+        result = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.domain == domain
+            )
+        )
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail="An organization with this domain already exists"
+            )
+
 
 # ==================== AUTH ROUTES ====================
 
@@ -566,6 +1016,231 @@ async def admin_reset_password(admin_id: str, data: PasswordChangeRequest, paylo
     await db.commit()
 
     return {"message": f"Password reset successfully for {admin.email}"}
+
+# ==================== USER FIRST LOGIN FLOW ====================
+
+@api_router.post("/public/user/verify-token", tags=["User First Login"])
+async def verify_first_login_token(email: str, token: str, db: AsyncSession = Depends(get_db)):
+    """
+    Verify user's first login token and return user info.
+    Used when user clicks the setup link.
+    """
+
+    result = await db.execute(
+        select(UserModel).where(
+            UserModel.email == email,
+            UserModel.first_login_token == token
+        )
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    # 🔑 Sync from Auth0 before exposing state
+    await sync_user_from_auth0(user, db)
+
+    # Block reuse after activation
+    if user.status == "active":
+        raise HTTPException(
+            status_code=400,
+            detail="Account setup already completed"
+        )
+
+    return {
+        "valid": True,
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "organization_name": user.organization_name,
+            "email_verified": user.email_verified,
+            "password_set": user.password_set
+        }
+    }
+
+
+@api_router.post("/public/user/verify-email", tags=["User First Login"])
+async def verify_user_email(email: str, token: str, db: AsyncSession = Depends(get_db)):
+    """
+    Mark user's email as verified after they click the verification link.
+    """
+    result = await db.execute(
+        select(UserModel).where(
+            UserModel.email == email,
+            UserModel.first_login_token == token
+        )
+    )
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    
+    user.email_verified = True
+    user.first_login_token = None
+    
+    # Also verify in Auth0 if we have the user ID
+    if user.auth0_user_id:
+        await auth0_mgmt.verify_user_email(user.auth0_user_id)
+    
+    await db.commit()
+    
+    return {
+        "message": "Email verified successfully",
+        "email_verified": True,
+        "password_set": user.password_set,
+        "next_step": "set_password" if not user.password_set else "login"
+    }
+
+
+@api_router.post("/public/user/set-password", tags=["User First Login"])
+async def set_user_password(email: str, token: str, password: str, db: AsyncSession = Depends(get_db)):
+    """
+    Set user's password for the first time.
+    Also updates the password in Auth0.
+    """
+    result = await db.execute(
+        select(UserModel).where(
+            UserModel.email == email,
+            UserModel.first_login_token == token
+        )
+    )
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+    
+    # Validate password strength
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    
+    # Update password in Auth0
+    if user.auth0_user_id:
+        auth0_result = await auth0_mgmt.update_user_password(user.auth0_user_id, password)
+        if not auth0_result.get("success"):
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to set password in Auth0: {auth0_result.get('error')}"
+            )
+    
+    # Mark password as set and email as verified
+    user.password_set = True
+    user.email_verified = True
+    user.status = "active"
+    user.first_login_token = None  # Clear the token after successful setup
+    
+    await db.commit()
+    
+    return {
+        "message": "Password set successfully. You can now log in.",
+        "email": user.email,
+        "status": "active"
+    }
+
+
+@api_router.post("/public/user/confirm-password-set", tags=["User First Login"])
+async def confirm_password_set(email: str, db: AsyncSession = Depends(get_db)):
+    """
+    Confirm that user has set their password via Auth0.
+    Call this after user completes Auth0 password reset flow.
+    This marks the user as active and ready to login.
+    """
+
+    result = await db.execute(
+        select(UserModel).where(UserModel.email == email)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 🔑 Sync authoritative state from Auth0
+    await sync_user_from_auth0(
+        user,
+        db,
+        allow_password_sync=True,
+        allow_status_activation=True
+    )
+
+    # If email is STILL not verified, block activation
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=400,
+            detail="Please verify your email before completing account setup"
+        )
+
+    # Ensure password_set (Auth0 password reset implies this)
+    if not user.password_set:
+        user.password_set = True
+
+    # Ensure active status
+    if user.status != "active":
+        user.status = "active"
+
+    # Cleanup token (idempotent)
+    if user.first_login_token:
+        user.first_login_token = None
+
+    await db.commit()
+
+    return {
+        "message": "Account setup complete. You can now log in.",
+        "email": user.email,
+        "status": "active"
+    }
+
+
+@api_router.post("/public/user/forgot-password", tags=["User First Login"])
+async def public_user_forgot_password(email: str, db: AsyncSession = Depends(get_db)):
+    """
+    Request password reset for a user (first login or forgot password).
+    This triggers Auth0 to send a password reset email.
+    """
+
+    success_message = {
+        "message": "If the email is registered, a password reset link will be sent."
+    }
+
+    result = await db.execute(
+        select(UserModel).where(UserModel.email == email)
+    )
+    user = result.scalar_one_or_none()
+
+    # Do not reveal whether user exists
+    if not user:
+        logger.info(f"Password reset requested for unknown email: {email}")
+        return success_message
+
+    # 🔑 Sync authoritative state from Auth0
+    await sync_user_from_auth0(user, db)
+
+    # Do not allow password reset unless email is verified
+    if not user.email_verified:
+        logger.info(f"Password reset blocked for unverified user: {email}")
+        return success_message
+
+    # Ensure Auth0 user exists
+    if not user.auth0_user_id:
+        auth0_user = await auth0_mgmt.get_user_by_email(email)
+        if auth0_user.get("success"):
+            user.auth0_user_id = auth0_user["user"]["user_id"]
+            await db.commit()
+        else:
+            logger.warning(f"No Auth0 account found for {email}")
+            return success_message
+
+    # Trigger Auth0 password reset email
+    reset_result = await auth0_mgmt.send_password_reset_email(email)
+
+    if reset_result.get("success"):
+        logger.info(f"Password reset email sent to: {email}")
+    else:
+        logger.error(
+            f"Failed to send password reset email to {email}: "
+            f"{reset_result.get('error')}"
+        )
+
+    return success_message
 
 # ==================== ADMIN MANAGEMENT (Super Admin Only) ====================
 
@@ -857,7 +1532,10 @@ async def approve_user_request_org_admin(request_id: str, role_id: str, payload:
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Role not found in your organization")
-    
+    # Check if user with this email already exists
+    existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
+    if existing_user.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="A user with this email already exists")
     now = datetime.now(timezone.utc)
     
     # Update request
@@ -866,22 +1544,65 @@ async def approve_user_request_org_admin(request_id: str, role_id: str, payload:
     req.updated_at = now
     req.approved_role_id = role_id
     
-    # Create user
+    # Create user with verification fields
     user = UserModel(
         email=req.email,
         name=req.name,
         organization_id=org_id,
         organization_name=req.organization_name,
         role_id=role_id,
-        role_name=role.name
+        role_name=role.name,
+        status="pending_verification",
+        email_verified=False,
+        password_set=False,
+        first_login_token=secrets.token_urlsafe(32)
     )
     db.add(user)
+    await db.flush()
+    
+    # Create user in Auth0
+    auth0_result = await auth0_mgmt.create_user(
+        email=req.email,
+        name=req.name,
+        user_metadata={
+            "probestack_user_id": user.id,
+            "organization_id": org_id,
+            "organization_name": req.organization_name
+        }
+    )
+    
+    if auth0_result.get("success"):
+        user.auth0_user_id = auth0_result.get("auth0_user_id")
+        logger.info(f"Auth0 user created for {req.email}: {user.auth0_user_id}")
+        # Send verification email via Auth0
+        await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    elif auth0_result.get("exists"):
+        existing_user = await auth0_mgmt.get_user_by_email(req.email)
+        if existing_user.get("success"):
+            user.auth0_user_id = existing_user["user"]["user_id"]
+            # Send verification email for existing Auth0 user
+            await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    else:
+        logger.warning(f"Failed to create Auth0 user for {req.email}: {auth0_result.get('error')}")
+    
     await db.commit()
+    
+    # Generate setup account URL
+    base_url = os.environ.get("APP_URL", "")
+    setup_url = f"{base_url}/setup-account?email={req.email}&token={user.first_login_token}" if base_url else None
     
     return {
         "message": "User request approved",
         "user_id": user.id,
-        "user": {"name": user.name, "email": user.email, "role": role.name}
+        "user": {
+            "name": user.name,
+            "email": user.email,
+            "role": role.name,
+            "auth0_user_id": user.auth0_user_id,
+            "status": user.status
+        },
+        "setup_url": setup_url,
+        "next_steps": "User will receive an email to verify their email address and set their password."
     }
 
 @api_router.post("/my-organization/user-requests/{request_id}/reject", tags=["Org Admin"])
@@ -1096,7 +1817,7 @@ async def get_my_organization_dashboard(payload: dict = Depends(require_any_admi
 
 @api_router.post("/my-organization/request-upgrade", tags=["Org Admin"])
 async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
-    """Request a plan upgrade for current organization (org admin only)"""
+    """Request a plan upgrade for current organization (org admin only) - supports multiple plans"""
     if payload.get("role") == "super_admin":
         raise HTTPException(status_code=400, detail="Super admins should directly update subscriptions")
     
@@ -1110,27 +1831,39 @@ async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    # Get current subscription
+    # Get current subscriptions
     sub_result = await db.execute(
         select(SubscriptionModel)
         .where(SubscriptionModel.organization_id == org_id)
         .where(SubscriptionModel.status == "active")
     )
-    current_sub = sub_result.scalar_one_or_none()
-    if not current_sub:
-        raise HTTPException(status_code=400, detail="No active subscription found")
+    current_subs = sub_result.scalars().all()
     
-    # Validate requested plan exists
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == data.requested_plan_id))
-    new_plan = plan_result.scalar_one_or_none()
-    if not new_plan:
-        raise HTTPException(status_code=404, detail="Requested plan not found")
+    # Build current plan info
+    current_plan_ids = [s.plan_id for s in current_subs]
+    current_plan_names = [s.plan_name for s in current_subs]
     
-    # Validate tools
-    valid_tools = ['api_platform', 'ai_agentic', 'migration_tool']
-    for tool in data.requested_tools:
-        if tool not in valid_tools:
-            raise HTTPException(status_code=400, detail=f"Invalid tool: {tool}")
+    # Validate requested plans exist and build details
+    if not data.requested_plans or len(data.requested_plans) == 0:
+        raise HTTPException(status_code=400, detail="At least one plan must be selected")
+    
+    requested_plan_ids = []
+    requested_plans_details = []
+    all_tools = []
+    
+    for plan_selection in data.requested_plans:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_selection.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_selection.plan_id} not found")
+        
+        requested_plan_ids.append(plan_selection.plan_id)
+        requested_plans_details.append({
+            "plan_id": plan.id,
+            "plan_name": plan.name,
+            "tools": plan_selection.tool_ids
+        })
+        all_tools.extend(plan_selection.tool_ids)
     
     # Check for existing pending request
     existing = await db.execute(
@@ -1141,24 +1874,33 @@ async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="You already have a pending upgrade request")
     
+    # For backward compatibility, use first plan for old columns
+    first_plan_id = requested_plan_ids[0] if requested_plan_ids else ""
+    first_plan_name = requested_plans_details[0]["plan_name"] if requested_plans_details else ""
+    
     # Create upgrade request
     upgrade_request = PlanUpgradeRequestModel(
         organization_id=org_id,
         organization_name=org.name,
-        current_plan_id=current_sub.plan_id,
-        current_plan_name=current_sub.plan_name,
-        requested_plan_id=data.requested_plan_id,
-        requested_plan_name=new_plan.name,
-        requested_tools=json.dumps(data.requested_tools),
+        current_plan_id=json.dumps(current_plan_ids),
+        current_plan_name=", ".join(current_plan_names) if current_plan_names else "None",
+        # Old columns for backward compatibility (NOT NULL in DB)
+        requested_plan_id=first_plan_id,
+        requested_plan_name=first_plan_name,
+        # New multi-plan columns
+        requested_plan_ids=json.dumps(requested_plan_ids),
+        requested_plans_details=json.dumps(requested_plans_details),
+        requested_tools=json.dumps(all_tools),
         reason=data.reason,
         requested_by=payload["sub"]
     )
     db.add(upgrade_request)
     
     # Create notification
+    plan_names = [d["plan_name"] for d in requested_plans_details]
     notif = NotificationModel(
         title="Plan Upgrade Request",
-        message=f"{org.name} requested to upgrade from {current_sub.plan_name} to {new_plan.name}",
+        message=f"{org.name} requested to change plans to: {', '.join(plan_names)}",
         type="info",
         link="/upgrade-requests"
     )
@@ -1171,9 +1913,9 @@ async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(
         "status": "pending",
         "message": "Upgrade request submitted successfully",
         "upgrade": {
-            "from_plan": current_sub.plan_name,
-            "to_plan": new_plan.name,
-            "requested_tools": data.requested_tools
+            "from_plans": current_plan_names,
+            "to_plans": plan_names,
+            "requested_tools": all_tools
         }
     }
 
@@ -1200,7 +1942,7 @@ async def get_pending_upgrade_requests(payload: dict = Depends(require_super_adm
 
 @api_router.post("/upgrade-requests/{request_id}/approve", tags=["Upgrade Requests"])
 async def approve_upgrade_request(request_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    """Approve a plan upgrade request (super admin only)"""
+    """Approve a plan upgrade request (super admin only) - supports multiple plans"""
     result = await db.execute(select(PlanUpgradeRequestModel).where(PlanUpgradeRequestModel.id == request_id))
     req = result.scalar_one_or_none()
     if not req:
@@ -1215,34 +1957,73 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
     req.approved_at = now
     req.updated_at = now
     
-    # Update organization's subscription
-    sub_result = await db.execute(
-        select(SubscriptionModel)
+    # Parse requested plans details
+    try:
+        requested_plans = json.loads(req.requested_plans_details) if req.requested_plans_details else []
+    except (json.JSONDecodeError, TypeError):
+        # Fallback for old format
+        requested_plans = [{
+            "plan_id": req.requested_plan_id,
+            "plan_name": req.requested_plan_name,
+            "tools": json.loads(req.requested_tools) if req.requested_tools else []
+        }]
+    
+    # Cancel all existing active subscriptions for this org
+    await db.execute(
+        update(SubscriptionModel)
         .where(SubscriptionModel.organization_id == req.organization_id)
         .where(SubscriptionModel.status == "active")
+        .values(status="cancelled")
     )
-    subscription = sub_result.scalar_one_or_none()
-    if subscription:
-        # Get new plan price
-        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == req.requested_plan_id))
-        new_plan = plan_result.scalar_one_or_none()
-        
-        subscription.plan_id = req.requested_plan_id
-        subscription.plan_name = req.requested_plan_name
-        subscription.tools = req.requested_tools
-        subscription.amount = new_plan.price_monthly if new_plan else subscription.amount
+    
+    # Create new subscriptions for each requested plan
+    created_subs = []
+    for plan_detail in requested_plans:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_detail["plan_id"]))
+        plan = plan_result.scalar_one_or_none()
+        if plan:
+            # Calculate price based on selected tools
+            tools = plan_detail.get("tools", [])
+            base_price = plan.price_monthly
+            
+            # Get tool prices
+            tools_result = await db.execute(
+                select(PlanToolModel).where(
+                    PlanToolModel.plan_id == plan.id,
+                    PlanToolModel.name.in_(tools)
+                )
+            )
+            plan_tools = tools_result.scalars().all()
+            tools_price = sum(t.price_monthly for t in plan_tools)
+            total_price = base_price + tools_price
+            
+            new_sub = SubscriptionModel(
+                organization_id=req.organization_id,
+                organization_name=req.organization_name,
+                plan_id=plan.id,
+                plan_name=plan.name,
+                tools=json.dumps(tools),
+                status="active",
+                start_date=now,
+                end_date=now + timedelta(days=30),
+                billing_cycle="monthly",
+                amount=total_price
+            )
+            db.add(new_sub)
+            created_subs.append({"plan": plan.name, "tools": tools})
     
     # Create notification
+    plan_names = [p.get("plan_name", p.get("plan_id", "Unknown")) for p in requested_plans]
     notif = NotificationModel(
         title="Upgrade Request Approved",
-        message=f"{req.organization_name} upgraded to {req.requested_plan_name}",
+        message=f"{req.organization_name} upgraded to: {', '.join(plan_names)}",
         type="success"
     )
     db.add(notif)
     
     await db.commit()
     
-    return {"message": "Upgrade request approved", "new_plan": req.requested_plan_name}
+    return {"message": "Upgrade request approved", "new_plans": plan_names, "subscriptions": created_subs}
 
 @api_router.post("/upgrade-requests/{request_id}/reject", tags=["Upgrade Requests"])
 async def reject_upgrade_request(request_id: str, reason: str = "", payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -1546,7 +2327,8 @@ async def create_organization(data: OrganizationCreate, db: AsyncSession = Depen
     org = OrganizationModel(
         name=data.name, email=data.email, domain=data.domain,
         requested_plan=data.requested_plan, requested_tools=json.dumps(data.requested_tools),
-        contact_person=data.contact_person, phone=data.phone, address=data.address
+        contact_person=data.contact_person, phone=data.phone, address=data.address,
+        description=data.description
     )
     db.add(org)
     
@@ -1614,7 +2396,204 @@ async def identify_organization(data: IdentifyOrgRequest, db: AsyncSession = Dep
         "message": "No organization found for this email domain"
     }
 
+@api_router.post("/public/login/initiate", tags=["Public API - Login"])
+async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Initiate login flow for all users (organization employees and individual users).
+    Called when user enters email in login form.
+    """
+
+    if not data.email or "@" not in data.email:
+        raise HTTPException(status_code=400, detail="Invalid email format")
+
+    email = data.email.lower().strip()
+    email_domain = "@" + email.split("@")[1]
+
+    # ------------------------------------------------------------------
+    # STEP 1: Check if user exists
+    # ------------------------------------------------------------------
+    result = await db.execute(
+        select(UserModel).where(UserModel.email == email)
+    )
+    user = result.scalar_one_or_none()
+
+    if user:
+        # 🔑 IMPORTANT: Sync from Auth0 BEFORE branching
+        await sync_user_from_auth0(user, db)
+
+        # Fetch org info
+        org_result = await db.execute(
+            select(OrganizationModel).where(OrganizationModel.id == user.organization_id)
+        )
+        user_org = org_result.scalar_one_or_none()
+        org_name = user_org.name if user_org else user.organization_name
+
+        # --------------------------------------------------------------
+        # CASE 1: Fully active user → password login
+        # --------------------------------------------------------------
+        if user.status == "active" and user.password_set:
+            return {
+                "success": True,
+                "next_step": "password",
+                "message": "Please enter your password to login.",
+                "user": {
+                    "email": user.email,
+                    "name": user.name,
+                    "organization_id": user.organization_id,
+                    "organization_name": org_name
+                }
+            }
+
+        # --------------------------------------------------------------
+        # CASE 2: Email verified but password not set → set password
+        # --------------------------------------------------------------
+        if user.email_verified and not user.password_set:
+            if not user.first_login_token:
+                user.first_login_token = secrets.token_urlsafe(32)
+                await db.commit()
+
+            return {
+                "success": True,
+                "next_step": "set_password",
+                "message": "Please set your password to complete account setup.",
+                "token": user.first_login_token,
+                "user": {
+                    "email": user.email,
+                    "name": user.name,
+                    "organization_id": user.organization_id,
+                    "organization_name": org_name
+                }
+            }
+
+        # --------------------------------------------------------------
+        # CASE 3: Not verified → resend verification email
+        # (At this point Auth0 + DB are already synced)
+        # --------------------------------------------------------------
+        if not user.first_login_token:
+            user.first_login_token = secrets.token_urlsafe(32)
+
+        if user.auth0_user_id:
+            await auth0_mgmt.send_verification_email(user.auth0_user_id)
+
+        await db.commit()
+
+        return {
+            "success": True,
+            "next_step": "verify_email",
+            "message": "Please verify your email. A verification email has been sent.",
+            "token": user.first_login_token,
+            "user": {
+                "email": user.email,
+                "name": user.name,
+                "organization_id": user.organization_id,
+                "organization_name": org_name,
+                "email_verified": user.email_verified
+            }
+        }
+
+    # ------------------------------------------------------------------
+    # STEP 2: User does NOT exist → match org by domain
+    # ------------------------------------------------------------------
+    result = await db.execute(
+        select(OrganizationModel).where(
+            OrganizationModel.status == "approved",
+            OrganizationModel.supported_domains.isnot(None),
+            OrganizationModel.name != "Individual Users"
+        )
+    )
+    organizations = result.scalars().all()
+
+    matched_org = None
+    for org in organizations:
+        try:
+            domains = json.loads(org.supported_domains or "[]")
+            if any(d.lower() == email_domain.lower() for d in domains):
+                matched_org = org
+                break
+        except json.JSONDecodeError:
+            continue
+
+    if not matched_org:
+        return {
+            "success": False,
+            "next_step": "request_access",
+            "message": f"No account found for {email}. Please submit an individual user request.",
+            "action_url": "/individual-user-request"
+        }
+
+    # ------------------------------------------------------------------
+    # STEP 3: Check for existing pending request
+    # ------------------------------------------------------------------
+    existing_request = await db.execute(
+        select(UserRequestModel).where(
+            UserRequestModel.email == email,
+            UserRequestModel.organization_id == matched_org.id,
+            UserRequestModel.status == "pending"
+        )
+    )
+    if existing_request.scalar_one_or_none():
+        return {
+            "success": True,
+            "next_step": "pending_approval",
+            "message": "Your access request is pending admin approval.",
+            "user": {
+                "email": email,
+                "organization_name": matched_org.name
+            }
+        }
+
+    # ------------------------------------------------------------------
+    # STEP 4: Create new user request
+    # ------------------------------------------------------------------
+    user_request = UserRequestModel(
+        email=email,
+        name=email.split("@")[0].replace(".", " ").title(),
+        organization_id=matched_org.id,
+        organization_name=matched_org.name,
+        requested_role="Member",
+        status="pending"
+    )
+    db.add(user_request)
+
+    notification = NotificationModel(
+        title="New User Request",
+        message=f"{user_request.name} ({email}) is requesting access to {matched_org.name}.",
+        type="info",
+        link="/user-requests"
+    )
+    db.add(notification)
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "next_step": "pending_approval",
+        "message": "Access request submitted. An admin will review it.",
+        "request_id": user_request.id,
+        "user": {
+            "email": email,
+            "name": user_request.name,
+            "organization_name": matched_org.name
+        }
+    }
+
+
 # ==================== PUBLIC API - Auth0 Authentication ====================
+
+@api_router.get("/public/auth0-config", tags=["Public API"])
+async def get_auth0_config():
+    """
+    Get current Auth0 environment configuration (for debugging).
+    Does not expose secrets.
+    """
+    return {
+        "domain": AUTH0_MGMT_DOMAIN,
+        "db_connection_name": AUTH0_DB_CONNECTION_NAME,
+        "db_connection_id": AUTH0_DB_CONNECTION_ID[:10] + "..." if AUTH0_DB_CONNECTION_ID else None,
+        "environment": "dev" if "dev" in AUTH0_DB_CONNECTION_NAME.lower() else 
+                       "test" if "test" in AUTH0_DB_CONNECTION_NAME.lower() else 
+                       "prod" if "prod" in AUTH0_DB_CONNECTION_NAME.lower() else "unknown"
+    }
 
 @api_router.post("/public/auth/init", tags=["Public API - Auth0"])
 async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db)):
@@ -1982,6 +2961,424 @@ async def get_auth0_logins(
         for r in records
     ]
 
+# ==================== INDIVIDUAL USER REQUESTS ====================
+
+@api_router.post("/individual-user-requests", tags=["Public API"])
+async def create_individual_user_request(data: IndividualUserRequestCreate, db: AsyncSession = Depends(get_db)):
+    """
+    Public API: Submit a request for individual user access (no organization).
+    Supports multiple plan selection.
+
+    **Request Body:**
+    - `email`: User email (required)
+    - `name`: User full name (required)
+    - `requested_plans`: List of Plan IDs (required) - e.g., ['plan_api_enterprise', 'plan_ai_enterprise']
+    - `selected_tools`: List of tool names from the plans (required)
+    - `purpose`: Why they need access (optional)
+    - `company_name`: Company name if any (optional)
+    - `job_title`: Job title (optional)
+    - `phone`: Phone number (optional)
+    """
+
+    await assert_unique_email(db, data.email)
+    # Check if email already has a pending request
+    result = await db.execute(
+        select(IndividualUserRequestModel).where(
+            IndividualUserRequestModel.email == data.email,
+            IndividualUserRequestModel.status == "pending"
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="A pending request already exists for this email")
+
+    # Validate all plans exist
+    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(data.requested_plans)))
+    plans = {p.id: p for p in plans_result.scalars().all()}
+    
+    invalid_plans = [pid for pid in data.requested_plans if pid not in plans]
+    if invalid_plans:
+        # Get available plans
+        all_plans_result = await db.execute(select(PlanModel.id, PlanModel.name, PlanModel.tool))
+        available_plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in all_plans_result.all()]
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Invalid plan IDs: {invalid_plans}",
+                "available_plans": available_plans
+            }
+        )
+
+    # Get available tools from ALL selected plans
+    tools_result = await db.execute(
+        select(PlanToolModel).where(
+            PlanToolModel.plan_id.in_(data.requested_plans),
+            PlanToolModel.is_active == True
+        )
+    )
+    available_tools = {t.name: t for t in tools_result.scalars().all()}
+
+    # Validate selected tools exist in at least one of the selected plans
+    invalid_tools = [t for t in data.selected_tools if t not in available_tools]
+    if invalid_tools:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Invalid tools: {invalid_tools}",
+                "available_tools": list(available_tools.keys())
+            }
+        )
+
+    # Calculate total price (sum of all plans + selected tools)
+    base_monthly = sum(plans[pid].price_monthly for pid in data.requested_plans)
+    base_yearly = sum(plans[pid].price_yearly for pid in data.requested_plans)
+    
+    selected_tool_objects = [available_tools[t] for t in data.selected_tools]
+    tools_monthly = sum(t.price_monthly for t in selected_tool_objects)
+    tools_yearly = sum(t.price_yearly for t in selected_tool_objects)
+    
+    total_monthly = base_monthly + tools_monthly
+    total_yearly = base_yearly + tools_yearly
+
+    # Create request - store plans as JSON array
+    request = IndividualUserRequestModel(
+        email=data.email,
+        name=data.name,
+        requested_tools=json.dumps(data.selected_tools),
+        requested_plan=json.dumps(data.requested_plans),  # Store as JSON array
+        purpose=data.purpose,
+        company_name=data.company_name,
+        job_title=data.job_title,
+        phone=data.phone
+    )
+    db.add(request)
+
+    # Create notification
+    tools_str = ', '.join(data.selected_tools[:3])
+    if len(data.selected_tools) > 3:
+        tools_str += f" +{len(data.selected_tools) - 3} more"
+    plans_str = ', '.join([plans[pid].name for pid in data.requested_plans])
+    notif = NotificationModel(
+        title="New Individual User Request",
+        message=f"{data.name} ({data.email}) has requested {plans_str} with tools: {tools_str}",
+        type="info",
+        link=f"/individual-requests/{request.id}"
+    )
+    db.add(notif)
+
+    await db.commit()
+
+    # Build response with plan details
+    plan_names = [{"id": pid, "name": plans[pid].name} for pid in data.requested_plans]
+
+    return {
+        "id": request.id,
+        "email": request.email,
+        "name": request.name,
+        "selected_tools": data.selected_tools,
+        "requested_plans": plan_names,
+        "purpose": request.purpose,
+        "company_name": request.company_name,
+        "job_title": request.job_title,
+        "phone": request.phone,
+        "status": request.status,
+        "pricing": {
+            "base_monthly": base_monthly,
+            "base_yearly": base_yearly,
+            "tools_monthly": tools_monthly,
+            "tools_yearly": tools_yearly,
+            "total_monthly": total_monthly,
+            "total_yearly": total_yearly
+        },
+        "created_at": request.created_at.isoformat() if request.created_at else None,
+        "message": "Your request has been submitted and is pending approval"
+    }
+
+@api_router.get("/individual-user-requests", tags=["Admin - Individual Users"])
+async def get_individual_user_requests(
+    status: Optional[str] = None,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all individual user requests (Super Admin only)"""
+    query = select(IndividualUserRequestModel).order_by(IndividualUserRequestModel.created_at.desc())
+
+    if status:
+        query = query.where(IndividualUserRequestModel.status == status)
+
+    result = await db.execute(query)
+    requests = result.scalars().all()
+
+    return [
+        {
+            "id": r.id,
+            "email": r.email,
+            "name": r.name,
+            "requested_tools": json.loads(r.requested_tools) if r.requested_tools else [],
+            "requested_plan": r.requested_plan,
+            "purpose": r.purpose,
+            "company_name": r.company_name,
+            "job_title": r.job_title,
+            "phone": r.phone,
+            "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            "approved_at": r.approved_at.isoformat() if r.approved_at else None,
+            "rejected_at": r.rejected_at.isoformat() if r.rejected_at else None,
+            "rejection_reason": r.rejection_reason,
+            "assigned_user_id": r.assigned_user_id,
+            "assigned_subscription_id": r.assigned_subscription_id
+        }
+        for r in requests
+    ]
+
+@api_router.get("/individual-user-requests/pending", tags=["Admin - Individual Users"])
+async def get_pending_individual_user_requests(
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get pending individual user requests (Super Admin only)"""
+    result = await db.execute(
+        select(IndividualUserRequestModel)
+        .where(IndividualUserRequestModel.status == "pending")
+        .order_by(IndividualUserRequestModel.created_at.desc())
+    )
+    requests = result.scalars().all()
+
+    return [
+        {
+            "id": r.id,
+            "email": r.email,
+            "name": r.name,
+            "requested_tools": json.loads(r.requested_tools) if r.requested_tools else [],
+            "requested_plans": json.loads(r.requested_plans) if r.requested_plans else [],
+            "purpose": r.purpose,
+            "company_name": r.company_name,
+            "job_title": r.job_title,
+            "phone": r.phone,
+            "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None
+        }
+        for r in requests
+    ]
+
+@api_router.post("/individual-user-requests/{request_id}/approve", tags=["Admin - Individual Users"])
+async def approve_individual_user_request(
+    request_id: str,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Approve an individual user request.
+    Creates user with "No Organization" and assigns subscription.
+    Also creates user in Auth0.
+    """
+    result = await db.execute(
+        select(IndividualUserRequestModel).where(IndividualUserRequestModel.id == request_id)
+    )
+    request = result.scalar_one_or_none()
+    
+    if not request:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if request.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request is already {request.status}")
+    # Check if user with this email already exists
+    existing_user = await db.execute(select(UserModel).where(UserModel.email == request.email))
+    if existing_user.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="A user with this email already exists")
+    # Parse requested_plan - can be a JSON array or single string
+    requested_plan_raw = request.requested_plan
+    try:
+        plan_ids = json.loads(requested_plan_raw) if requested_plan_raw.startswith('[') else [requested_plan_raw]
+    except (json.JSONDecodeError, AttributeError):
+        plan_ids = [requested_plan_raw] if requested_plan_raw else []
+    
+    if not plan_ids:
+        raise HTTPException(status_code=400, detail="No plan specified in request")
+    
+    # Get the first/primary plan (for subscription)
+    primary_plan_id = plan_ids[0]
+    result = await db.execute(select(PlanModel).where(PlanModel.id == primary_plan_id))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=400, detail=f"Requested plan '{primary_plan_id}' no longer exists")
+    
+    # Create a "No Organization" entry if it doesn't exist
+    result = await db.execute(
+        select(OrganizationModel).where(OrganizationModel.id == "no_organization")
+    )
+    no_org = result.scalar_one_or_none()
+    
+    if not no_org:
+        no_org = OrganizationModel(
+            id="no_organization",
+            name="Individual Users",
+            email="individual@probestack.io",
+            domain=None,
+            status="approved",
+            requested_plan="plan_api_starter",
+            requested_tools=json.dumps(["api_platform"]),
+            contact_person="System",
+            approved_at=datetime.now(timezone.utc)
+        )
+        db.add(no_org)
+        await db.flush()
+    
+    # Create or get a default role for individual users
+    result = await db.execute(
+        select(RoleModel).where(
+            RoleModel.name == "Individual User",
+            RoleModel.organization_id == "no_organization"
+        )
+    )
+    role = result.scalar_one_or_none()
+    
+    if not role:
+        role = RoleModel(
+            name="Individual User",
+            organization_id="no_organization",
+            permissions=json.dumps(["read", "write"]),
+            description="Default role for individual users"
+        )
+        db.add(role)
+        await db.flush()
+    
+    # Create user with first_login_token for setup flow
+    user = UserModel(
+        email=request.email,
+        name=request.name,
+        organization_id="no_organization",
+        organization_name="Individual Users",
+        role_id=role.id,
+        role_name=role.name,
+        status="pending_verification",
+        email_verified=False,
+        password_set=False,
+        first_login_token=secrets.token_urlsafe(32)
+    )
+    db.add(user)
+    await db.flush()
+    
+    # Create user in Auth0
+    auth0_result = await auth0_mgmt.create_user(
+        email=request.email,
+        name=request.name,
+        user_metadata={
+            "probestack_user_id": user.id,
+            "organization_id": "no_organization",
+            "organization_name": "Individual Users"
+        }
+    )
+    
+    if auth0_result.get("success"):
+        user.auth0_user_id = auth0_result.get("auth0_user_id")
+        logger.info(f"Auth0 user created for {request.email}: {user.auth0_user_id}")
+        # Send verification email via Auth0 (user will set password via our setup page)
+        await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    elif auth0_result.get("exists"):
+        # User already exists in Auth0, try to get their ID
+        existing_user = await auth0_mgmt.get_user_by_email(request.email)
+        if existing_user.get("success"):
+            user.auth0_user_id = existing_user["user"]["user_id"]
+            logger.info(f"Auth0 user already exists for {request.email}: {user.auth0_user_id}")
+    else:
+        logger.warning(f"Failed to create Auth0 user for {request.email}: {auth0_result.get('error')}")
+    
+    # Create subscription for individual user
+    requested_tools = json.loads(request.requested_tools) if request.requested_tools else []
+    subscription = SubscriptionModel(
+        organization_id="no_organization",
+        organization_name=f"Individual: {request.name}",
+        plan_id=plan.id,
+        plan_name=plan.name,
+        tools=json.dumps(requested_tools),
+        status="active",
+        start_date=datetime.now(timezone.utc),
+        end_date=datetime.now(timezone.utc) + timedelta(days=30),
+        billing_cycle="monthly",
+        amount=plan.price_monthly
+    )
+    db.add(subscription)
+    await db.flush()
+    
+    # Update request
+    request.status = "approved"
+    request.approved_at = datetime.now(timezone.utc)
+    request.assigned_user_id = user.id
+    request.assigned_subscription_id = subscription.id
+    request.updated_at = datetime.now(timezone.utc)
+    
+    await db.commit()
+    
+    # Generate setup account URL for the user
+    setup_account_url = f"/setup-account?email={user.email}&token={user.first_login_token}"
+    
+    return {
+        "message": f"Individual user request approved for {request.name}",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "organization_name": "Individual Users",
+            "auth0_user_id": user.auth0_user_id,
+            "status": user.status,
+            "setup_account_url": setup_account_url
+        },
+        "subscription": {
+            "id": subscription.id,
+            "plan": plan.name,
+            "tools": requested_tools
+        },
+        "next_steps": "User will receive an email to verify their email address. They can complete setup at the setup account page."
+    }
+
+@api_router.post("/individual-user-requests/{request_id}/reject", tags=["Admin - Individual Users"])
+async def reject_individual_user_request(
+    request_id: str,
+    reason: Optional[str] = None,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reject an individual user request"""
+    result = await db.execute(
+        select(IndividualUserRequestModel).where(IndividualUserRequestModel.id == request_id)
+    )
+    request = result.scalar_one_or_none()
+
+    if not request:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if request.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request is already {request.status}")
+
+    request.status = "rejected"
+    request.rejected_at = datetime.now(timezone.utc)
+    request.rejection_reason = reason
+    request.updated_at = datetime.now(timezone.utc)
+
+    await db.commit()
+
+    return {"message": f"Individual user request rejected for {request.name}"}
+
+@api_router.delete("/individual-user-requests/{request_id}", tags=["Admin - Individual Users"])
+async def delete_individual_user_request(
+    request_id: str,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete an individual user request"""
+    result = await db.execute(
+        select(IndividualUserRequestModel).where(IndividualUserRequestModel.id == request_id)
+    )
+    request = result.scalar_one_or_none()
+
+    if not request:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    await db.delete(request)
+    await db.commit()
+
+    return {"message": "Request deleted successfully"}
+
 @api_router.put("/organizations/{org_id}")
 async def update_organization(org_id: str, data: OrganizationUpdate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
@@ -2022,10 +3419,21 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     org.approved_at = now
     org.updated_at = now
     
+    # Parse requested_plan - can be a JSON array or single string
+    requested_plan_raw = org.requested_plan
+    try:
+        plan_ids = json.loads(requested_plan_raw) if requested_plan_raw.startswith('[') else [requested_plan_raw]
+    except (json.JSONDecodeError, AttributeError):
+        plan_ids = [requested_plan_raw] if requested_plan_raw else []
+    
+    primary_plan_id = plan_ids[0] if plan_ids else None
+    
     # Get plan details
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == org.requested_plan))
-    plan = plan_result.scalar_one_or_none()
-    plan_name = plan.name if plan else org.requested_plan
+    plan = None
+    if primary_plan_id:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == primary_plan_id))
+        plan = plan_result.scalar_one_or_none()
+    plan_name = plan.name if plan else (primary_plan_id or "Unknown")
     plan_amount = plan.price_monthly if plan else 99.0
     
     # Create subscription with explicit ID
@@ -2034,7 +3442,7 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     subscription = SubscriptionModel(
         id=subscription_id,
         organization_id=org_id, organization_name=org.name,
-        plan_id=org.requested_plan, plan_name=plan_name,
+        plan_id=primary_plan_id or "unknown", plan_name=plan_name,
         tools=json.dumps(tools), status="active",
         start_date=now, end_date=now + timedelta(days=30), amount=plan_amount
     )
@@ -2055,7 +3463,7 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     notif = NotificationModel(title="Organization Approved", message=f"{org.name} has been approved", type="success")
     db.add(notif)
     await db.commit()
-    return {"message": "Organization approved", "subscription_id": subscription_id}
+    return {"message": "Organization approved", "subscription_id": subscription_id, "plan_ids": plan_ids}
 
 @api_router.post("/organizations/{org_id}/reject")
 async def reject_organization(org_id: str, reason: str = "", payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -2084,6 +3492,302 @@ async def delete_organization(org_id: str, payload: dict = Depends(require_super
         raise HTTPException(status_code=404, detail="Organization not found")
     await db.commit()
     return {"message": "Organization deleted"}
+
+
+class OrganizationFullUpdate(BaseModel):
+    """Schema for super admin to fully edit an organization"""
+    name: Optional[str] = None
+    email: Optional[str] = None
+    domain: Optional[str] = None
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    description: Optional[str] = None
+    external_org_id: Optional[str] = None
+    auth0_org_id: Optional[str] = None
+    supported_domains: Optional[List[str]] = None
+
+
+@api_router.put("/organizations/{org_id}")
+async def update_organization_full(org_id: str, data: OrganizationFullUpdate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Update organization details (super admin only)"""
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
+    # Update fields if provided
+    if data.name is not None:
+        org.name = data.name
+    if data.email is not None:
+        org.email = data.email
+    if data.domain is not None:
+        org.domain = data.domain
+    if data.contact_person is not None:
+        org.contact_person = data.contact_person
+    if data.phone is not None:
+        org.phone = data.phone
+    if data.address is not None:
+        org.address = data.address
+    if data.description is not None:
+        org.description = data.description
+    if data.external_org_id is not None:
+        org.external_org_id = data.external_org_id if data.external_org_id else None
+    if data.auth0_org_id is not None:
+        org.auth0_org_id = data.auth0_org_id if data.auth0_org_id else None
+    if data.supported_domains is not None:
+        org.supported_domains = json.dumps(data.supported_domains) if data.supported_domains else None
+    
+    org.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    
+    return {"message": "Organization updated successfully", "organization": model_to_dict(org, ["requested_tools", "supported_domains"])}
+
+
+@api_router.put("/organizations/{org_id}/subscription")
+async def update_organization_subscription(org_id: str, data: SubscriptionUpdateRequest, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Update organization's subscription - replace plans and tools (super admin only)"""
+    # Verify org exists
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    org = org_result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
+    now = datetime.now(timezone.utc)
+    
+    # Cancel all existing active subscriptions
+    await db.execute(
+        update(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == org_id)
+        .where(SubscriptionModel.status == "active")
+        .values(status="cancelled")
+    )
+    
+    # Create new subscriptions for each selected plan
+    created_subs = []
+    for plan_selection in data.plan_selections:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_selection.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_selection.plan_id} not found")
+        
+        # Calculate price
+        base_price = plan.price_monthly if data.billing_cycle == "monthly" else plan.price_yearly
+        
+        # Get tool prices
+        tools_result = await db.execute(
+            select(PlanToolModel).where(
+                PlanToolModel.plan_id == plan.id,
+                PlanToolModel.name.in_(plan_selection.tool_ids)
+            )
+        )
+        plan_tools = tools_result.scalars().all()
+        tools_price = sum(t.price_monthly if data.billing_cycle == "monthly" else t.price_yearly for t in plan_tools)
+        total_price = base_price + tools_price
+        
+        end_date = now + timedelta(days=30) if data.billing_cycle == "monthly" else now + timedelta(days=365)
+        
+        new_sub = SubscriptionModel(
+            organization_id=org_id,
+            organization_name=org.name,
+            plan_id=plan.id,
+            plan_name=plan.name,
+            tools=json.dumps(plan_selection.tool_ids),
+            status="active",
+            start_date=now,
+            end_date=end_date,
+            billing_cycle=data.billing_cycle,
+            amount=total_price
+        )
+        db.add(new_sub)
+        created_subs.append({
+            "plan_id": plan.id,
+            "plan_name": plan.name,
+            "tools": plan_selection.tool_ids,
+            "amount": total_price
+        })
+    
+    # Update org's requested_plan and requested_tools
+    all_plan_ids = [s["plan_id"] for s in created_subs]
+    all_tools = []
+    for s in created_subs:
+        all_tools.extend(s["tools"])
+    
+    org.requested_plan = json.dumps(all_plan_ids)
+    org.requested_tools = json.dumps(all_tools)
+    org.updated_at = now
+    
+    await db.commit()
+    
+    return {
+        "message": "Organization subscription updated",
+        "subscriptions": created_subs
+    }
+
+
+class UserFullUpdate(BaseModel):
+    """Schema for super admin to edit a user"""
+    name: Optional[str] = None
+    email: Optional[str] = None
+    role_id: Optional[str] = None
+    status: Optional[str] = None
+    theme_preference: Optional[str] = None
+
+
+@api_router.put("/users/{user_id}")
+async def update_user_full(user_id: str, data: UserFullUpdate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Update user details (super admin only) - cannot change organization"""
+    result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Update fields if provided
+    if data.name is not None:
+        user.name = data.name
+    if data.email is not None:
+        user.email = data.email
+    if data.status is not None:
+        if data.status not in ["active", "inactive", "suspended", "pending_verification"]:
+            raise HTTPException(status_code=400, detail="Invalid status")
+        user.status = data.status
+    if data.theme_preference is not None:
+        if data.theme_preference not in ["light", "dark", "system"]:
+            raise HTTPException(status_code=400, detail="Invalid theme preference")
+        user.theme_preference = data.theme_preference
+    if data.role_id is not None:
+        # Validate role exists in user's organization
+        role_result = await db.execute(
+            select(RoleModel).where(
+                RoleModel.id == data.role_id,
+                RoleModel.organization_id == user.organization_id
+            )
+        )
+        role = role_result.scalar_one_or_none()
+        if not role:
+            raise HTTPException(status_code=404, detail="Role not found in user's organization")
+        user.role_id = role.id
+        user.role_name = role.name
+    
+    await db.commit()
+    
+    return {"message": "User updated successfully", "user": model_to_dict(user)}
+
+
+@api_router.put("/users/{user_id}/subscription")
+async def update_individual_user_subscription(user_id: str, data: SubscriptionUpdateRequest, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """
+    Update subscription for an individual user (Super Admin only).
+    Individual users have their own separate subscription, unlike org employees who share org's subscription.
+    """
+    # Get user
+    user_result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if this is an individual user (belongs to "Individual Users" org or "no_organization")
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == user.organization_id))
+    org = org_result.scalar_one_or_none()
+    
+    is_individual = (
+        user.organization_id == "no_organization" or 
+        (org and org.name == "Individual Users")
+    )
+    
+    if not is_individual:
+        raise HTTPException(
+            status_code=400, 
+            detail="This user belongs to an organization. Update the organization's subscription instead."
+        )
+    
+    # Get the individual user request to find their subscription
+    ind_req_result = await db.execute(
+        select(IndividualUserRequestModel).where(IndividualUserRequestModel.assigned_user_id == user_id)
+    )
+    ind_req = ind_req_result.scalar_one_or_none()
+    
+    now = datetime.now(timezone.utc)
+    
+    if ind_req and ind_req.assigned_subscription_id:
+        # Update existing subscription
+        old_sub_result = await db.execute(
+            select(SubscriptionModel).where(SubscriptionModel.id == ind_req.assigned_subscription_id)
+        )
+        old_sub = old_sub_result.scalar_one_or_none()
+        if old_sub:
+            old_sub.status = "cancelled"
+    
+    # Create new subscriptions for selected plans
+    created_subs = []
+    primary_sub_id = None
+    
+    for plan_selection in data.plan_selections:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_selection.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_selection.plan_id} not found")
+        
+        # Calculate price
+        base_price = plan.price_monthly if data.billing_cycle == "monthly" else plan.price_yearly
+        
+        # Get tool prices
+        tools_result = await db.execute(
+            select(PlanToolModel).where(
+                PlanToolModel.plan_id == plan.id,
+                PlanToolModel.name.in_(plan_selection.tool_ids)
+            )
+        )
+        plan_tools = tools_result.scalars().all()
+        tools_price = sum(t.price_monthly if data.billing_cycle == "monthly" else t.price_yearly for t in plan_tools)
+        total_price = base_price + tools_price
+        
+        end_date = now + timedelta(days=30) if data.billing_cycle == "monthly" else now + timedelta(days=365)
+        
+        new_sub = SubscriptionModel(
+            organization_id=user.organization_id,
+            organization_name=org.name if org else "Individual Users",
+            plan_id=plan.id,
+            plan_name=plan.name,
+            tools=json.dumps(plan_selection.tool_ids),
+            status="active",
+            start_date=now,
+            end_date=end_date,
+            billing_cycle=data.billing_cycle,
+            amount=total_price
+        )
+        db.add(new_sub)
+        await db.flush()  # Get the ID
+        
+        if primary_sub_id is None:
+            primary_sub_id = new_sub.id
+        
+        created_subs.append({
+            "subscription_id": new_sub.id,
+            "plan_id": plan.id,
+            "plan_name": plan.name,
+            "tools": plan_selection.tool_ids,
+            "amount": total_price
+        })
+    
+    # Update the individual user request with the primary subscription
+    if ind_req and primary_sub_id:
+        ind_req.assigned_subscription_id = primary_sub_id
+        # Also update the requested_plan and requested_tools
+        all_plan_ids = [s["plan_id"] for s in created_subs]
+        all_tools = []
+        for s in created_subs:
+            all_tools.extend(s["tools"])
+        ind_req.requested_plan = json.dumps(all_plan_ids)
+        ind_req.requested_tools = json.dumps(all_tools)
+    
+    await db.commit()
+    
+    return {
+        "message": "Individual user subscription updated",
+        "user_id": user_id,
+        "subscriptions": created_subs
+    }
 
 # ==================== SUBSCRIPTION ROUTES (Super Admin Only) ====================
 
@@ -2136,7 +3840,22 @@ async def get_plans(tool: Optional[str] = None, payload: dict = Depends(require_
     if tool:
         query = query.where(PlanModel.tool == tool)
     result = await db.execute(query.order_by(PlanModel.created_at.desc()))
-    return [model_to_dict(p, ["features"]) for p in result.scalars().all()]
+    plans = result.scalars().all()
+
+    # Get tools for each plan
+    plans_with_tools = []
+    for plan in plans:
+        plan_dict = model_to_dict(plan, ["features"])
+        # Get associated tools
+        tools_result = await db.execute(
+            select(PlanToolModel)
+            .where(PlanToolModel.plan_id == plan.id)
+            .order_by(PlanToolModel.display_order, PlanToolModel.name)
+        )
+        plan_dict["plan_tools"] = [model_to_dict(t) for t in tools_result.scalars().all()]
+        plans_with_tools.append(plan_dict)
+
+    return plans_with_tools
 
 @api_router.get("/plans/{plan_id}")
 async def get_plan(plan_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -2144,7 +3863,17 @@ async def get_plan(plan_id: str, payload: dict = Depends(require_any_admin), db:
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
-    return model_to_dict(plan, ["features"])
+    plan_dict = model_to_dict(plan, ["features"])
+
+    # Get associated tools
+    tools_result = await db.execute(
+        select(PlanToolModel)
+        .where(PlanToolModel.plan_id == plan.id)
+        .order_by(PlanToolModel.display_order, PlanToolModel.name)
+    )
+    plan_dict["plan_tools"] = [model_to_dict(t) for t in tools_result.scalars().all()]
+
+    return plan_dict
 
 @api_router.post("/plans")
 async def create_plan(data: PlanCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -2177,8 +3906,144 @@ async def delete_plan(plan_id: str, payload: dict = Depends(require_super_admin)
     result = await db.execute(delete(PlanModel).where(PlanModel.id == plan_id))
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Plan not found")
+    # Also delete associated plan tools
+    await db.execute(delete(PlanToolModel).where(PlanToolModel.plan_id == plan_id))
     await db.commit()
     return {"message": "Plan deleted"}
+
+# ==================== PLAN TOOLS ROUTES (Super Admin Only) ====================
+
+@api_router.get("/plans/{plan_id}/tools", tags=["Plans"])
+async def get_plan_tools(plan_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+    """Get all tools for a specific plan"""
+    # Verify plan exists
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan = plan_result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    result = await db.execute(
+        select(PlanToolModel)
+        .where(PlanToolModel.plan_id == plan_id)
+        .order_by(PlanToolModel.display_order, PlanToolModel.name)
+    )
+    return [model_to_dict(t) for t in result.scalars().all()]
+
+@api_router.post("/plans/{plan_id}/tools", tags=["Plans"])
+async def create_plan_tool(plan_id: str, data: PlanToolCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Add a new tool to a plan"""
+    # Verify plan exists
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan = plan_result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    tool = PlanToolModel(
+        plan_id=plan_id,
+        name=data.name,
+        description=data.description,
+        price_monthly=data.price_monthly,
+        price_yearly=data.price_yearly,
+        display_order=data.display_order
+    )
+    db.add(tool)
+    await db.commit()
+    return model_to_dict(tool)
+
+@api_router.put("/plans/{plan_id}/tools/{tool_id}", tags=["Plans"])
+async def update_plan_tool(plan_id: str, tool_id: str, data: PlanToolUpdate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Update a tool within a plan"""
+    result = await db.execute(
+        select(PlanToolModel).where(
+            PlanToolModel.id == tool_id,
+            PlanToolModel.plan_id == plan_id
+        )
+    )
+    tool = result.scalar_one_or_none()
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    if data.name is not None:
+        tool.name = data.name
+    if data.description is not None:
+        tool.description = data.description
+    if data.price_monthly is not None:
+        tool.price_monthly = data.price_monthly
+    if data.price_yearly is not None:
+        tool.price_yearly = data.price_yearly
+    if data.is_active is not None:
+        tool.is_active = data.is_active
+    if data.display_order is not None:
+        tool.display_order = data.display_order
+
+    await db.commit()
+    return model_to_dict(tool)
+
+@api_router.delete("/plans/{plan_id}/tools/{tool_id}", tags=["Plans"])
+async def delete_plan_tool(plan_id: str, tool_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Delete a tool from a plan"""
+    result = await db.execute(
+        delete(PlanToolModel).where(
+            PlanToolModel.id == tool_id,
+            PlanToolModel.plan_id == plan_id
+        )
+    )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    await db.commit()
+    return {"message": "Tool deleted"}
+
+@api_router.get("/plans/{plan_id}/calculate-price", tags=["Plans"])
+async def calculate_plan_price(plan_id: str, tool_ids: str = "", payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+    """
+    Calculate total price for a plan based on selected tools.
+    tool_ids: Comma-separated list of tool IDs
+    """
+    # Verify plan exists
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan = plan_result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    # Get selected tools
+    selected_tool_ids = [t.strip() for t in tool_ids.split(",") if t.strip()]
+
+    if not selected_tool_ids:
+        return {
+            "plan_id": plan_id,
+            "plan_name": plan.name,
+            "base_price_monthly": plan.price_monthly,
+            "base_price_yearly": plan.price_yearly,
+            "tools_price_monthly": 0,
+            "tools_price_yearly": 0,
+            "total_price_monthly": plan.price_monthly,
+            "total_price_yearly": plan.price_yearly,
+            "selected_tools": []
+        }
+
+    result = await db.execute(
+        select(PlanToolModel).where(
+            PlanToolModel.plan_id == plan_id,
+            PlanToolModel.id.in_(selected_tool_ids),
+            PlanToolModel.is_active == True
+        )
+    )
+    tools = result.scalars().all()
+
+    tools_price_monthly = sum(t.price_monthly for t in tools)
+    tools_price_yearly = sum(t.price_yearly for t in tools)
+
+    return {
+        "plan_id": plan_id,
+        "plan_name": plan.name,
+        "base_price_monthly": plan.price_monthly,
+        "base_price_yearly": plan.price_yearly,
+        "tools_price_monthly": tools_price_monthly,
+        "tools_price_yearly": tools_price_yearly,
+        "total_price_monthly": plan.price_monthly + tools_price_monthly,
+        "total_price_yearly": plan.price_yearly + tools_price_yearly,
+        "selected_tools": [{"id": t.id, "name": t.name, "price_monthly": t.price_monthly, "price_yearly": t.price_yearly} for t in tools]
+    }
 
 # ==================== USERS ROUTES (Super Admin Only) ====================
 
@@ -2203,6 +4068,10 @@ async def get_user(user_id: str, payload: dict = Depends(require_super_admin), d
 
 @api_router.post("/users")
 async def create_user(data: UserCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    # Check if email already exists
+    existing_user = await db.execute(select(UserModel).where(UserModel.email == data.email))
+    if existing_user.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="A user with this email already exists")
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == data.organization_id))
     org = org_result.scalar_one_or_none()
     if not org:
@@ -2231,11 +4100,46 @@ async def update_user_status(user_id: str, status: str, payload: dict = Depends(
 
 @api_router.delete("/users/{user_id}")
 async def delete_user(user_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(delete(UserModel).where(UserModel.id == user_id))
-    if result.rowcount == 0:
+    # First get the user to check if it's an individual user
+    user_result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    user = user_result.scalar_one_or_none()
+    
+    if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    # If user is from no_organization, delete their individual subscription
+    if user.organization_id == "no_organization":
+        # Find the individual user request to get the subscription ID
+        ind_req_result = await db.execute(
+            select(IndividualUserRequestModel).where(
+                IndividualUserRequestModel.email == user.email
+            )
+        )
+        ind_req = ind_req_result.scalar_one_or_none()
+        
+        if ind_req:
+            # Delete the subscription if it exists
+            if ind_req.assigned_subscription_id:
+                await db.execute(
+                    delete(SubscriptionModel).where(
+                        SubscriptionModel.id == ind_req.assigned_subscription_id
+                    )
+                )
+            # Delete the individual user request
+            await db.execute(
+                delete(IndividualUserRequestModel).where(
+                    IndividualUserRequestModel.email == user.email
+                )
+            )
+    
+    # Delete the user
+    await db.execute(delete(UserModel).where(UserModel.id == user_id))
+    
+    # Also delete admin record if exists
+    await db.execute(delete(AdminModel).where(AdminModel.email == user.email))
+    
     await db.commit()
-    return {"message": "User deleted"}
+    return {"message": "User deleted successfully"}
 
 # ==================== ROLES ROUTES (Super Admin Only) ====================
 
@@ -2563,55 +4467,73 @@ async def root():
 async def request_organization_subscription(data: OrganizationRequest, db: AsyncSession = Depends(get_db)):
     """
     Public API endpoint for external applications to submit organization subscription requests.
-    
-    This endpoint does NOT require authentication and is meant to be called by your main application
-    when a new organization wants to subscribe to your services.
+    Supports multiple plan selection.
     
     **Request Body:**
     - `name`: Organization name (required)
     - `email`: Organization email (required)
     - `domain`: Company domain (optional)
-    - `plan_id`: Plan ID to subscribe to (required) - e.g., 'plan_api_pro', 'plan_ai_starter'
-    - `tools`: List of tools to access (required) - e.g., ['api_platform', 'ai_agentic']
+    - `plan_ids`: List of Plan IDs to subscribe to (required) - e.g., ['plan_api_enterprise', 'plan_ai_enterprise']
+    - `selected_tools`: List of tool names from the plans (required)
     - `contact_person`: Primary contact name (required)
     - `contact_phone`: Contact phone number (optional)
     - `company_address`: Company address (optional)
     - `additional_notes`: Any additional notes (optional)
+    - `description`: Optional description (optional)
     
-    **Available Tools:**
-    - `api_platform` - API Development Platform
-    - `ai_agentic` - AI Agentic API Development Platform
-    - `migration_tool` - Migration Tool (Apigee Edge to X, etc.)
-    
-    **Returns:**
-    - `request_id`: Unique ID for tracking the request
-    - `status`: Current status ('pending')
-    - `message`: Confirmation message
+    **Flow:**
+    1. Call GET /api/public/plans to see available plans
+    2. Call GET /api/public/plans/{plan_id}/tools to see available tools for each plan
+    3. Submit this request with selected plan_ids and tools
     """
+
+    # Validate all plans exist
+    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(data.plan_ids)))
+    plans = {p.id: p for p in plans_result.scalars().all()}
     
-    # Validate tools
-    valid_tools = ['api_platform', 'ai_agentic', 'migration_tool']
-    for tool in data.tools:
-        if tool not in valid_tools:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid tool: {tool}. Valid tools are: {', '.join(valid_tools)}"
-            )
-    
-    # Validate plan exists
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == data.plan_id))
-    plan = plan_result.scalar_one_or_none()
-    if not plan:
+    invalid_plans = [pid for pid in data.plan_ids if pid not in plans]
+    if invalid_plans:
         # Get available plans
-        plans_result = await db.execute(select(PlanModel.id, PlanModel.name, PlanModel.tool))
-        available_plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.all()]
+        all_plans_result = await db.execute(select(PlanModel.id, PlanModel.name, PlanModel.tool))
+        available_plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in all_plans_result.all()]
         raise HTTPException(
             status_code=400,
             detail={
-                "error": f"Invalid plan_id: {data.plan_id}",
+                "error": f"Invalid plan_ids: {invalid_plans}",
                 "available_plans": available_plans
             }
         )
+    
+    # Get available tools from ALL selected plans
+    tools_result = await db.execute(
+        select(PlanToolModel).where(
+            PlanToolModel.plan_id.in_(data.plan_ids),
+            PlanToolModel.is_active == True
+        )
+    )
+    available_tools = {t.name: t for t in tools_result.scalars().all()}
+
+    # Validate selected tools exist in at least one of the selected plans
+    invalid_tools = [t for t in data.selected_tools if t not in available_tools]
+    if invalid_tools:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Invalid tools for selected plans: {invalid_tools}",
+                "available_tools": list(available_tools.keys())
+            }
+        )
+
+    # Calculate total price (sum of all plans + selected tools)
+    base_monthly = sum(plans[pid].price_monthly for pid in data.plan_ids)
+    base_yearly = sum(plans[pid].price_yearly for pid in data.plan_ids)
+    
+    selected_tool_objects = [available_tools[t] for t in data.selected_tools]
+    tools_monthly = sum(t.price_monthly for t in selected_tool_objects)
+    tools_yearly = sum(t.price_yearly for t in selected_tool_objects)
+    
+    total_monthly = base_monthly + tools_monthly
+    total_yearly = base_yearly + tools_yearly
     
     # Check if organization with same email already exists
     existing = await db.execute(select(OrganizationModel).where(OrganizationModel.email == data.email))
@@ -2621,23 +4543,28 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
             detail=f"An organization with email {data.email} already exists"
         )
     
-    # Create organization request
+    # Create organization request - store plan_ids as JSON array
     org = OrganizationModel(
         name=data.name,
         email=data.email,
         domain=data.domain,
-        requested_plan=data.plan_id,
-        requested_tools=json.dumps(data.tools),
+        requested_plan=json.dumps(data.plan_ids),  # Store as JSON array
+        requested_tools=json.dumps(data.selected_tools),
         contact_person=data.contact_person,
         phone=data.contact_phone,
-        address=data.company_address
+        address=data.company_address,
+        description=data.description
     )
     db.add(org)
     
     # Create notification for admin
+    tools_str = ', '.join(data.selected_tools[:3])
+    if len(data.selected_tools) > 3:
+        tools_str += f" +{len(data.selected_tools) - 3} more"
+    plans_str = ', '.join([plans[pid].name for pid in data.plan_ids])
     notif = NotificationModel(
         title="New Organization Request",
-        message=f"{data.name} has requested {plan.name} plan for {', '.join(data.tools)}",
+        message=f"{data.name} has requested {plans_str} with tools: {tools_str}",
         type="info",
         link=f"/pending-organizations"
     )
@@ -2645,18 +4572,28 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     
     await db.commit()
     
+    # Build response with plan details
+    plan_names = [{"id": pid, "name": plans[pid].name} for pid in data.plan_ids]
+    
     return {
         "request_id": org.id,
         "status": "pending",
         "message": f"Organization subscription request submitted successfully. Your request ID is {org.id}. An admin will review your request shortly.",
         "organization": {
-            "name": data.name,
-            "email": data.email,
-            "plan": plan.name,
-            "tools": data.tools
+            "name": org.name,
+            "email": org.email,
+            "plans": plan_names,
+            "selected_tools": data.selected_tools,
+            "pricing": {
+                "base_monthly": base_monthly,
+                "base_yearly": base_yearly,
+                "tools_monthly": tools_monthly,
+                "tools_yearly": tools_yearly,
+                "total_monthly": total_monthly,
+                "total_yearly": total_yearly
+            }
         }
     }
-
 
 @api_router.get("/public/organizations/status/{request_id}", tags=["Public API"])
 async def get_organization_request_status(request_id: str, db: AsyncSession = Depends(get_db)):
@@ -2713,25 +4650,99 @@ async def get_available_plans(tool: Optional[str] = None, db: AsyncSession = Dep
     
     result = await db.execute(query.order_by(PlanModel.tool, PlanModel.price_monthly))
     plans = result.scalars().all()
-    
+    # Build plans with their tools
+    plans_with_tools = []
+    for p in plans:
+        # Get tools for this plan
+        tools_result = await db.execute(
+            select(PlanToolModel)
+            .where(PlanToolModel.plan_id == p.id, PlanToolModel.is_active == True)
+            .order_by(PlanToolModel.display_order, PlanToolModel.name)
+        )
+        plan_tools = tools_result.scalars().all()
+
+        # Calculate total if all tools selected
+        total_tools_monthly = sum(t.price_monthly for t in plan_tools)
+        total_tools_yearly = sum(t.price_yearly for t in plan_tools)
+
+        plans_with_tools.append({
+            "id": p.id,
+            "name": p.name,
+            "tool": p.tool,
+            "description": p.description,
+            "features": json.loads(p.features) if isinstance(p.features, str) else p.features,
+            "base_price_monthly": p.price_monthly,
+            "base_price_yearly": p.price_yearly,
+            "available_tools": [
+                {
+                    "id": t.id,
+                    "name": t.name,
+                    "description": t.description,
+                    "price_monthly": t.price_monthly,
+                    "price_yearly": t.price_yearly
+                }
+                for t in plan_tools
+            ],
+            "total_tools_count": len(plan_tools),
+            "max_price_monthly": p.price_monthly + total_tools_monthly,
+            "max_price_yearly": p.price_yearly + total_tools_yearly
+        })
     return {
-        "plans": [
-            {
-                "id": p.id,
-                "name": p.name,
-                "tool": p.tool,
-                "description": p.description,
-                "features": json.loads(p.features) if isinstance(p.features, str) else p.features,
-                "price_monthly": p.price_monthly,
-                "price_yearly": p.price_yearly
-            }
-            for p in plans
-        ],
-        "tools": [
+        "plans": plans_with_tools,
+        "product_types": [
             {"id": "api_platform", "name": "API Development Platform"},
             {"id": "ai_agentic", "name": "AI Agentic API Development Platform"},
             {"id": "migration_tool", "name": "Migration Tool"}
         ]
+    }
+
+@api_router.get("/public/plans/{plan_id}/tools", tags=["Public API"])
+async def get_plan_tools_public(plan_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Get all available tools for a specific plan. This endpoint is public.
+    
+    Use this to display tool selection when users/organizations are signing up.
+    
+    **Path Parameter:**
+    - `plan_id`: The plan ID (e.g., 'plan_api_enterprise')
+    
+    **Returns:**
+    - Plan info with list of selectable tools and their pricing
+    """
+    # Get plan
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan = plan_result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    # Get tools for this plan
+    tools_result = await db.execute(
+        select(PlanToolModel)
+        .where(PlanToolModel.plan_id == plan_id, PlanToolModel.is_active == True)
+        .order_by(PlanToolModel.display_order, PlanToolModel.name)
+    )
+    tools = tools_result.scalars().all()
+
+    return {
+        "plan": {
+            "id": plan.id,
+            "name": plan.name,
+            "tool": plan.tool,
+            "description": plan.description,
+            "base_price_monthly": plan.price_monthly,
+            "base_price_yearly": plan.price_yearly
+        },
+        "available_tools": [
+            {
+                "id": t.id,
+                "name": t.name,
+                "description": t.description,
+                "price_monthly": t.price_monthly,
+                "price_yearly": t.price_yearly
+            }
+            for t in tools
+        ],
+        "total_tools": len(tools)
     }
 
 
@@ -2757,7 +4768,7 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
     - `status`: Current status ('pending')
     - `message`: Confirmation message
     """
-    
+    await assert_unique_email(db, data.email)
     # Validate organization exists and is approved
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == data.organization_id))
     org = org_result.scalar_one_or_none()
@@ -2866,7 +4877,423 @@ async def get_user_request_status(request_id: str, db: AsyncSession = Depends(ge
     return response
 
 
-@api_router.get("/public/organizations/{org_id}/roles", tags=["Public API"])
+@api_router.get("/public/users/{email}", tags=["Public API"])
+async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
+    """
+    Get user details by email (public endpoint).
+    Returns user info including role, permissions, plans, tools, and admin status.
+    """
+    # Check in users table
+    result = await db.execute(select(UserModel).where(UserModel.email == email))
+    user = result.scalar_one_or_none()
+    
+    if user:
+        # Get role permissions
+        role_result = await db.execute(select(RoleModel).where(RoleModel.id == user.role_id))
+        role = role_result.scalar_one_or_none()
+        permissions = json.loads(role.permissions) if role and role.permissions else []
+        
+        # Check if user is also an admin
+        admin_result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+        admin = admin_result.scalar_one_or_none()
+        
+        # Get subscription details (plans and tools) based on organization type
+        subscription = None
+        plans = []
+        tools = []
+        
+        if user.organization_id == "no_organization":
+            # For individual users, get subscription from their individual request
+            ind_req_result = await db.execute(
+                select(IndividualUserRequestModel).where(
+                    IndividualUserRequestModel.email == user.email,
+                    IndividualUserRequestModel.status == "approved"
+                ).order_by(IndividualUserRequestModel.approved_at.desc())
+            )
+            ind_req = ind_req_result.scalars().first()
+            if ind_req and ind_req.assigned_subscription_id:
+                sub_result = await db.execute(
+                    select(SubscriptionModel).where(
+                        SubscriptionModel.id == ind_req.assigned_subscription_id
+                    )
+                )
+                subscription = sub_result.scalar_one_or_none()
+        else:
+            # For organization users, get org subscription
+            sub_result = await db.execute(
+                select(SubscriptionModel).where(
+                    SubscriptionModel.organization_id == user.organization_id,
+                    SubscriptionModel.status == "active"
+                ).order_by(SubscriptionModel.start_date.desc())
+            )
+            subscription = sub_result.scalars().first()
+        
+        if subscription:
+            # Parse plan_id - could be JSON array or single string
+            plan_id_raw = subscription.plan_id
+            try:
+                plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                plan_ids = [plan_id_raw] if plan_id_raw else []
+            
+            # Get plan details
+            if plan_ids:
+                plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+                plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+            
+            # Parse tools
+            try:
+                tools = json.loads(subscription.tools) if subscription.tools else []
+            except (json.JSONDecodeError, TypeError):
+                tools = []
+        
+        # Build response with admin details if user is also an admin
+        response = {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "organization_id": user.organization_id,
+            "organization_name": user.organization_name,
+            "role_id": user.role_id,
+            "role_name": user.role_name,
+            "role": admin.role if admin else user.role_name.lower().replace(" ", "_"),
+            "permissions": permissions,
+            "is_admin": admin is not None,
+            "status": user.status,
+            "theme_preference": getattr(user, 'theme_preference', 'light'),
+            "plans": plans,
+            "tools": tools,
+            "subscription": {
+                "id": subscription.id,
+                "plan_name": subscription.plan_name,
+                "status": subscription.status,
+                "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
+                "end_date": subscription.end_date.isoformat() if subscription.end_date else None
+            } if subscription else None,
+            "created_at": user.created_at.isoformat() if user.created_at else None
+        }
+        
+        # Add admin details if user is also an admin
+        if admin:
+            response["admin"] = {
+                "id": admin.id,
+                "email": admin.email,
+                "name": admin.name,
+                "role": admin.role,
+                "organization_id": admin.organization_id,
+                "organization_name": admin.organization_name,
+                "theme_preference": getattr(admin, 'theme_preference', 'light'),
+                "is_active": admin.is_active,
+                "created_at": admin.created_at.isoformat() if admin.created_at else None
+            }
+        
+        return response
+    
+    # Check in admins table
+    result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+    admin = result.scalar_one_or_none()
+    
+    if admin:
+        # Get subscription based on organization type
+        subscription = None
+        plans = []
+        tools = []
+        
+        if admin.organization_id and admin.organization_id != "no_organization":
+            # For organization admins, get org subscription
+            sub_result = await db.execute(
+                select(SubscriptionModel).where(
+                    SubscriptionModel.organization_id == admin.organization_id,
+                    SubscriptionModel.status == "active"
+                ).order_by(SubscriptionModel.start_date.desc())
+            )
+            subscription = sub_result.scalars().first()
+        elif admin.organization_id == "no_organization":
+            # For individual admins, get from their individual request
+            ind_req_result = await db.execute(
+                select(IndividualUserRequestModel).where(
+                    IndividualUserRequestModel.email == admin.email,
+                    IndividualUserRequestModel.status == "approved"
+                ).order_by(IndividualUserRequestModel.approved_at.desc())
+            )
+            ind_req = ind_req_result.scalars().first()
+            if ind_req and ind_req.assigned_subscription_id:
+                sub_result = await db.execute(
+                    select(SubscriptionModel).where(
+                        SubscriptionModel.id == ind_req.assigned_subscription_id
+                    )
+                )
+                subscription = sub_result.scalar_one_or_none()
+        
+        if subscription:
+            # Parse plan_id
+            plan_id_raw = subscription.plan_id
+            try:
+                plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                plan_ids = [plan_id_raw] if plan_id_raw else []
+            
+            if plan_ids:
+                plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+                plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+            
+            try:
+                tools = json.loads(subscription.tools) if subscription.tools else []
+            except (json.JSONDecodeError, TypeError):
+                tools = []
+        
+        return {
+            "id": admin.id,
+            "email": admin.email,
+            "name": admin.name,
+            "organization_id": admin.organization_id,
+            "organization_name": admin.organization_name,
+            "role": admin.role,
+            "permissions": ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"],
+            "is_admin": True,
+            "status": "active" if admin.is_active else "inactive",
+            "theme_preference": getattr(admin, 'theme_preference', 'light'),
+            "plans": plans,
+            "tools": tools,
+            "subscription": {
+                "id": subscription.id,
+                "plan_name": subscription.plan_name,
+                "status": subscription.status,
+                "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
+                "end_date": subscription.end_date.isoformat() if subscription.end_date else None
+            } if subscription else None,
+            "created_at": admin.created_at.isoformat() if admin.created_at else None
+        }
+    
+    raise HTTPException(status_code=404, detail="User not found")
+
+
+@api_router.post("/public/users/lookup", tags=["Public API"])
+async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
+    """
+    Bulk lookup users by email addresses.
+    Returns user info including plans and tools for each user.
+    """
+    emails = data.get("emails", [])
+    if not emails:
+        raise HTTPException(status_code=400, detail="No emails provided")
+    
+    found_users = []
+    not_found = []
+    
+    for email in emails:
+        # Check users table
+        result = await db.execute(select(UserModel).where(UserModel.email == email))
+        user = result.scalar_one_or_none()
+        
+        if user:
+            # Get role permissions
+            role_result = await db.execute(select(RoleModel).where(RoleModel.id == user.role_id))
+            role = role_result.scalar_one_or_none()
+            permissions = json.loads(role.permissions) if role and role.permissions else []
+            
+            # Check if also admin
+            admin_result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+            admin = admin_result.scalar_one_or_none()
+            
+            # Get subscription details based on organization type
+            plans = []
+            tools = []
+            subscription = None
+            
+            if user.organization_id == "no_organization":
+                # For individual users, get subscription from their individual request
+                ind_req_result = await db.execute(
+                    select(IndividualUserRequestModel).where(
+                        IndividualUserRequestModel.email == user.email,
+                        IndividualUserRequestModel.status == "approved"
+                    ).order_by(IndividualUserRequestModel.approved_at.desc())
+                )
+                ind_req = ind_req_result.scalars().first()
+                if ind_req and ind_req.assigned_subscription_id:
+                    sub_result = await db.execute(
+                        select(SubscriptionModel).where(
+                            SubscriptionModel.id == ind_req.assigned_subscription_id
+                        )
+                    )
+                    subscription = sub_result.scalar_one_or_none()
+            else:
+                # For organization users, get org subscription
+                sub_result = await db.execute(
+                    select(SubscriptionModel).where(
+                        SubscriptionModel.organization_id == user.organization_id,
+                        SubscriptionModel.status == "active"
+                    ).order_by(SubscriptionModel.start_date.desc())
+                )
+                subscription = sub_result.scalars().first()
+            
+            if subscription:
+                plan_id_raw = subscription.plan_id
+                try:
+                    plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    plan_ids = [plan_id_raw] if plan_id_raw else []
+                
+                if plan_ids:
+                    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+                    plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+                
+                try:
+                    tools = json.loads(subscription.tools) if subscription.tools else []
+                except (json.JSONDecodeError, TypeError):
+                    tools = []
+            
+            user_data = {
+                "email": user.email,
+                "name": user.name,
+                "organization_id": user.organization_id,
+                "organization_name": user.organization_name,
+                "role_id": user.role_id,
+                "role_name": user.role_name,
+                "role": admin.role if admin else user.role_name.lower().replace(" ", "_"),
+                "permissions": permissions,
+                "is_admin": admin is not None,
+                "status": user.status,
+                "theme_preference": getattr(user, 'theme_preference', 'light'),
+                "plans": plans,
+                "tools": tools,
+                "subscription": {
+                    "id": subscription.id,
+                    "plan_name": subscription.plan_name,
+                    "status": subscription.status,
+                    "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
+                    "end_date": subscription.end_date.isoformat() if subscription.end_date else None
+                } if subscription else None,
+                "created_at": user.created_at.isoformat() if user.created_at else None
+            }
+            
+            # Add admin details if user is also an admin
+            if admin:
+                user_data["admin"] = {
+                    "id": admin.id,
+                    "email": admin.email,
+                    "name": admin.name,
+                    "role": admin.role,
+                    "organization_id": admin.organization_id,
+                    "organization_name": admin.organization_name,
+                    "is_active": admin.is_active
+                }
+            
+            found_users.append(user_data)
+            continue
+        
+        # Check admins table
+        result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+        admin = result.scalar_one_or_none()
+        
+        if admin:
+            plans = []
+            tools = []
+            subscription = None
+            
+            if admin.organization_id and admin.organization_id != "no_organization":
+                # For organization admins, get org subscription
+                sub_result = await db.execute(
+                    select(SubscriptionModel).where(
+                        SubscriptionModel.organization_id == admin.organization_id,
+                        SubscriptionModel.status == "active"
+                    ).order_by(SubscriptionModel.start_date.desc())
+                )
+                subscription = sub_result.scalars().first()
+            elif admin.organization_id == "no_organization":
+                # For individual admins, get from their individual request
+                ind_req_result = await db.execute(
+                    select(IndividualUserRequestModel).where(
+                        IndividualUserRequestModel.email == admin.email,
+                        IndividualUserRequestModel.status == "approved"
+                    ).order_by(IndividualUserRequestModel.approved_at.desc())
+                )
+                ind_req = ind_req_result.scalars().first()
+                if ind_req and ind_req.assigned_subscription_id:
+                    sub_result = await db.execute(
+                        select(SubscriptionModel).where(
+                            SubscriptionModel.id == ind_req.assigned_subscription_id
+                        )
+                    )
+                    subscription = sub_result.scalar_one_or_none()
+            
+            if subscription:
+                plan_id_raw = subscription.plan_id
+                try:
+                    plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    plan_ids = [plan_id_raw] if plan_id_raw else []
+                
+                if plan_ids:
+                    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+                    plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+                
+                try:
+                    tools = json.loads(subscription.tools) if subscription.tools else []
+                except (json.JSONDecodeError, TypeError):
+                    tools = []
+            
+            found_users.append({
+                "email": admin.email,
+                "name": admin.name,
+                "organization_id": admin.organization_id,
+                "organization_name": admin.organization_name,
+                "role": admin.role,
+                "permissions": ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"],
+                "is_admin": True,
+                "status": "active" if admin.is_active else "inactive",
+                "theme_preference": getattr(admin, 'theme_preference', 'light'),
+                "plans": plans,
+                "tools": tools,
+                "subscription": {
+                    "id": subscription.id,
+                    "plan_name": subscription.plan_name,
+                    "status": subscription.status,
+                    "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
+                    "end_date": subscription.end_date.isoformat() if subscription.end_date else None
+                } if subscription else None,
+                "created_at": admin.created_at.isoformat() if admin.created_at else None
+            })
+            continue
+        
+        not_found.append(email)
+    
+    return {
+        "users": found_users,
+        "not_found": not_found
+    }
+
+
+@api_router.put("/public/users/{email}/preferences", tags=["Public API"])
+async def update_user_preferences(email: str, data: dict, db: AsyncSession = Depends(get_db)):
+    """
+    Update user preferences (theme preference).
+    """
+    theme = data.get("theme_preference", "light")
+    if theme not in ["light", "dark"]:
+        raise HTTPException(status_code=400, detail="Invalid theme preference. Must be 'light' or 'dark'")
+    
+    # Try to update in users table
+    result = await db.execute(select(UserModel).where(UserModel.email == email))
+    user = result.scalar_one_or_none()
+    
+    if user:
+        if hasattr(user, 'theme_preference'):
+            user.theme_preference = theme
+        await db.commit()
+        return {"message": "Preferences updated", "theme_preference": theme}
+    
+    # Try to update in admins table
+    result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+    admin = result.scalar_one_or_none()
+    
+    if admin:
+        if hasattr(admin, 'theme_preference'):
+            admin.theme_preference = theme
+        await db.commit()
+        return {"message": "Preferences updated", "theme_preference": theme}
+    
+    raise HTTPException(status_code=404, detail="User not found")
 async def get_organization_roles(org_id: str, db: AsyncSession = Depends(get_db)):
     """
     Get available roles for an organization. External apps can use this to show role options.
@@ -2962,7 +5389,10 @@ async def approve_user_request(
         raise HTTPException(status_code=404, detail="User request not found")
     if req.status != "pending":
         raise HTTPException(status_code=400, detail="Request is not pending")
-    
+    # Check if user with this email already exists
+    existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
+    if existing_user.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="A user with this email already exists")
     # Validate role exists and belongs to the organization
     role_result = await db.execute(
         select(RoleModel).where(RoleModel.id == role_id, RoleModel.organization_id == req.organization_id)
@@ -2986,9 +5416,39 @@ async def approve_user_request(
         organization_id=req.organization_id,
         organization_name=req.organization_name,
         role_id=role_id,
-        role_name=role.name
+        role_name=role.name,
+        status="pending_verification",
+        email_verified=False,
+        password_set=False,
+        first_login_token=secrets.token_urlsafe(32)
     )
     db.add(user)
+    await db.flush()
+    
+    # Create user in Auth0
+    auth0_result = await auth0_mgmt.create_user(
+        email=req.email,
+        name=req.name,
+        user_metadata={
+            "probestack_user_id": user.id,
+            "organization_id": req.organization_id,
+            "organization_name": req.organization_name
+        }
+    )
+    
+    if auth0_result.get("success"):
+        user.auth0_user_id = auth0_result.get("auth0_user_id")
+        logger.info(f"Auth0 user created for {req.email}: {user.auth0_user_id}")
+        # Send verification email via Auth0
+        await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    elif auth0_result.get("exists"):
+        existing_user = await auth0_mgmt.get_user_by_email(req.email)
+        if existing_user.get("success"):
+            user.auth0_user_id = existing_user["user"]["user_id"]
+            # Send verification email for existing Auth0 user
+            await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    else:
+        logger.warning(f"Failed to create Auth0 user for {req.email}: {auth0_result.get('error')}")
     
     # Create notification
     notif = NotificationModel(
@@ -3000,6 +5460,10 @@ async def approve_user_request(
     
     await db.commit()
     
+    # Generate setup account URL
+    base_url = os.environ.get("APP_URL", "")
+    setup_url = f"{base_url}/setup-account?email={req.email}&token={user.first_login_token}" if base_url else None
+    
     return {
         "message": "User request approved",
         "user_id": user.id,
@@ -3007,8 +5471,12 @@ async def approve_user_request(
             "name": user.name,
             "email": user.email,
             "organization": user.organization_name,
-            "role": user.role_name
-        }
+            "role": user.role_name,
+            "auth0_user_id": user.auth0_user_id,
+            "status": user.status
+        },
+        "setup_url": setup_url,
+        "next_steps": "User will receive an email to verify their email address and set their password."
     }
 
 

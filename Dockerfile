@@ -5,6 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy env file into the image
+COPY .env .env
+
+# Copy application code
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
