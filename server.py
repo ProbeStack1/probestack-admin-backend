@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON
 from sqlalchemy.dialects.mysql import LONGTEXT
-
+from sqlalchemy import text
 import os
 import logging
 from pathlib import Path
@@ -22,7 +22,13 @@ from urllib.parse import urlencode
 import secrets
 
 from passlib.context import CryptContext
+app = FastAPI(
+    title="ProbeStack Admin Dashboard API",
+    root_path=os.getenv("ROOT_PATH", "")
+)
 
+api_router = APIRouter(prefix="/api")
+security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -79,11 +85,6 @@ AsyncSessionLocal = async_sessionmaker(
 # JWT Config
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
-
-# Create the main app
-app = FastAPI(title="ProbeStack Admin Dashboard API")
-api_router = APIRouter(prefix="/api")
-security = HTTPBearer()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -804,6 +805,14 @@ def require_any_admin(payload: dict = Depends(verify_token)):
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+# ==================== HEALTH CHECKS ====================
+
+@api_router.get("/health/db", tags=["Health"])
+async def db_health():
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(text("SELECT 1"))
+        return {"db": "ok", "result": result.scalar()}
 
 # ==================== UNIQUENESS HELPERS ====================
 
