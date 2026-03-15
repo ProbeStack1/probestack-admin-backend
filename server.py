@@ -20,7 +20,20 @@ import json
 import httpx
 from urllib.parse import urlencode
 import secrets
+from urllib.parse import quote_plus
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase
+import os
 
+DB_USER = os.environ.get("DB_USER")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+DB_NAME = os.environ.get("DB_NAME")
+INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
+
+if not all([DB_USER, DB_PASSWORD, DB_NAME]):
+    raise RuntimeError("Database environment variables not set")
+
+DB_PASSWORD = quote_plus(DB_PASSWORD)
 from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -57,12 +70,12 @@ DB_PASSWORD = quote_plus(DB_PASSWORD)
 
 if INSTANCE_CONNECTION_NAME:
     DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
+        f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
         f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
     )
 else:
     DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
+        f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
     )
 
 engine = create_async_engine(
@@ -71,6 +84,7 @@ engine = create_async_engine(
     pool_recycle=1800,
     pool_size=5,
     max_overflow=10,
+    pool_timeout=30,
     echo=False,
 )
 
