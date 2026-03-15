@@ -57,8 +57,7 @@ DB_PASSWORD = quote_plus(DB_PASSWORD)
 
 if INSTANCE_CONNECTION_NAME:
     DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
-        f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
     )
 else:
     DATABASE_URL = (
