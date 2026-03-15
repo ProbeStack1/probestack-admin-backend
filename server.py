@@ -80,8 +80,15 @@ AsyncSessionLocal = async_sessionmaker(
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
 
+# Root path (for GKE ingress path prefix)
+ROOT_PATH = os.environ.get("ROOT_PATH", "")
+
 # Create the main app
-app = FastAPI(title="ProbeStack Admin Dashboard API")
+app = FastAPI(
+    title="ProbeStack Admin Dashboard API",
+    root_path=ROOT_PATH
+)
+
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
