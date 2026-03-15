@@ -57,7 +57,8 @@ DB_PASSWORD = quote_plus(DB_PASSWORD)
 
 if INSTANCE_CONNECTION_NAME:
     DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
+        f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
     )
 else:
     DATABASE_URL = (
@@ -67,9 +68,9 @@ else:
 engine = create_async_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=1800,      # recycle connections every 30 minutes
-    pool_size=5,            # max connections in pool
-    max_overflow=10,        # additional burst connections
+    pool_recycle=1800,
+    pool_size=5,
+    max_overflow=10,
     echo=False,
 )
 
