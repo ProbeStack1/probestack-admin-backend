@@ -68,6 +68,9 @@ else:
 engine = create_async_engine(
     DATABASE_URL,
     pool_pre_ping=True,
+    pool_recycle=1800,      # recycle connections every 30 minutes
+    pool_size=5,            # max connections in pool
+    max_overflow=10,        # additional burst connections
     echo=False,
 )
 
