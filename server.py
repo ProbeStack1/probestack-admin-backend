@@ -1,11 +1,18 @@
+# ================================
+# IMPORTS
+# ================================
+
 from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON
 from sqlalchemy.dialects.mysql import LONGTEXT
+
+from passlib.context import CryptContext
 
 import os
 import logging
@@ -18,45 +25,37 @@ import jwt
 import bcrypt
 import json
 import httpx
-from urllib.parse import urlencode
 import secrets
-from urllib.parse import quote_plus
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
-import os
 
-DB_USER = os.environ.get("DB_USER")
-DB_PASSWORD = os.environ.get("DB_PASSWORD")
-DB_NAME = os.environ.get("DB_NAME")
-INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
+from urllib.parse import urlencode, quote_plus
 
-if not all([DB_USER, DB_PASSWORD, DB_NAME]):
-    raise RuntimeError("Database environment variables not set")
 
-DB_PASSWORD = quote_plus(DB_PASSWORD)
-from passlib.context import CryptContext
+# ================================
+# LOAD ENV FILE
+# ================================
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+ROOT_DIR = Path(__file__).parent
+
+if os.path.exists(ROOT_DIR / ".env"):
+    load_dotenv(ROOT_DIR / ".env")
+
+
+# ================================
+# PASSWORD HASHING
+# ================================
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto"
+)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-ROOT_DIR = Path(__file__).parent
-if os.path.exists(ROOT_DIR / ".env"):
-    load_dotenv(ROOT_DIR / ".env")
 
-# Auth0 Config
-AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'probestack-usa-dev.us.auth0.com')
-AUTH0_CLIENT_ID = os.environ.get('AUTH0_CLIENT_ID', '')
-AUTH0_CLIENT_SECRET = os.environ.get('AUTH0_CLIENT_SECRET', '')
-AUTH0_CALLBACK_URI = os.environ.get('AUTH0_CALLBACK_URI', 'https://probestack.io/callback')
-AUTH0_MGMT_DOMAIN = os.environ.get('AUTH0_MGMT_DOMAIN', 'probestack-usa-dev.us.auth0.com')
-AUTH0_MGMT_CLIENT_ID = os.environ.get('AUTH0_MGMT_CLIENT_ID', '')
-AUTH0_MGMT_CLIENT_SECRET = os.environ.get('AUTH0_MGMT_CLIENT_SECRET', '')
-AUTH0_DB_CONNECTION_NAME = os.environ.get('AUTH0_DB_CONNECTION_NAME', 'Username-Password-Authentication')
-AUTH0_DB_CONNECTION_ID = os.environ.get('AUTH0_DB_CONNECTION_ID', '')
-
-from urllib.parse import quote_plus
+# ================================
+# DATABASE CONFIGURATION
+# ================================
 
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
@@ -66,37 +65,101 @@ INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
 if not all([DB_USER, DB_PASSWORD, DB_NAME]):
     raise RuntimeError("Database environment variables not set")
 
+# encode password safely
 DB_PASSWORD = quote_plus(DB_PASSWORD)
 
+# Cloud SQL socket connection
 if INSTANCE_CONNECTION_NAME:
     DATABASE_URL = (
-        f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
         f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
     )
 else:
+    # local development
     DATABASE_URL = (
-        f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
     )
+
 
 engine = create_async_engine(
     DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
     echo=False,
+    pool_pre_ping=True,
+    pool_recycle=600,
+    pool_size=5,
+    max_overflow=2,
 )
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
     expire_on_commit=False,
+    autoflush=False,
 )
 
-# JWT Config
-JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
+# ================================
+# AUTH0 CONFIG
+# ================================
+
+AUTH0_DOMAIN = os.environ.get(
+    "AUTH0_DOMAIN",
+    "probestack-usa-dev.us.auth0.com"
+)
+
+AUTH0_CLIENT_ID = os.environ.get("AUTH0_CLIENT_ID", "")
+AUTH0_CLIENT_SECRET = os.environ.get("AUTH0_CLIENT_SECRET", "")
+
+AUTH0_CALLBACK_URI = os.environ.get(
+    "AUTH0_CALLBACK_URI",
+    "https://probestack.io/callback"
+)
+
+AUTH0_MGMT_DOMAIN = os.environ.get(
+    "AUTH0_MGMT_DOMAIN",
+    "probestack-usa-dev.us.auth0.com"
+)
+
+AUTH0_MGMT_CLIENT_ID = os.environ.get("AUTH0_MGMT_CLIENT_ID", "")
+AUTH0_MGMT_CLIENT_SECRET = os.environ.get("AUTH0_MGMT_CLIENT_SECRET", "")
+
+AUTH0_DB_CONNECTION_NAME = os.environ.get(
+    "AUTH0_DB_CONNECTION_NAME",
+    "Username-Password-Authentication"
+)
+
+AUTH0_DB_CONNECTION_ID = os.environ.get(
+    "AUTH0_DB_CONNECTION_ID",
+    ""
+)
+
+
+# ================================
+# JWT CONFIG
+# ================================
+
+JWT_SECRET = os.environ.get(
+    "JWT_SECRET",
+    "admin-dashboard-secret-key-2024"
+)
+
 JWT_ALGORITHM = "HS256"
 
+
+# ================================
+# LOGGING
+# ================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 # Root path (for GKE ingress path prefix)
 ROOT_PATH = os.environ.get("ROOT_PATH", "")
 
