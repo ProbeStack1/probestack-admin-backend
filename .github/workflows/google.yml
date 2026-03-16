@@ -3,7 +3,7 @@ name: 'Build and Deploy to GKE'
 on:
   push:
     branches:
-      - '"main"'
+      - 'gke'
 
 env:
   PROJECT_ID: 'methodical-mark-482504-j3' # TODO: update to your Google Cloud project ID
@@ -13,7 +13,7 @@ env:
   DEPLOYMENT_NAME: 'ps-admin-be' # TODO: update to your deployment name
   REPOSITORY: 'ps-admin-be' # TODO: update to your Artifact Registry docker repository name
   IMAGE: 'ps-admin-be'
-  WORKLOAD_IDENTITY_PROVIDER: 'projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider' # TODO: update to your workload identity provider
+  WORKLOAD_IDENTITY_PROVIDER: 'projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider'
 
 jobs:
   setup-build-publish-deploy:
@@ -69,7 +69,7 @@ jobs:
       # Set up kustomize
       - name: 'Set up Kustomize'
         run: |-
-          curl -sfLo kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz
+          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz | tar xz
           chmod u+x ./kustomize
 
       # Deploy the Docker image to the GKE cluster
