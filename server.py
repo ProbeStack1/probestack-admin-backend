@@ -67,8 +67,12 @@ if not all([DB_USER, DB_PASSWORD, DB_NAME]):
 
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 # encode password safely
 DB_PASSWORD = quote_plus(DB_PASSWORD)
+=======
+DB_PASSWORD_ENCODED = quote_plus(DB_PASSWORD)
+>>>>>>> Stashed changes
 =======
 DB_PASSWORD_ENCODED = quote_plus(DB_PASSWORD)
 >>>>>>> Stashed changes
@@ -95,6 +99,7 @@ if INSTANCE_CONNECTION_NAME:
 else:
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
     # local development
     DATABASE_URL = (
         f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
@@ -110,6 +115,20 @@ engine = create_async_engine(
     max_overflow=2,
 )
 
+=======
+    DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD_ENCODED}@127.0.0.1:3306/{DB_NAME}"
+    engine = create_async_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+        connect_args={"connect_timeout": 10},
+        echo=False,
+    )
+
+>>>>>>> Stashed changes
 =======
     DATABASE_URL = f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD_ENCODED}@127.0.0.1:3306/{DB_NAME}"
     engine = create_async_engine(
