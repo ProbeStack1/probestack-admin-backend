@@ -4433,6 +4433,15 @@ async def seed_data(db: AsyncSession = Depends(get_db)):
 async def root():
     return {"message": "ProbeStack Admin Dashboard API", "version": "1.0.0", "database": "MySQL"}
 
+@api_router.get("/health/db")
+async def db_health():
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(select(func.now()))
+        return {"db": "ok", "instance": INSTANCE_CONNECTION_NAME or "local"}
+    except Exception as e:
+        return {"db": "error", "detail": str(e)}
+
 # ==================== PUBLIC API FOR EXTERNAL APPLICATIONS ====================
 
 @api_router.post("/public/organizations/request", tags=["Public API"])
