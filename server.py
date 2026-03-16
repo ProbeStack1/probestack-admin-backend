@@ -66,29 +66,32 @@ if not all([DB_USER, DB_PASSWORD, DB_NAME]):
     raise RuntimeError("Database environment variables not set")
 
 # encode password safely
-DB_PASSWORD = quote_plus(DB_PASSWORD)
+DB_PASSWORD_ENCODED = quote_plus(DB_PASSWORD)
 
 # Cloud SQL socket connection
 if INSTANCE_CONNECTION_NAME:
-    DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
-        f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
+    engine = create_async_engine(
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD_ENCODED}@/{DB_NAME}",
+        echo=False,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+        connect_args={
+            "unix_socket": f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
+            "connect_timeout": 10
+        }
     )
 else:
-    # local development
-    DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
+    engine = create_async_engine(
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD_ENCODED}@127.0.0.1:3306/{DB_NAME}",
+        echo=False,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_size=5,
+        max_overflow=10,
     )
-
-
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    pool_recycle=600,
-    pool_size=5,
-    max_overflow=2,
-)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
