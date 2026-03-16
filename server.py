@@ -60,38 +60,23 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 DB_NAME = os.environ.get("DB_NAME")
+DB_HOST = os.environ.get("DB_HOST")
+DB_PORT = os.environ.get("DB_PORT", "3306")
 INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
 
-if not all([DB_USER, DB_PASSWORD, DB_NAME]):
+if not all([DB_USER, DB_PASSWORD, DB_NAME, DB_HOST]):
     raise RuntimeError("Database environment variables not set")
 
-# encode password safely
-DB_PASSWORD_ENCODED = quote_plus(DB_PASSWORD)
-
-# Cloud SQL socket connection
-if INSTANCE_CONNECTION_NAME:
-    engine = create_async_engine(
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD_ENCODED}@/{DB_NAME}",
-        echo=False,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-        pool_size=5,
-        max_overflow=10,
-        pool_timeout=30,
-        connect_args={
-            "unix_socket": f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
-            "connect_timeout": 10
-        }
-    )
-else:
-    engine = create_async_engine(
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD_ENCODED}@127.0.0.1:3306/{DB_NAME}",
-        echo=False,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-        pool_size=5,
-        max_overflow=10,
-    )
+engine = create_async_engine(
+    f"mysql+aiomysql://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+    echo=False,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
+    connect_args={"connect_timeout": 10}
+)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
@@ -181,14 +166,9 @@ logger = logging.getLogger(__name__)
 
 class Auth0ManagementAPI:
     """Helper class for Auth0 Management API operations"""
-    if not all([
-        AUTH0_MGMT_CLIENT_ID,
-        AUTH0_MGMT_CLIENT_SECRET,
-        AUTH0_MGMT_DOMAIN,
-    ]):
-        raise RuntimeError("Auth0 Management API env vars missing")
-    
     def __init__(self):
+        if not all([AUTH0_MGMT_CLIENT_ID, AUTH0_MGMT_CLIENT_SECRET, AUTH0_MGMT_DOMAIN]):
+            raise RuntimeError("Auth0 Management API env vars missing")
         self.domain = AUTH0_MGMT_DOMAIN
         self.client_id = AUTH0_MGMT_CLIENT_ID
         self.client_secret = AUTH0_MGMT_CLIENT_SECRET
@@ -834,10 +814,6 @@ def require_any_admin(payload: dict = Depends(verify_token)):
     if payload.get("role") not in ["super_admin", "org_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload
-
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
 
 # ==================== AUTH ROUTES ====================
 
