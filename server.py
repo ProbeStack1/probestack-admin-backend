@@ -1,18 +1,11 @@
-# ================================
-# IMPORTS
-# ================================
-
 from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON
 from sqlalchemy.dialects.mysql import LONGTEXT
-
-from passlib.context import CryptContext
 
 import os
 import logging
@@ -25,159 +18,70 @@ import jwt
 import bcrypt
 import json
 import httpx
+from urllib.parse import urlencode
 import secrets
 
-from urllib.parse import urlencode, quote_plus
+from passlib.context import CryptContext
 
-
-# ================================
-# LOAD ENV FILE
-# ================================
-
-ROOT_DIR = Path(__file__).parent
-
-if os.path.exists(ROOT_DIR / ".env"):
-    load_dotenv(ROOT_DIR / ".env")
-
-
-# ================================
-# PASSWORD HASHING
-# ================================
-
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto"
-)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
- 
 
-# ================================
-# DATABASE CONFIGURATION
-# ================================
+ROOT_DIR = Path(__file__).parent
+if os.path.exists(ROOT_DIR / ".env"):
+    load_dotenv(ROOT_DIR / ".env")
+
+# Auth0 Config
+AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'probestack-usa-dev.us.auth0.com')
+AUTH0_CLIENT_ID = os.environ.get('AUTH0_CLIENT_ID', '')
+AUTH0_CLIENT_SECRET = os.environ.get('AUTH0_CLIENT_SECRET', '')
+AUTH0_CALLBACK_URI = os.environ.get('AUTH0_CALLBACK_URI', 'https://probestack.io/callback')
+AUTH0_MGMT_DOMAIN = os.environ.get('AUTH0_MGMT_DOMAIN', 'probestack-usa-dev.us.auth0.com')
+AUTH0_MGMT_CLIENT_ID = os.environ.get('AUTH0_MGMT_CLIENT_ID', '')
+AUTH0_MGMT_CLIENT_SECRET = os.environ.get('AUTH0_MGMT_CLIENT_SECRET', '')
+AUTH0_DB_CONNECTION_NAME = os.environ.get('AUTH0_DB_CONNECTION_NAME', 'Username-Password-Authentication')
+AUTH0_DB_CONNECTION_ID = os.environ.get('AUTH0_DB_CONNECTION_ID', '')
+
+from urllib.parse import quote_plus
 
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 DB_NAME = os.environ.get("DB_NAME")
-DB_HOST = os.environ.get("DB_HOST")
-DB_PORT = os.environ.get("DB_PORT", "3306")
 INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
 
-if not all([DB_USER, DB_PASSWORD, DB_NAME, DB_HOST]):
+if DB_USER is None or DB_PASSWORD is None or DB_NAME is None:
     raise RuntimeError("Database environment variables not set")
 
+DB_PASSWORD = quote_plus(DB_PASSWORD)
+
+if INSTANCE_CONNECTION_NAME:
+    DATABASE_URL = (
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
+        f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
+    )
+else:
+    DATABASE_URL = (
+        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
+    )
+
 engine = create_async_engine(
-    f"mysql+aiomysql://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
-    echo=False,
+    DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
-    connect_args={"connect_timeout": 10}
+    echo=False,
 )
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
     expire_on_commit=False,
-    autoflush=False,
 )
 
-
-class Base(DeclarativeBase):
-    pass
-
-
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
-
-
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-
-# ================================
-# AUTH0 CONFIG
-# ================================
-
-AUTH0_DOMAIN = os.environ.get(
-    "AUTH0_DOMAIN",
-    "probestack-usa-dev.us.auth0.com"
-)
-
-AUTH0_CLIENT_ID = os.environ.get("AUTH0_CLIENT_ID", "")
-AUTH0_CLIENT_SECRET = os.environ.get("AUTH0_CLIENT_SECRET", "")
-
-AUTH0_CALLBACK_URI = os.environ.get(
-    "AUTH0_CALLBACK_URI",
-    "https://probestack.io/callback"
-)
-
-AUTH0_MGMT_DOMAIN = os.environ.get(
-    "AUTH0_MGMT_DOMAIN",
-    "probestack-usa-dev.us.auth0.com"
-)
-
-AUTH0_MGMT_CLIENT_ID = os.environ.get("AUTH0_MGMT_CLIENT_ID", "")
-AUTH0_MGMT_CLIENT_SECRET = os.environ.get("AUTH0_MGMT_CLIENT_SECRET", "")
-
-AUTH0_DB_CONNECTION_NAME = os.environ.get(
-    "AUTH0_DB_CONNECTION_NAME",
-    "Username-Password-Authentication"
-)
-
-AUTH0_DB_CONNECTION_ID = os.environ.get(
-    "AUTH0_DB_CONNECTION_ID",
-    ""
-)
-
-
-# ================================
-# JWT CONFIG
-# ================================
-
-JWT_SECRET = os.environ.get(
-    "JWT_SECRET",
-    "admin-dashboard-secret-key-2024"
-)
-
+# JWT Config
+JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
 
-
-# ================================
-# LOGGING
-# ================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-
-logger = logging.getLogger(__name__)
-# Root path (for GKE ingress path prefix)
-ROOT_PATH = os.environ.get("ROOT_PATH", "")
-
 # Create the main app
-app = FastAPI(
-    title="ProbeStack Admin Dashboard API",
-    root_path=ROOT_PATH
-)
-
-@app.on_event("startup")
-async def startup():
-    await init_db()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+app = FastAPI(title="ProbeStack Admin Dashboard API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -187,9 +91,14 @@ logger = logging.getLogger(__name__)
 
 class Auth0ManagementAPI:
     """Helper class for Auth0 Management API operations"""
+    if not all([
+        AUTH0_MGMT_CLIENT_ID,
+        AUTH0_MGMT_CLIENT_SECRET,
+        AUTH0_MGMT_DOMAIN,
+    ]):
+        raise RuntimeError("Auth0 Management API env vars missing")
+    
     def __init__(self):
-        if not all([AUTH0_MGMT_CLIENT_ID, AUTH0_MGMT_CLIENT_SECRET, AUTH0_MGMT_DOMAIN]):
-            raise RuntimeError("Auth0 Management API env vars missing")
         self.domain = AUTH0_MGMT_DOMAIN
         self.client_id = AUTH0_MGMT_CLIENT_ID
         self.client_secret = AUTH0_MGMT_CLIENT_SECRET
@@ -364,9 +273,9 @@ class Auth0ManagementAPI:
                     "grant_type": "password",
                     "username": email,
                     "password": password,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "audience": f"https://{self.domain}/api/v2/",
+                    "client_id": AUTH0_CLIENT_ID,
+                    "client_secret": AUTH0_CLIENT_SECRET,
+                    "audience": "https://probestack.io/api",
                     "scope": "openid profile email"
                 }
             )
@@ -388,6 +297,9 @@ class Auth0ManagementAPI:
 auth0_mgmt = Auth0ManagementAPI()
 
 # ==================== DATABASE MODELS ====================
+
+class Base(DeclarativeBase):
+    pass
 
 class AdminModel(Base):
     __tablename__ = "admins"
@@ -423,9 +335,6 @@ class OrganizationModel(Base):
     external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True) 
     supported_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     auth0_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    # Project IDs and APM Numbers for the organization
-    project_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of project IDs available in this org
-    apm_numbers: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of APM numbers available in this org
 
 class SubscriptionModel(Base):
     __tablename__ = "subscriptions"
@@ -470,7 +379,7 @@ class PlanToolModel(Base):
 class UserModel(Base):
     __tablename__ = "users"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)  # Unique email constraint
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
     organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -484,10 +393,7 @@ class UserModel(Base):
     auth0_user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Auth0 user ID
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)  # Email verification status
     password_set: Mapped[bool] = mapped_column(Boolean, default=False)  # Has user set their password
-    first_login_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Token for first login flow
-    # Project IDs and APM Numbers assigned to this user
-    assigned_project_ids: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of assigned project IDs
-    assigned_apm_numbers: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of assigned APM numbers
+    first_login_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
 class RoleModel(Base):
     __tablename__ = "roles"
@@ -743,24 +649,6 @@ class PlanToolUpdate(BaseModel):
     is_active: Optional[bool] = None
     display_order: Optional[int] = None
 
-class UserPreferenceUpdate(BaseModel):
-    """Schema for updating user preferences"""
-    theme_preference: str  # 'light', 'dark', 'system'
-
-class ProjectIDCreate(BaseModel):
-    """Schema for adding a project ID to an organization"""
-    project_id: str  # Alphanumeric project ID
-
-class APMNumberCreate(BaseModel):
-    """Schema for adding an APM number to an organization"""
-    apm_number: str  # Alphanumeric APM number
-
-class UserApprovalRequest(BaseModel):
-    """Schema for approving a user with project IDs and APM numbers"""
-    role_id: str
-    project_ids: List[str]  # Required - one or more project IDs
-    apm_numbers: List[str]  # Required - one or more APM numbers
-
 class UserCreate(BaseModel):
     email: str
     name: str
@@ -785,6 +673,86 @@ class UserRequestCreate(BaseModel):
     notes: Optional[str] = None
 
 # ==================== HELPERS ====================
+
+async def sync_user_from_auth0(
+    user: UserModel,
+    db: AsyncSession,
+    *,
+    allow_password_sync: bool = True,
+    allow_status_activation: bool = True
+) -> bool:
+    """
+    Synchronize user state from Auth0 into local DB.
+
+    Rules:
+    - Auth0 is source of truth for email_verified
+    - If Auth0 has email_verified=True → DB is updated
+    - If Auth0 user exists → password_set=True
+    - Clears first_login_token when account becomes active
+    - Safe to call multiple times (idempotent)
+
+    Returns:
+        True  -> user state was changed
+        False -> no changes
+    """
+
+    # No Auth0 user → nothing to sync
+    if not user.auth0_user_id:
+        return False
+
+    try:
+        auth0_result = await auth0_mgmt.get_user_by_email(user.email)
+    except Exception as e:
+        logger.warning(f"Auth0 sync skipped for {user.email}: {e}")
+        return False
+
+    if not auth0_result.get("success"):
+        return False
+
+    auth0_user = auth0_result.get("user", {})
+    updated = False
+
+    # ----------------------------
+    # Email verification sync
+    # ----------------------------
+    auth0_email_verified = auth0_user.get("email_verified")
+
+    if auth0_email_verified and not user.email_verified:
+        user.email_verified = True
+        updated = True
+
+    # ----------------------------
+    # Password existence sync
+    # ----------------------------
+    # If Auth0 user exists, password must exist
+    if allow_password_sync and not user.password_set:
+        user.password_set = True
+        updated = True
+
+    # ----------------------------
+    # Status activation
+    # ----------------------------
+    if (
+        allow_status_activation
+        and user.email_verified
+        and user.password_set
+        and user.status != "active"
+    ):
+        user.status = "active"
+        updated = True
+
+    # ----------------------------
+    # Cleanup first-login token
+    # ----------------------------
+    if user.status == "active" and user.first_login_token:
+        user.first_login_token = None
+        updated = True
+
+    if updated:
+        await db.commit()
+
+    return updated
+
 
 def model_to_dict(model, json_fields=None):
     """Convert SQLAlchemy model to dict, parsing JSON fields"""
@@ -832,6 +800,80 @@ def require_any_admin(payload: dict = Depends(verify_token)):
     if payload.get("role") not in ["super_admin", "org_admin"]:
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+# ==================== UNIQUENESS HELPERS ====================
+
+async def assert_unique_email(db: AsyncSession, email: str):
+    """
+    Enforces global uniqueness of email across:
+    - users
+    - admins
+    - user requests
+    - individual user requests
+    """
+    checks = [
+        select(UserModel).where(UserModel.email == email),
+        select(AdminModel).where(AdminModel.email == email),
+        select(UserRequestModel).where(
+            UserRequestModel.email == email,
+            UserRequestModel.status == "pending"
+        ),
+        select(IndividualUserRequestModel).where(
+            IndividualUserRequestModel.email == email,
+            IndividualUserRequestModel.status == "pending"
+        ),
+    ]
+
+    for stmt in checks:
+        result = await db.execute(stmt)
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail="An account or request with this email already exists"
+            )
+
+
+async def assert_unique_organization(
+    db: AsyncSession,
+    *,
+    external_org_id: str | None = None,
+    domain: str | None = None
+):
+    """
+    Enforces one account per organization.
+    Priority:
+    1. external_org_id (strongest)
+    2. domain (fallback)
+    """
+
+    if external_org_id:
+        result = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.external_org_id == external_org_id
+            )
+        )
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail="An organization account already exists for this organization"
+            )
+
+    if domain:
+        result = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.domain == domain
+            )
+        )
+        if result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=400,
+                detail="An organization with this domain already exists"
+            )
+
 
 # ==================== AUTH ROUTES ====================
 
@@ -981,8 +1023,9 @@ async def admin_reset_password(admin_id: str, data: PasswordChangeRequest, paylo
 async def verify_first_login_token(email: str, token: str, db: AsyncSession = Depends(get_db)):
     """
     Verify user's first login token and return user info.
-    This is used when user clicks the setup link.
+    Used when user clicks the setup link.
     """
+
     result = await db.execute(
         select(UserModel).where(
             UserModel.email == email,
@@ -990,10 +1033,20 @@ async def verify_first_login_token(email: str, token: str, db: AsyncSession = De
         )
     )
     user = result.scalar_one_or_none()
-    
+
     if not user:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
-    
+
+    # 🔑 Sync from Auth0 before exposing state
+    await sync_user_from_auth0(user, db)
+
+    # Block reuse after activation
+    if user.status == "active":
+        raise HTTPException(
+            status_code=400,
+            detail="Account setup already completed"
+        )
+
     return {
         "valid": True,
         "user": {
@@ -1024,6 +1077,7 @@ async def verify_user_email(email: str, token: str, db: AsyncSession = Depends(g
         raise HTTPException(status_code=400, detail="Invalid or expired token")
     
     user.email_verified = True
+    user.first_login_token = None
     
     # Also verify in Auth0 if we have the user ID
     if user.auth0_user_id:
@@ -1091,24 +1145,44 @@ async def confirm_password_set(email: str, db: AsyncSession = Depends(get_db)):
     Call this after user completes Auth0 password reset flow.
     This marks the user as active and ready to login.
     """
+
     result = await db.execute(
         select(UserModel).where(UserModel.email == email)
     )
     user = result.scalar_one_or_none()
-    
+
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
+    # 🔑 Sync authoritative state from Auth0
+    await sync_user_from_auth0(
+        user,
+        db,
+        allow_password_sync=True,
+        allow_status_activation=True
+    )
+
+    # If email is STILL not verified, block activation
     if not user.email_verified:
-        raise HTTPException(status_code=400, detail="Please verify your email first")
-    
-    # Mark password as set and user as active
-    user.password_set = True
-    user.status = "active"
-    user.first_login_token = None  # Clear the token
-    
+        raise HTTPException(
+            status_code=400,
+            detail="Please verify your email before completing account setup"
+        )
+
+    # Ensure password_set (Auth0 password reset implies this)
+    if not user.password_set:
+        user.password_set = True
+
+    # Ensure active status
+    if user.status != "active":
+        user.status = "active"
+
+    # Cleanup token (idempotent)
+    if user.first_login_token:
+        user.first_login_token = None
+
     await db.commit()
-    
+
     return {
         "message": "Account setup complete. You can now log in.",
         "email": user.email,
@@ -1122,40 +1196,50 @@ async def public_user_forgot_password(email: str, db: AsyncSession = Depends(get
     Request password reset for a user (first login or forgot password).
     This triggers Auth0 to send a password reset email.
     """
-    # Check if user exists in our system
+
+    success_message = {
+        "message": "If the email is registered, a password reset link will be sent."
+    }
+
     result = await db.execute(
         select(UserModel).where(UserModel.email == email)
     )
     user = result.scalar_one_or_none()
-    
-    # For security, always return same message regardless of user existence
-    success_message = {"message": "If the email is registered, a password reset link will be sent."}
-    
+
+    # Do not reveal whether user exists
     if not user:
-        # Don't reveal if email exists - just return success message
         logger.info(f"Password reset requested for unknown email: {email}")
         return success_message
-    
-    # If user doesn't have Auth0 ID, try to find/create one
+
+    # 🔑 Sync authoritative state from Auth0
+    await sync_user_from_auth0(user, db)
+
+    # Do not allow password reset unless email is verified
+    if not user.email_verified:
+        logger.info(f"Password reset blocked for unverified user: {email}")
+        return success_message
+
+    # Ensure Auth0 user exists
     if not user.auth0_user_id:
-        # Try to find existing Auth0 user
         auth0_user = await auth0_mgmt.get_user_by_email(email)
         if auth0_user.get("success"):
             user.auth0_user_id = auth0_user["user"]["user_id"]
             await db.commit()
         else:
-            logger.warning(f"User {email} has no Auth0 account - cannot send password reset")
+            logger.warning(f"No Auth0 account found for {email}")
             return success_message
-    
-    # Send password reset email via Auth0
+
+    # Trigger Auth0 password reset email
     reset_result = await auth0_mgmt.send_password_reset_email(email)
-    
+
     if reset_result.get("success"):
         logger.info(f"Password reset email sent to: {email}")
     else:
-        logger.error(f"Failed to send password reset email to {email}: {reset_result.get('error')}")
-    
-    # Always return success message for security
+        logger.error(
+            f"Failed to send password reset email to {email}: "
+            f"{reset_result.get('error')}"
+        )
+
     return success_message
 
 # ==================== ADMIN MANAGEMENT (Super Admin Only) ====================
@@ -1448,12 +1532,10 @@ async def approve_user_request_org_admin(request_id: str, role_id: str, payload:
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Role not found in your organization")
-    
     # Check if user with this email already exists
     existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
     if existing_user.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="A user with this email already exists")
-    
     now = datetime.now(timezone.utc)
     
     # Update request
@@ -2314,74 +2396,42 @@ async def identify_organization(data: IdentifyOrgRequest, db: AsyncSession = Dep
         "message": "No organization found for this email domain"
     }
 
-
 @api_router.post("/public/login/initiate", tags=["Public API - Login"])
 async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(get_db)):
     """
     Initiate login flow for all users (organization employees and individual users).
     Called when user enters email in login form.
-    
-    Flow:
-    1. Check if user already exists in the system (any org including individual users)
-    2. If exists -> handle based on status (verify_email, set_password, or password)
-    3. If not exists -> check domain for org match -> auto-provision for org employees
-    4. If no domain match -> return not_found (individual users must go through request flow)
-    
-    Returns appropriate next_step for the UI to handle.
     """
+
     if not data.email or "@" not in data.email:
         raise HTTPException(status_code=400, detail="Invalid email format")
-    
+
     email = data.email.lower().strip()
     email_domain = "@" + email.split("@")[1]
-    
-    # Step 1: Check if user already exists in the system (ANY organization including individual users)
-    user_result = await db.execute(
+
+    # ------------------------------------------------------------------
+    # STEP 1: Check if user exists
+    # ------------------------------------------------------------------
+    result = await db.execute(
         select(UserModel).where(UserModel.email == email)
     )
-    user = user_result.scalar_one_or_none()
-    
+    user = result.scalar_one_or_none()
+
     if user:
-        # User exists - get their organization info
+        # 🔑 IMPORTANT: Sync from Auth0 BEFORE branching
+        await sync_user_from_auth0(user, db)
+
+        # Fetch org info
         org_result = await db.execute(
             select(OrganizationModel).where(OrganizationModel.id == user.organization_id)
         )
         user_org = org_result.scalar_one_or_none()
         org_name = user_org.name if user_org else user.organization_name
-        
-        # ALWAYS sync with Auth0 if user has auth0_user_id and local DB shows not fully verified
-        if user.auth0_user_id and (not user.email_verified or not user.password_set or user.status != "active"):
-            try:
-                auth0_user = await auth0_mgmt.get_user_by_email(email)
-                if auth0_user.get("success") and auth0_user.get("user", {}).get("email_verified"):
-                    # Auth0 shows verified - sync to local DB
-                    logger.info(f"Syncing Auth0 verification status for user {email}")
-                    
-                    await db.execute(
-                        update(UserModel)
-                        .where(UserModel.id == user.id)
-                        .values(
-                            email_verified=True,
-                            password_set=True,
-                            status="active",
-                            first_login_token=None
-                        )
-                    )
-                    await db.commit()
-                    
-                    # Refresh user object with updated values
-                    user.email_verified = True
-                    user.password_set = True
-                    user.status = "active"
-                    user.first_login_token = None
-                    
-                    logger.info(f"User {email} synced from Auth0: email_verified=True, password_set=True, status=active")
-            except Exception as e:
-                logger.error(f"Failed to sync Auth0 status for user {email}: {str(e)}")
-        
-        # Now check the (potentially updated) status
+
+        # --------------------------------------------------------------
+        # CASE 1: Fully active user → password login
+        # --------------------------------------------------------------
         if user.status == "active" and user.password_set:
-            # Fully setup - proceed to password login
             return {
                 "success": True,
                 "next_step": "password",
@@ -2393,12 +2443,15 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
                     "organization_name": org_name
                 }
             }
-        elif user.email_verified and not user.password_set:
-            # Email verified but password not set - need to set password
+
+        # --------------------------------------------------------------
+        # CASE 2: Email verified but password not set → set password
+        # --------------------------------------------------------------
+        if user.email_verified and not user.password_set:
             if not user.first_login_token:
                 user.first_login_token = secrets.token_urlsafe(32)
                 await db.commit()
-            
+
             return {
                 "success": True,
                 "next_step": "set_password",
@@ -2411,67 +2464,70 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
                     "organization_name": org_name
                 }
             }
-        else:
-            # User not fully verified - send verification email
-            if not user.first_login_token:
-                user.first_login_token = secrets.token_urlsafe(32)
-            
-            # Send verification email via Auth0 if user has Auth0 ID
-            if user.auth0_user_id:
-                await auth0_mgmt.send_verification_email(user.auth0_user_id)
-            
-            await db.commit()
-            
-            return {
-                "success": True,
-                "next_step": "verify_email",
-                "message": "Please verify your email. A verification email has been sent.",
-                "token": user.first_login_token,
-                "user": {
-                    "email": user.email,
-                    "name": user.name,
-                    "organization_id": user.organization_id,
-                    "organization_name": org_name,
-                    "email_verified": user.email_verified
-                }
+
+        # --------------------------------------------------------------
+        # CASE 3: Not verified → resend verification email
+        # (At this point Auth0 + DB are already synced)
+        # --------------------------------------------------------------
+        if not user.first_login_token:
+            user.first_login_token = secrets.token_urlsafe(32)
+
+        if user.auth0_user_id:
+            await auth0_mgmt.send_verification_email(user.auth0_user_id)
+
+        await db.commit()
+
+        return {
+            "success": True,
+            "next_step": "verify_email",
+            "message": "Please verify your email. A verification email has been sent.",
+            "token": user.first_login_token,
+            "user": {
+                "email": user.email,
+                "name": user.name,
+                "organization_id": user.organization_id,
+                "organization_name": org_name,
+                "email_verified": user.email_verified
             }
-    
-    # Step 2: User doesn't exist - check if domain matches an organization for auto-provisioning
-    # IMPORTANT: Exclude "Individual Users" org from auto-provisioning - those users must submit individual requests
+        }
+
+    # ------------------------------------------------------------------
+    # STEP 2: User does NOT exist → match org by domain
+    # ------------------------------------------------------------------
     result = await db.execute(
         select(OrganizationModel).where(
             OrganizationModel.status == "approved",
             OrganizationModel.supported_domains.isnot(None),
-            OrganizationModel.name != "Individual Users"  # Exclude individual users org
+            OrganizationModel.name != "Individual Users"
         )
     )
     organizations = result.scalars().all()
-    
-    org = None
-    for o in organizations:
-        if o.supported_domains:
-            try:
-                supported = json.loads(o.supported_domains)
-                if any(d.lower() == email_domain.lower() for d in supported):
-                    org = o
-                    break
-            except json.JSONDecodeError:
-                continue
-    
-    if not org:
-        # No matching org - user needs to submit individual user request first
+
+    matched_org = None
+    for org in organizations:
+        try:
+            domains = json.loads(org.supported_domains or "[]")
+            if any(d.lower() == email_domain.lower() for d in domains):
+                matched_org = org
+                break
+        except json.JSONDecodeError:
+            continue
+
+    if not matched_org:
         return {
             "success": False,
             "next_step": "request_access",
-            "message": f"No account found for {email}. Please submit an individual user request to get access.",
+            "message": f"No account found for {email}. Please submit an individual user request.",
             "action_url": "/individual-user-request"
         }
-    
-    # Step 3: New org user - check if there's already a pending request
+
+    # ------------------------------------------------------------------
+    # STEP 3: Check for existing pending request
+    # ------------------------------------------------------------------
     existing_request = await db.execute(
         select(UserRequestModel).where(
             UserRequestModel.email == email,
-            UserRequestModel.organization_id == org.id,
+            UserRequestModel.organization_id == matched_org.id,
             UserRequestModel.status == "pending"
         )
     )
@@ -2479,44 +2535,45 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
         return {
             "success": True,
             "next_step": "pending_approval",
-            "message": "Your access request is pending admin approval. You will receive an email once approved.",
+            "message": "Your access request is pending admin approval.",
             "user": {
                 "email": email,
-                "organization_name": org.name
+                "organization_name": matched_org.name
             }
         }
-    
-    # Create a user request for admin approval (not auto-provision)
+
+    # ------------------------------------------------------------------
+    # STEP 4: Create new user request
+    # ------------------------------------------------------------------
     user_request = UserRequestModel(
         email=email,
-        name=email.split("@")[0].replace(".", " ").title(),  # Generate name from email
-        organization_id=org.id,
-        organization_name=org.name,
-        requested_role="Member",  # Default role request
+        name=email.split("@")[0].replace(".", " ").title(),
+        organization_id=matched_org.id,
+        organization_name=matched_org.name,
+        requested_role="Member",
         status="pending"
     )
     db.add(user_request)
-    
-    # Create notification for admin
-    notif = NotificationModel(
-        title="New User Request (Auto)",
-        message=f"{user_request.name} ({email}) from {org.name} is requesting access.",
+
+    notification = NotificationModel(
+        title="New User Request",
+        message=f"{user_request.name} ({email}) is requesting access to {matched_org.name}.",
         type="info",
         link="/user-requests"
     )
-    db.add(notif)
-    
+    db.add(notification)
+
     await db.commit()
-    
+
     return {
         "success": True,
         "next_step": "pending_approval",
-        "message": "Access request submitted. An admin will review your request. You will receive an email once approved.",
+        "message": "Access request submitted. An admin will review it.",
         "request_id": user_request.id,
         "user": {
             "email": email,
             "name": user_request.name,
-            "organization_name": org.name
+            "organization_name": matched_org.name
         }
     }
 
@@ -2808,17 +2865,6 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
                 existing_user.role_id = primary_role["id"]
                 existing_user.role_name = primary_role["name"]
             existing_user.last_login = datetime.now(timezone.utc)
-            
-            # Sync email_verified and password_set from Auth0
-            auth0_email_verified = user_info.get("email_verified", False)
-            if auth0_email_verified:
-                existing_user.email_verified = True
-                existing_user.password_set = True  # Auth0 manages password
-                if existing_user.status == "pending_verification":
-                    existing_user.status = "active"
-                existing_user.first_login_token = None  # Clear token
-                logger.info(f"Synced email_verified=True for user {email} from Auth0 callback")
-            
             synced_user = existing_user
         else:
             # Create new user
@@ -2844,9 +2890,6 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
 
                 primary_role = {"id": default_role.id, "name": default_role.name}
 
-            # Set email_verified and password_set based on Auth0 status
-            auth0_email_verified = user_info.get("email_verified", False)
-            
             new_user = UserModel(
                 email=email,
                 name=user_info.get("name") or user_info.get("nickname") or email.split("@")[0],
@@ -2855,10 +2898,7 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
                 role_id=primary_role["id"],
                 role_name=primary_role["name"],
                 status="active",
-                last_login=datetime.now(timezone.utc),
-                email_verified=auth0_email_verified,
-                password_set=auth0_email_verified,  # Auth0 manages password
-                auth0_user_id=auth0_user_id
+                last_login=datetime.now(timezone.utc)
             )
             db.add(new_user)
             synced_user = new_user
@@ -2939,11 +2979,8 @@ async def create_individual_user_request(data: IndividualUserRequestCreate, db: 
     - `job_title`: Job title (optional)
     - `phone`: Phone number (optional)
     """
-    # Check if email already exists as a user in the system
-    existing_user = await db.execute(select(UserModel).where(UserModel.email == data.email))
-    if existing_user.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="A user with this email already exists in the system")
-    
+
+    await assert_unique_email(db, data.email)
     # Check if email already has a pending request
     result = await db.execute(
         select(IndividualUserRequestModel).where(
@@ -3145,12 +3182,10 @@ async def approve_individual_user_request(
         raise HTTPException(status_code=404, detail="Request not found")
     if request.status != "pending":
         raise HTTPException(status_code=400, detail=f"Request is already {request.status}")
-    
     # Check if user with this email already exists
     existing_user = await db.execute(select(UserModel).where(UserModel.email == request.email))
     if existing_user.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="A user with this email already exists")
-    
     # Parse requested_plan - can be a JSON array or single string
     requested_plan_raw = request.requested_plan
     try:
@@ -4037,7 +4072,6 @@ async def create_user(data: UserCreate, payload: dict = Depends(require_super_ad
     existing_user = await db.execute(select(UserModel).where(UserModel.email == data.email))
     if existing_user.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="A user with this email already exists")
-    
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == data.organization_id))
     org = org_result.scalar_one_or_none()
     if not org:
@@ -4427,17 +4461,6 @@ async def seed_data(db: AsyncSession = Depends(get_db)):
 async def root():
     return {"message": "ProbeStack Admin Dashboard API", "version": "1.0.0", "database": "MySQL"}
 
-@api_router.get("/health/db")
-async def db_health():
-    try:
-        async with AsyncSessionLocal() as session:
-            await session.execute(select(func.now()))
-        return {"db": "ok", "instance": INSTANCE_CONNECTION_NAME or "local"}
-    except Exception as e:
-        return {"db": "error", "detail": str(e)}
-
-app.include_router(api_router)
-
 # ==================== PUBLIC API FOR EXTERNAL APPLICATIONS ====================
 
 @api_router.post("/public/organizations/request", tags=["Public API"])
@@ -4745,7 +4768,7 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
     - `status`: Current status ('pending')
     - `message`: Confirmation message
     """
-    
+    await assert_unique_email(db, data.email)
     # Validate organization exists and is approved
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == data.organization_id))
     org = org_result.scalar_one_or_none()
@@ -4754,10 +4777,15 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
     if org.status != "approved":
         raise HTTPException(status_code=400, detail="Organization is not approved yet")
     
-    # Check if user with same email already exists anywhere in the system
-    existing_user = await db.execute(select(UserModel).where(UserModel.email == data.email))
+    # Check if user with same email already exists in the organization
+    existing_user = await db.execute(
+        select(UserModel).where(
+            UserModel.email == data.email,
+            UserModel.organization_id == data.organization_id
+        )
+    )
     if existing_user.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail=f"A user with email {data.email} already exists in the system")
+        raise HTTPException(status_code=409, detail=f"User with email {data.email} already exists in this organization")
     
     # Check if there's already a pending request for this email in this org
     existing_request = await db.execute(
@@ -5361,12 +5389,10 @@ async def approve_user_request(
         raise HTTPException(status_code=404, detail="User request not found")
     if req.status != "pending":
         raise HTTPException(status_code=400, detail="Request is not pending")
-    
     # Check if user with this email already exists
     existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
     if existing_user.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="A user with this email already exists")
-    
     # Validate role exists and belongs to the organization
     role_result = await db.execute(
         select(RoleModel).where(RoleModel.id == role_id, RoleModel.organization_id == req.organization_id)
@@ -5508,10 +5534,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-#@app.on_event("startup")
-#async def startup():
-#    async with engine.begin() as conn:
-#        await conn.run_sync(Base.metadata.create_all)
+@app.on_event("startup")
+async def startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 @app.on_event("shutdown")
 async def shutdown():
