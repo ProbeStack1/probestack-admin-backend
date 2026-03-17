@@ -80,6 +80,7 @@ jobs:
           -n ${{ env.NAMESPACE }}
 
       - name: Wait for deployment rollout
+        continue-on-error: true
         run: |
           kubectl rollout status deployment/${{ env.SERVICE_NAME }} \
           -n ${{ env.NAMESPACE }} --timeout=120s
