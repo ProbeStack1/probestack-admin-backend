@@ -3,7 +3,7 @@ name: 'Build and Deploy to GKE'
 on:
   push:
     branches:
-      - 'gke'
+      - 'disabled-old-workflow'
 
 env:
   PROJECT_ID: 'methodical-mark-482504-j3' # TODO: update to your Google Cloud project ID
@@ -53,6 +53,7 @@ jobs:
         with:
           cluster_name: '${{ env.GKE_CLUSTER }}'
           location: '${{ env.GKE_ZONE }}'
+          project_id: '${{ env.PROJECT_ID }}'
 
       # Build the Docker image
       - name: 'Build and push Docker container'
