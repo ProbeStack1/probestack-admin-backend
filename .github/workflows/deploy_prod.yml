@@ -82,8 +82,13 @@ jobs:
       - name: Wait for deployment rollout
         run: |
           kubectl rollout status deployment/${{ env.SERVICE_NAME }} \
-          -n ${{ env.NAMESPACE }}
+          -n ${{ env.NAMESPACE }} --timeout=120s
 
       - name: Verify running pods
+        if: always()
         run: |
           kubectl get pods -n ${{ env.NAMESPACE }}
+          echo "--- Pod logs ---"
+          kubectl logs -n ${{ env.NAMESPACE }} -l app=${{ env.SERVICE_NAME }} --tail=50 || true
+          echo "--- Pod describe ---"
+          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=${{ env.SERVICE_NAME }} || true

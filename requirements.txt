@@ -10,12 +10,13 @@ watchfiles==1.1.1
 click==8.3.1
 
 # --------------------
-# Database (MySQL via Cloud SQL Proxy - ASYNC)
+# Database (MySQL via Cloud SQL Connector - ASYNC)
 # --------------------
 asyncmy==0.2.9
 SQLAlchemy==2.0.30
 aiomysql==0.2.0
 greenlet==3.3.0
+cloud-sql-python-connector[asyncmy]==1.9.0
 
 # --------------------
 # Auth / Security
