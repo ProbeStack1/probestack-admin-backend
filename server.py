@@ -51,7 +51,7 @@ pwd_context = CryptContext(
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
-
+ 
 
 # ================================
 # DATABASE CONFIGURATION
@@ -85,9 +85,18 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
+class Base(DeclarativeBase):
+    pass
+
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
 # ================================
@@ -155,6 +164,18 @@ ROOT_PATH = os.environ.get("ROOT_PATH", "")
 app = FastAPI(
     title="ProbeStack Admin Dashboard API",
     root_path=ROOT_PATH
+)
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 api_router = APIRouter(prefix="/api")
@@ -367,9 +388,6 @@ class Auth0ManagementAPI:
 auth0_mgmt = Auth0ManagementAPI()
 
 # ==================== DATABASE MODELS ====================
-
-class Base(DeclarativeBase):
-    pass
 
 class AdminModel(Base):
     __tablename__ = "admins"
@@ -4418,6 +4436,8 @@ async def db_health():
     except Exception as e:
         return {"db": "error", "detail": str(e)}
 
+app.include_router(api_router)
+
 # ==================== PUBLIC API FOR EXTERNAL APPLICATIONS ====================
 
 @api_router.post("/public/organizations/request", tags=["Public API"])
@@ -5488,10 +5508,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+#@app.on_event("startup")
+#async def startup():
+#    async with engine.begin() as conn:
+#        await conn.run_sync(Base.metadata.create_all)
 
 @app.on_event("shutdown")
 async def shutdown():
