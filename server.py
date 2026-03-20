@@ -82,7 +82,7 @@ JWT_ALGORITHM = "HS256"
 
 # Create the main app
 app = FastAPI(title="ProbeStack Admin Dashboard API")
-api_router = APIRouter(prefix="/api")
+api_router = APIRouter(prefix="/admin-backend/api")
 security = HTTPBearer()
 
 # Configure logging
