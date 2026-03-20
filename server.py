@@ -4898,54 +4898,63 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
         admin = admin_result.scalar_one_or_none()
         
         # Get subscription details (plans and tools) based on organization type
-        subscription = None
+        subscriptions = []
         plans = []
         tools = []
+        user_type = "individual" if user.organization_id == "no_organization" else "organization"
         
-        if user.organization_id == "no_organization":
-            # For individual users, get subscription from their individual request
+        if user_type == "individual":
+            # For individual users, get all approved requests
             ind_req_result = await db.execute(
                 select(IndividualUserRequestModel).where(
                     IndividualUserRequestModel.email == user.email,
                     IndividualUserRequestModel.status == "approved"
-                ).order_by(IndividualUserRequestModel.approved_at.desc())
+                )
             )
-            ind_req = ind_req_result.scalars().first()
-            if ind_req and ind_req.assigned_subscription_id:
+            ind_reqs = ind_req_result.scalars().all()
+            sub_ids = [req.assigned_subscription_id for req in ind_reqs if req.assigned_subscription_id]
+            
+            if sub_ids:
                 sub_result = await db.execute(
                     select(SubscriptionModel).where(
-                        SubscriptionModel.id == ind_req.assigned_subscription_id
+                        SubscriptionModel.id.in_(sub_ids),
+                        SubscriptionModel.status == "active"
                     )
                 )
-                subscription = sub_result.scalar_one_or_none()
+                subscriptions = sub_result.scalars().all()
         else:
-            # For organization users, get org subscription
+            # For organization users, get all active org subscriptions
             sub_result = await db.execute(
                 select(SubscriptionModel).where(
                     SubscriptionModel.organization_id == user.organization_id,
                     SubscriptionModel.status == "active"
                 ).order_by(SubscriptionModel.start_date.desc())
             )
-            subscription = sub_result.scalars().first()
+            subscriptions = sub_result.scalars().all()
         
-        if subscription:
+        for sub in subscriptions:
             # Parse plan_id - could be JSON array or single string
-            plan_id_raw = subscription.plan_id
+            plan_id_raw = sub.plan_id
             try:
                 plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
             except (json.JSONDecodeError, AttributeError, TypeError):
                 plan_ids = [plan_id_raw] if plan_id_raw else []
             
-            # Get plan details
+            # Get plan details and avoid duplicates
             if plan_ids:
                 plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
-                plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+                for p in plans_result.scalars().all():
+                    if not any(existing_plan["id"] == p.id for existing_plan in plans):
+                        plans.append({"id": p.id, "name": p.name, "tool": p.tool})
             
-            # Parse tools
+            # Parse tools and avoid duplicates
             try:
-                tools = json.loads(subscription.tools) if subscription.tools else []
+                sub_tools = json.loads(sub.tools) if sub.tools else []
+                for tool in sub_tools:
+                    if tool not in tools:
+                        tools.append(tool)
             except (json.JSONDecodeError, TypeError):
-                tools = []
+                pass
         
         # Build response with admin details if user is also an admin
         response = {
@@ -4954,6 +4963,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "name": user.name,
             "organization_id": user.organization_id,
             "organization_name": user.organization_name,
+            "user_type": user_type,
             "role_id": user.role_id,
             "role_name": user.role_name,
             "role": admin.role if admin else user.role_name.lower().replace(" ", "_"),
@@ -4963,13 +4973,15 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "theme_preference": getattr(user, 'theme_preference', 'light'),
             "plans": plans,
             "tools": tools,
-            "subscription": {
-                "id": subscription.id,
-                "plan_name": subscription.plan_name,
-                "status": subscription.status,
-                "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
-                "end_date": subscription.end_date.isoformat() if subscription.end_date else None
-            } if subscription else None,
+            "subscriptions": [
+                {
+                    "id": sub.id,
+                    "plan_name": sub.plan_name,
+                    "status": sub.status,
+                    "start_date": sub.start_date.isoformat() if sub.start_date else None,
+                    "end_date": sub.end_date.isoformat() if sub.end_date else None
+                } for sub in subscriptions
+            ],
             "created_at": user.created_at.isoformat() if user.created_at else None
         }
         
@@ -4995,39 +5007,43 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
     
     if admin:
         # Get subscription based on organization type
-        subscription = None
+        subscriptions = []
         plans = []
         tools = []
+        user_type = "individual" if admin.organization_id == "no_organization" else "organization"
         
         if admin.organization_id and admin.organization_id != "no_organization":
-            # For organization admins, get org subscription
+            # For organization admins, get all active org subscriptions
             sub_result = await db.execute(
                 select(SubscriptionModel).where(
                     SubscriptionModel.organization_id == admin.organization_id,
                     SubscriptionModel.status == "active"
                 ).order_by(SubscriptionModel.start_date.desc())
             )
-            subscription = sub_result.scalars().first()
+            subscriptions = sub_result.scalars().all()
         elif admin.organization_id == "no_organization":
             # For individual admins, get from their individual request
             ind_req_result = await db.execute(
                 select(IndividualUserRequestModel).where(
                     IndividualUserRequestModel.email == admin.email,
                     IndividualUserRequestModel.status == "approved"
-                ).order_by(IndividualUserRequestModel.approved_at.desc())
+                )
             )
-            ind_req = ind_req_result.scalars().first()
-            if ind_req and ind_req.assigned_subscription_id:
+            ind_reqs = ind_req_result.scalars().all()
+            sub_ids = [req.assigned_subscription_id for req in ind_reqs if req.assigned_subscription_id]
+            
+            if sub_ids:
                 sub_result = await db.execute(
                     select(SubscriptionModel).where(
-                        SubscriptionModel.id == ind_req.assigned_subscription_id
+                        SubscriptionModel.id.in_(sub_ids),
+                        SubscriptionModel.status == "active"
                     )
                 )
-                subscription = sub_result.scalar_one_or_none()
+                subscriptions = sub_result.scalars().all()
         
-        if subscription:
+        for sub in subscriptions:
             # Parse plan_id
-            plan_id_raw = subscription.plan_id
+            plan_id_raw = sub.plan_id
             try:
                 plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
             except (json.JSONDecodeError, AttributeError, TypeError):
@@ -5035,12 +5051,17 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             
             if plan_ids:
                 plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
-                plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+                for p in plans_result.scalars().all():
+                    if not any(existing_plan["id"] == p.id for existing_plan in plans):
+                        plans.append({"id": p.id, "name": p.name, "tool": p.tool})
             
             try:
-                tools = json.loads(subscription.tools) if subscription.tools else []
+                sub_tools = json.loads(sub.tools) if sub.tools else []
+                for tool in sub_tools:
+                    if tool not in tools:
+                        tools.append(tool)
             except (json.JSONDecodeError, TypeError):
-                tools = []
+                pass
         
         return {
             "id": admin.id,
@@ -5048,6 +5069,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "name": admin.name,
             "organization_id": admin.organization_id,
             "organization_name": admin.organization_name,
+            "user_type": user_type,
             "role": admin.role,
             "permissions": ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"],
             "is_admin": True,
@@ -5055,13 +5077,15 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "theme_preference": getattr(admin, 'theme_preference', 'light'),
             "plans": plans,
             "tools": tools,
-            "subscription": {
-                "id": subscription.id,
-                "plan_name": subscription.plan_name,
-                "status": subscription.status,
-                "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
-                "end_date": subscription.end_date.isoformat() if subscription.end_date else None
-            } if subscription else None,
+            "subscriptions": [
+                {
+                    "id": sub.id,
+                    "plan_name": sub.plan_name,
+                    "status": sub.status,
+                    "start_date": sub.start_date.isoformat() if sub.start_date else None,
+                    "end_date": sub.end_date.isoformat() if sub.end_date else None
+                } for sub in subscriptions
+            ],
             "created_at": admin.created_at.isoformat() if admin.created_at else None
         }
     
@@ -5099,36 +5123,40 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
             # Get subscription details based on organization type
             plans = []
             tools = []
-            subscription = None
+            subscriptions = []
+            user_type = "individual" if user.organization_id == "no_organization" else "organization"
             
-            if user.organization_id == "no_organization":
-                # For individual users, get subscription from their individual request
+            if user_type == "individual":
+                # For individual users, get all approved requests
                 ind_req_result = await db.execute(
                     select(IndividualUserRequestModel).where(
                         IndividualUserRequestModel.email == user.email,
                         IndividualUserRequestModel.status == "approved"
-                    ).order_by(IndividualUserRequestModel.approved_at.desc())
+                    )
                 )
-                ind_req = ind_req_result.scalars().first()
-                if ind_req and ind_req.assigned_subscription_id:
+                ind_reqs = ind_req_result.scalars().all()
+                sub_ids = [req.assigned_subscription_id for req in ind_reqs if req.assigned_subscription_id]
+                
+                if sub_ids:
                     sub_result = await db.execute(
                         select(SubscriptionModel).where(
-                            SubscriptionModel.id == ind_req.assigned_subscription_id
+                            SubscriptionModel.id.in_(sub_ids),
+                            SubscriptionModel.status == "active"
                         )
                     )
-                    subscription = sub_result.scalar_one_or_none()
+                    subscriptions = sub_result.scalars().all()
             else:
-                # For organization users, get org subscription
+                # For organization users, get all active org subscriptions
                 sub_result = await db.execute(
                     select(SubscriptionModel).where(
                         SubscriptionModel.organization_id == user.organization_id,
                         SubscriptionModel.status == "active"
                     ).order_by(SubscriptionModel.start_date.desc())
                 )
-                subscription = sub_result.scalars().first()
+                subscriptions = sub_result.scalars().all()
             
-            if subscription:
-                plan_id_raw = subscription.plan_id
+            for sub in subscriptions:
+                plan_id_raw = sub.plan_id
                 try:
                     plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
                 except (json.JSONDecodeError, AttributeError, TypeError):
@@ -5136,18 +5164,24 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 
                 if plan_ids:
                     plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
-                    plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+                    for p in plans_result.scalars().all():
+                        if not any(existing_plan["id"] == p.id for existing_plan in plans):
+                            plans.append({"id": p.id, "name": p.name, "tool": p.tool})
                 
                 try:
-                    tools = json.loads(subscription.tools) if subscription.tools else []
+                    sub_tools = json.loads(sub.tools) if sub.tools else []
+                    for tool in sub_tools:
+                        if tool not in tools:
+                            tools.append(tool)
                 except (json.JSONDecodeError, TypeError):
-                    tools = []
+                    pass
             
             user_data = {
                 "email": user.email,
                 "name": user.name,
                 "organization_id": user.organization_id,
                 "organization_name": user.organization_name,
+                "user_type": user_type,
                 "role_id": user.role_id,
                 "role_name": user.role_name,
                 "role": admin.role if admin else user.role_name.lower().replace(" ", "_"),
@@ -5157,13 +5191,15 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 "theme_preference": getattr(user, 'theme_preference', 'light'),
                 "plans": plans,
                 "tools": tools,
-                "subscription": {
-                    "id": subscription.id,
-                    "plan_name": subscription.plan_name,
-                    "status": subscription.status,
-                    "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
-                    "end_date": subscription.end_date.isoformat() if subscription.end_date else None
-                } if subscription else None,
+                "subscriptions": [
+                    {
+                        "id": sub.id,
+                        "plan_name": sub.plan_name,
+                        "status": sub.status,
+                        "start_date": sub.start_date.isoformat() if sub.start_date else None,
+                        "end_date": sub.end_date.isoformat() if sub.end_date else None
+                    } for sub in subscriptions
+                ],
                 "created_at": user.created_at.isoformat() if user.created_at else None
             }
             
@@ -5189,36 +5225,40 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
         if admin:
             plans = []
             tools = []
-            subscription = None
+            subscriptions = []
+            user_type = "individual" if admin.organization_id == "no_organization" else "organization"
             
             if admin.organization_id and admin.organization_id != "no_organization":
-                # For organization admins, get org subscription
+                # For organization admins, get all active org subscriptions
                 sub_result = await db.execute(
                     select(SubscriptionModel).where(
                         SubscriptionModel.organization_id == admin.organization_id,
                         SubscriptionModel.status == "active"
                     ).order_by(SubscriptionModel.start_date.desc())
                 )
-                subscription = sub_result.scalars().first()
+                subscriptions = sub_result.scalars().all()
             elif admin.organization_id == "no_organization":
                 # For individual admins, get from their individual request
                 ind_req_result = await db.execute(
                     select(IndividualUserRequestModel).where(
                         IndividualUserRequestModel.email == admin.email,
                         IndividualUserRequestModel.status == "approved"
-                    ).order_by(IndividualUserRequestModel.approved_at.desc())
+                    )
                 )
-                ind_req = ind_req_result.scalars().first()
-                if ind_req and ind_req.assigned_subscription_id:
+                ind_reqs = ind_req_result.scalars().all()
+                sub_ids = [req.assigned_subscription_id for req in ind_reqs if req.assigned_subscription_id]
+                
+                if sub_ids:
                     sub_result = await db.execute(
                         select(SubscriptionModel).where(
-                            SubscriptionModel.id == ind_req.assigned_subscription_id
+                            SubscriptionModel.id.in_(sub_ids),
+                            SubscriptionModel.status == "active"
                         )
                     )
-                    subscription = sub_result.scalar_one_or_none()
+                    subscriptions = sub_result.scalars().all()
             
-            if subscription:
-                plan_id_raw = subscription.plan_id
+            for sub in subscriptions:
+                plan_id_raw = sub.plan_id
                 try:
                     plan_ids = json.loads(plan_id_raw) if plan_id_raw.startswith('[') else [plan_id_raw]
                 except (json.JSONDecodeError, AttributeError, TypeError):
@@ -5226,18 +5266,24 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 
                 if plan_ids:
                     plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
-                    plans = [{"id": p.id, "name": p.name, "tool": p.tool} for p in plans_result.scalars().all()]
+                    for p in plans_result.scalars().all():
+                        if not any(existing_plan["id"] == p.id for existing_plan in plans):
+                            plans.append({"id": p.id, "name": p.name, "tool": p.tool})
                 
                 try:
-                    tools = json.loads(subscription.tools) if subscription.tools else []
+                    sub_tools = json.loads(sub.tools) if sub.tools else []
+                    for tool in sub_tools:
+                        if tool not in tools:
+                            tools.append(tool)
                 except (json.JSONDecodeError, TypeError):
-                    tools = []
+                    pass
             
             found_users.append({
                 "email": admin.email,
                 "name": admin.name,
                 "organization_id": admin.organization_id,
                 "organization_name": admin.organization_name,
+                "user_type": user_type,
                 "role": admin.role,
                 "permissions": ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"],
                 "is_admin": True,
@@ -5245,13 +5291,15 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 "theme_preference": getattr(admin, 'theme_preference', 'light'),
                 "plans": plans,
                 "tools": tools,
-                "subscription": {
-                    "id": subscription.id,
-                    "plan_name": subscription.plan_name,
-                    "status": subscription.status,
-                    "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
-                    "end_date": subscription.end_date.isoformat() if subscription.end_date else None
-                } if subscription else None,
+                "subscriptions": [
+                    {
+                        "id": sub.id,
+                        "plan_name": sub.plan_name,
+                        "status": sub.status,
+                        "start_date": sub.start_date.isoformat() if sub.start_date else None,
+                        "end_date": sub.end_date.isoformat() if sub.end_date else None
+                    } for sub in subscriptions
+                ],
                 "created_at": admin.created_at.isoformat() if admin.created_at else None
             })
             continue
@@ -5523,6 +5571,30 @@ async def delete_user_request(request_id: str, payload: dict = Depends(verify_to
     await db.commit()
     return {"message": "User request deleted"}
 
+
+@api_router.get("/health/db", tags=["Health"])
+async def db_health_check(db: AsyncSession = Depends(get_db)):
+    """
+    Check the database connection health.
+    """
+    try:
+        # Execute a simple query
+        from sqlalchemy import text
+        result = await db.execute(text("SELECT 1"))
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        return {
+            "status": "unhealthy",
+            "database": "disconnected",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
 # Include the router
 app.include_router(api_router)
 
@@ -5536,8 +5608,12 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        logger.warning("Server is starting without a successful database connection.")
 
 @app.on_event("shutdown")
 async def shutdown():
