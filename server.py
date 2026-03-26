@@ -81,7 +81,13 @@ JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
 
 # Create the main app
-app = FastAPI(title="ProbeStack Admin Dashboard API")
+app = FastAPI(
+    title="ProbeStack Admin Dashboard API",
+    root_path="/admin-backend"
+)
+
+from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
+app.add_middleware(ProxyHeadersMiddleware)
 api_router = APIRouter(prefix="/admin-backend/api")
 security = HTTPBearer()
 
