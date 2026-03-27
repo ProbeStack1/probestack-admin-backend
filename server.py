@@ -86,8 +86,6 @@ app = FastAPI(
     root_path="/admin-backend"
 )
 
-from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
-app.add_middleware(ProxyHeadersMiddleware)
 api_router = APIRouter(prefix="/admin-backend/api")
 security = HTTPBearer()
 
