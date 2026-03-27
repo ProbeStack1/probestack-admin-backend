@@ -5573,6 +5573,17 @@ async def delete_user_request(request_id: str, payload: dict = Depends(verify_to
     return {"message": "User request deleted"}
 
 
+@api_router.get("/health", tags=["Health"])
+async def api_health_check():
+    """
+    Check the API health.
+    """
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
 @api_router.get("/health/db", tags=["Health"])
 async def db_health_check(db: AsyncSession = Depends(get_db)):
     """
