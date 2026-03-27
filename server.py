@@ -81,12 +81,9 @@ JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
 
 # Create the main app
-app = FastAPI(
-    title="ProbeStack Admin Dashboard API",
-    root_path="/admin-backend"
-)
+app = FastAPI()
 
-api_router = APIRouter(prefix="/admin-backend/api")
+api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
 # Configure logging
