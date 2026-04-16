@@ -276,8 +276,9 @@ class Auth0ManagementAPI:
                     "password": password,
                     "client_id": AUTH0_CLIENT_ID,
                     "client_secret": AUTH0_CLIENT_SECRET,
-                    "audience": "https://probestack.io/api",
-                    "scope": "openid profile email"
+                    "audience": "https://prod.probestack.io/api",
+                    "scope": "openid profile email",
+                    "realm": self.connection
                 }
             )
             
