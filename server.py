@@ -36,7 +36,7 @@ if os.path.exists(ROOT_DIR / ".env"):
 AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'probestack-usa-dev.us.auth0.com')
 AUTH0_CLIENT_ID = os.environ.get('AUTH0_CLIENT_ID', '')
 AUTH0_CLIENT_SECRET = os.environ.get('AUTH0_CLIENT_SECRET', '')
-AUTH0_CALLBACK_URI = os.environ.get('AUTH0_CALLBACK_URI', 'https://prod.probestack.io/callback')
+AUTH0_CALLBACK_URI = os.environ.get('AUTH0_CALLBACK_URI', 'https://probestack.io/callback')
 AUTH0_MGMT_DOMAIN = os.environ.get('AUTH0_MGMT_DOMAIN', 'probestack-usa-dev.us.auth0.com')
 AUTH0_MGMT_CLIENT_ID = os.environ.get('AUTH0_MGMT_CLIENT_ID', '')
 AUTH0_MGMT_CLIENT_SECRET = os.environ.get('AUTH0_MGMT_CLIENT_SECRET', '')
@@ -276,7 +276,7 @@ class Auth0ManagementAPI:
                     "password": password,
                     "client_id": AUTH0_CLIENT_ID,
                     "client_secret": AUTH0_CLIENT_SECRET,
-                    "audience": "https://prod.probestack.io/api",
+                    "audience": "https://probestack.io/api",
                     "scope": "openid profile email",
                     "realm": self.connection
                 }
