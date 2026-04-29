@@ -42,7 +42,7 @@ AUTH0_MGMT_CLIENT_ID = os.environ.get('AUTH0_MGMT_CLIENT_ID', '')
 AUTH0_MGMT_CLIENT_SECRET = os.environ.get('AUTH0_MGMT_CLIENT_SECRET', '')
 AUTH0_DB_CONNECTION_NAME = os.environ.get('AUTH0_DB_CONNECTION_NAME', 'probestack-prod-users')
 AUTH0_DB_CONNECTION_ID = os.environ.get('AUTH0_DB_CONNECTION_ID', '')
-
+AUTH0_CALLBACK_URI = "https://probestack.io/callback"
 from urllib.parse import quote_plus
 
 DB_USER = os.environ.get("DB_USER")
