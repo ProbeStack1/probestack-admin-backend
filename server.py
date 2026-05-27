@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON
+from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON, UniqueConstraint
 from sqlalchemy.dialects.mysql import LONGTEXT
 
 import os
@@ -20,6 +20,9 @@ import json
 import httpx
 from urllib.parse import urlencode
 import secrets
+import smtplib
+from email.message import EmailMessage
+from html import escape
 
 from passlib.context import CryptContext
 
@@ -48,6 +51,8 @@ from urllib.parse import quote_plus
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 DB_NAME = os.environ.get("DB_NAME")
+DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
+DB_PORT = os.environ.get("DB_PORT", "3306")
 INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
 
 if DB_USER is None or DB_PASSWORD is None or DB_NAME is None:
@@ -57,17 +62,17 @@ DB_PASSWORD = quote_plus(DB_PASSWORD)
 
 if INSTANCE_CONNECTION_NAME:
     DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
+        f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@/{DB_NAME}"
         f"?unix_socket=/cloudsql/{INSTANCE_CONNECTION_NAME}"
     )
 else:
     DATABASE_URL = (
-        f"mysql+aiomysql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:3306/{DB_NAME}"
+        f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     )
 
 engine = create_async_engine(
     DATABASE_URL,
-    pool_pre_ping=True,
+    pool_pre_ping=False,
     echo=False,
 )
 
@@ -79,6 +84,17 @@ AsyncSessionLocal = async_sessionmaker(
 # JWT Config
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
+
+# Application email config. When SMTP_HOST is not set, email sending is skipped
+# and the generated setup link is returned/logged for local testing.
+APP_URL = os.environ.get("APP_URL", "https://probestack.io")
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or SMTP_USERNAME
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "ProbeStack")
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ["1", "true", "yes"]
 
 # Create the main app
 app = FastAPI()
@@ -337,20 +353,38 @@ class OrganizationModel(Base):
     external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True) 
     supported_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     auth0_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    gateway_region: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    gateway_organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    gateway_environment_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    gateway_environments: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 class SubscriptionModel(Base):
     __tablename__ = "subscriptions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     plan_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    plan_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    plan_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     tools: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array
     status: Mapped[str] = mapped_column(String(50), default="active")
     start_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     end_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     billing_cycle: Mapped[str] = mapped_column(String(50), default="monthly")
     amount: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class SubscriptionToolModel(Base):
+    """Normalized selected tools for a subscription."""
+    __tablename__ = "subscription_tools"
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "plan_tool_id", name="uq_subscription_tools_plan_tool"),
+        UniqueConstraint("subscription_id", "tool_key", name="uq_subscription_tools_tool_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    subscription_id: Mapped[str] = mapped_column(String(36), ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
+    plan_tool_id: Mapped[str] = mapped_column(String(36), ForeignKey("plan_tools.id", ondelete="RESTRICT"), nullable=False)
+    tool_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class PlanModel(Base):
@@ -362,18 +396,20 @@ class PlanModel(Base):
     features: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array
     price_monthly: Mapped[float] = mapped_column(Float, nullable=False)
     price_yearly: Mapped[float] = mapped_column(Float, nullable=False)
+    api_limit: Mapped[int] = mapped_column(default=0)
+    cost: Mapped[float] = mapped_column(Float, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class PlanToolModel(Base):
-    """Model for individual tools within a plan with their own pricing"""
+    """Model for individual tools within a plan."""
     __tablename__ = "plan_tools"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     plan_id: Mapped[str] = mapped_column(String(36), nullable=False)  # FK to plans
     name: Mapped[str] = mapped_column(String(255), nullable=False)  # e.g., "API Design Studio"
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    price_monthly: Mapped[float] = mapped_column(Float, default=0)  # Monthly price for this tool
-    price_yearly: Mapped[float] = mapped_column(Float, default=0)  # Yearly price for this tool
+    price_monthly: Mapped[float] = mapped_column(Float, default=0)  # Deprecated compatibility field
+    price_yearly: Mapped[float] = mapped_column(Float, default=0)  # Deprecated compatibility field
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     display_order: Mapped[int] = mapped_column(default=0)  # For ordering tools in UI
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -384,9 +420,9 @@ class UserModel(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     role_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    role_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    role_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     status: Mapped[str] = mapped_column(String(50), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_login: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -410,7 +446,7 @@ class BillingModel(Base):
     __tablename__ = "billing"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     subscription_id: Mapped[str] = mapped_column(String(36), nullable=False)
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="pending")
@@ -438,7 +474,7 @@ class UserRequestModel(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     requested_role: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, approved, rejected
     job_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -451,6 +487,9 @@ class UserRequestModel(Base):
     rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     approved_role_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    approved_business_unit_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    approved_project_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    approved_project_role: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
 class IndividualUserRequestModel(Base):
     """Model for individual user requests (users without organization)"""
@@ -479,9 +518,9 @@ class PlanUpgradeRequestModel(Base):
     __tablename__ = "plan_upgrade_requests"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     current_plan_id: Mapped[str] = mapped_column(String(100), nullable=False)  # JSON array of current plan IDs
-    current_plan_name: Mapped[str] = mapped_column(String(255), nullable=False)  # JSON array or comma-separated
+    current_plan_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     # Old single-plan columns (for backward compatibility)
     requested_plan_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     requested_plan_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -498,13 +537,77 @@ class PlanUpgradeRequestModel(Base):
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     requested_by: Mapped[str] = mapped_column(String(36), nullable=False)  # Admin who requested
 
+class PlanUpgradeRequestItemModel(Base):
+    """Normalized requested plan rows for plan upgrade requests."""
+    __tablename__ = "plan_upgrade_request_items"
+    __table_args__ = (
+        UniqueConstraint("request_id", "plan_id", name="uq_upgrade_request_items_request_plan"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id: Mapped[str] = mapped_column(String(36), ForeignKey("plan_upgrade_requests.id", ondelete="CASCADE"), nullable=False)
+    plan_id: Mapped[str] = mapped_column(String(36), ForeignKey("plans.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class PlanUpgradeRequestToolModel(Base):
+    """Normalized selected tools for a requested upgrade plan."""
+    __tablename__ = "plan_upgrade_request_tools"
+    __table_args__ = (
+        UniqueConstraint("request_item_id", "plan_tool_id", name="uq_upgrade_request_tools_plan_tool"),
+        UniqueConstraint("request_item_id", "tool_key", name="uq_upgrade_request_tools_tool_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("plan_upgrade_request_items.id", ondelete="CASCADE"), nullable=False)
+    plan_tool_id: Mapped[str] = mapped_column(String(36), ForeignKey("plan_tools.id", ondelete="RESTRICT"), nullable=False)
+    tool_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class OrganizationSubscriptionRequestModel(Base):
+    """Normalized plan request for organization onboarding."""
+    __tablename__ = "organization_subscription_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+class OrganizationSubscriptionRequestItemModel(Base):
+    """Normalized requested plans for organization onboarding."""
+    __tablename__ = "organization_subscription_request_items"
+    __table_args__ = (
+        UniqueConstraint("request_id", "plan_id", name="uq_org_subscription_request_items_request_plan"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id: Mapped[str] = mapped_column(String(36), ForeignKey("organization_subscription_requests.id", ondelete="CASCADE"), nullable=False)
+    plan_id: Mapped[str] = mapped_column(String(36), ForeignKey("plans.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class OrganizationSubscriptionRequestToolModel(Base):
+    """Normalized selected tools for organization onboarding request plans."""
+    __tablename__ = "organization_subscription_request_tools"
+    __table_args__ = (
+        UniqueConstraint("request_item_id", "plan_tool_id", name="uq_org_subscription_request_tools_plan_tool"),
+        UniqueConstraint("request_item_id", "tool_key", name="uq_org_subscription_request_tools_tool_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("organization_subscription_request_items.id", ondelete="CASCADE"), nullable=False)
+    plan_tool_id: Mapped[str] = mapped_column(String(36), ForeignKey("plan_tools.id", ondelete="RESTRICT"), nullable=False)
+    tool_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 class Auth0LoginRecordModel(Base):
     """Model for storing Auth0 login records"""
     __tablename__ = "auth0_login_records"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Deprecated display cache
     external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     auth0_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  
     auth0_user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True) 
@@ -518,6 +621,75 @@ class Auth0LoginRecordModel(Base):
     login_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     ip_address: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+class BusinessUnitModel(Base):
+    """Business units owned by an approved organization."""
+    __tablename__ = "business_units"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name", name="uq_business_units_org_name"),
+        UniqueConstraint("organization_id", "code", name="uq_business_units_org_code"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    application_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    application_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    go_live_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    members_count: Mapped[int] = mapped_column(default=0)
+    consumers_count: Mapped[int] = mapped_column(default=0)
+    project_sme: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    tester: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    servicenow_group: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    sync_status: Mapped[str] = mapped_column(String(50), default="synced")
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="active")
+    created_by: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("admins.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class ProjectModel(Base):
+    """Projects or teams owned by an approved organization, optionally under a BU."""
+    __tablename__ = "projects"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name", name="uq_projects_org_name"),
+        UniqueConstraint("organization_id", "code", name="uq_projects_org_code"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
+    business_unit_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("business_units.id"), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="active")
+    created_by: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("admins.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class ProjectTeamMemberModel(Base):
+    """Project-scoped team invitations and memberships."""
+    __tablename__ = "project_team_members"
+    __table_args__ = (
+        UniqueConstraint("project_id", "email", name="uq_project_team_members_project_email"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    project_role: Mapped[str] = mapped_column(String(50), default="member")
+    status: Mapped[str] = mapped_column(String(50), default="invited")
+    invited_by: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("admins.id", ondelete="SET NULL"), nullable=True)
+    invited_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 # ==================== PYDANTIC SCHEMAS ====================
 
@@ -545,7 +717,9 @@ class PlanSelectionItem(BaseModel):
 
 class PlanUpgradeCreate(BaseModel):
     """Schema for org admin to request plan upgrade - supports multiple plans"""
-    requested_plans: List[PlanSelectionItem]  # Multiple plans with their tools
+    requested_plans: Optional[List[PlanSelectionItem]] = None  # Multiple plans with their tools
+    requested_plan_id: Optional[str] = None  # Backward-compatible single-plan payload
+    requested_tools: Optional[List[str]] = None  # Backward-compatible single-plan payload
     reason: Optional[str] = None
 
 class SubscriptionUpdateRequest(BaseModel):
@@ -563,6 +737,10 @@ class OrganizationCreate(BaseModel):
     phone: Optional[str] = None
     address: Optional[str] = None
     description: Optional[str] = None
+    gateway_region: Optional[str] = None
+    gateway_organization_name: Optional[str] = None
+    gateway_environment_type: Optional[str] = None
+    gateway_environments: Optional[List[str]] = None
 
 class OrganizationRequest(BaseModel):
     """Schema for external API requests to register an organization"""
@@ -576,6 +754,10 @@ class OrganizationRequest(BaseModel):
     company_address: Optional[str] = None
     additional_notes: Optional[str] = None
     description: Optional[str] = None
+    gateway_region: Optional[str] = None
+    gateway_organization_name: Optional[str] = None
+    gateway_environment_type: Optional[str] = None
+    gateway_environments: Optional[List[str]] = None
 
 class OrganizationUpdate(BaseModel):
     name: Optional[str] = None
@@ -586,6 +768,10 @@ class OrganizationUpdate(BaseModel):
     external_org_id: Optional[str] = None
     supported_domains: Optional[List[str]] = None
     auth0_org_id: Optional[str] = None  # Auth0 organization ID
+    gateway_region: Optional[str] = None
+    gateway_organization_name: Optional[str] = None
+    gateway_environment_type: Optional[str] = None
+    gateway_environments: Optional[List[str]] = None
 
 class IdentifyOrgRequest(BaseModel):
     """Request to identify organization from email"""
@@ -631,8 +817,10 @@ class PlanCreate(BaseModel):
     tool: str
     description: str
     features: List[str]
-    price_monthly: float
-    price_yearly: float
+    price_monthly: Optional[float] = None
+    price_yearly: Optional[float] = None
+    api_limit: int = 0
+    cost: float = 0
 
 class PlanToolCreate(BaseModel):
     """Schema for creating a tool within a plan"""
@@ -673,6 +861,67 @@ class UserRequestCreate(BaseModel):
     department: Optional[str] = None
     phone: Optional[str] = None
     notes: Optional[str] = None
+
+class BusinessUnitCreate(BaseModel):
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+    application_name: Optional[str] = None
+    application_id: Optional[str] = None
+    owner_name: Optional[str] = None
+    go_live_date: Optional[datetime] = None
+    members_count: int = 0
+    consumers_count: int = 0
+    project_sme: Optional[str] = None
+    tester: Optional[str] = None
+    servicenow_group: Optional[str] = None
+    last_synced_at: Optional[datetime] = None
+    sync_status: Optional[str] = "synced"
+    tags: List[str] = []
+    status: Optional[str] = "active"
+
+class BusinessUnitUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+    application_name: Optional[str] = None
+    application_id: Optional[str] = None
+    owner_name: Optional[str] = None
+    go_live_date: Optional[datetime] = None
+    members_count: Optional[int] = None
+    consumers_count: Optional[int] = None
+    project_sme: Optional[str] = None
+    tester: Optional[str] = None
+    servicenow_group: Optional[str] = None
+    last_synced_at: Optional[datetime] = None
+    sync_status: Optional[str] = None
+    tags: Optional[List[str]] = None
+    status: Optional[str] = None
+
+class ProjectCreate(BaseModel):
+    name: str
+    business_unit_id: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = "active"
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    business_unit_id: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+
+class ProjectTeamInviteCreate(BaseModel):
+    emails: List[str]
+    project_role: Optional[str] = "member"
+
+class ExternalProjectCreate(BaseModel):
+    name: str
+    business_unit_id: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = "active"
 
 # ==================== HELPERS ====================
 
@@ -772,6 +1021,403 @@ def model_to_dict(model, json_fields=None):
         result[column.name] = value
     return result
 
+async def get_organization_name(db: AsyncSession, organization_id: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
+    if not organization_id:
+        return fallback
+    result = await db.execute(select(OrganizationModel.name).where(OrganizationModel.id == organization_id))
+    return result.scalar_one_or_none() or fallback
+
+async def get_role_name(db: AsyncSession, role_id: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
+    if not role_id:
+        return fallback
+    result = await db.execute(select(RoleModel.name).where(RoleModel.id == role_id))
+    return result.scalar_one_or_none() or fallback
+
+async def get_plan_name(db: AsyncSession, plan_id: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
+    if not plan_id:
+        return fallback
+    try:
+        plan_ids = json.loads(plan_id) if isinstance(plan_id, str) and plan_id.startswith("[") else [plan_id]
+    except (json.JSONDecodeError, TypeError):
+        plan_ids = [plan_id]
+    plan_ids = [pid for pid in plan_ids if pid]
+    if not plan_ids:
+        return fallback
+    result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+    names = [plan.name for plan in result.scalars().all()]
+    return ", ".join(names) if names else fallback
+
+def parse_json_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else [parsed]
+        except (json.JSONDecodeError, TypeError):
+            return [value] if value else []
+    return [value]
+
+def normalize_plan_selections(data: PlanUpgradeCreate) -> List[PlanSelectionItem]:
+    if data.requested_plans:
+        return data.requested_plans
+    if data.requested_plan_id:
+        return [PlanSelectionItem(plan_id=data.requested_plan_id, tool_ids=data.requested_tools or [])]
+    return []
+
+async def resolve_plan_tool(db: AsyncSession, plan_id: str, tool_value: str) -> Optional[PlanToolModel]:
+    result = await db.execute(
+        select(PlanToolModel).where(
+            PlanToolModel.plan_id == plan_id,
+            (PlanToolModel.id == tool_value) | (PlanToolModel.name == tool_value)
+        )
+    )
+    return result.scalar_one_or_none()
+
+async def set_subscription_tools(db: AsyncSession, subscription_id: str, plan_id: str, tools: List[str]):
+    await db.execute(delete(SubscriptionToolModel).where(SubscriptionToolModel.subscription_id == subscription_id))
+    seen = set()
+    for tool in tools or []:
+        if not tool or tool in seen:
+            continue
+        seen.add(tool)
+        plan_tool = await resolve_plan_tool(db, plan_id, tool)
+        if not plan_tool:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tool '{tool}' is not available for plan '{plan_id}'"
+            )
+        db.add(SubscriptionToolModel(
+            subscription_id=subscription_id,
+            plan_tool_id=plan_tool.id,
+            tool_key=None
+        ))
+
+async def get_subscription_tools(db: AsyncSession, subscription: SubscriptionModel) -> List[str]:
+    result = await db.execute(
+        select(SubscriptionToolModel)
+        .where(SubscriptionToolModel.subscription_id == subscription.id)
+        .order_by(SubscriptionToolModel.created_at.asc())
+    )
+    rows = result.scalars().all()
+    if not rows:
+        return parse_json_list(subscription.tools)
+
+    tool_names = []
+    for row in rows:
+        if row.plan_tool_id:
+            tool_result = await db.execute(select(PlanToolModel).where(PlanToolModel.id == row.plan_tool_id))
+            plan_tool = tool_result.scalar_one_or_none()
+            tool_names.append(plan_tool.name if plan_tool else row.plan_tool_id)
+        elif row.tool_key:
+            tool_names.append(row.tool_key)
+    return tool_names
+
+def is_real_organization(org: Optional[OrganizationModel]) -> bool:
+    return bool(org and org.id != "no_organization" and org.name != "Individual Users")
+
+async def get_organization_by_id(db: AsyncSession, organization_id: Optional[str]) -> Optional[OrganizationModel]:
+    if not organization_id:
+        return None
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == organization_id))
+    return result.scalar_one_or_none()
+
+async def cancel_active_real_org_subscription_for_plan(
+    db: AsyncSession,
+    organization_id: str,
+    plan_id: str,
+    *,
+    exclude_subscription_id: Optional[str] = None,
+):
+    org = await get_organization_by_id(db, organization_id)
+    if not is_real_organization(org):
+        return 0
+
+    stmt = (
+        update(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == organization_id)
+        .where(SubscriptionModel.plan_id == plan_id)
+        .where(SubscriptionModel.status == "active")
+    )
+    if exclude_subscription_id:
+        stmt = stmt.where(SubscriptionModel.id != exclude_subscription_id)
+    result = await db.execute(stmt.values(status="cancelled"))
+    return result.rowcount or 0
+
+async def ensure_can_activate_subscription(db: AsyncSession, subscription: SubscriptionModel):
+    org = await get_organization_by_id(db, subscription.organization_id)
+    if not is_real_organization(org):
+        return
+
+    result = await db.execute(
+        select(func.count())
+        .select_from(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == subscription.organization_id)
+        .where(SubscriptionModel.plan_id == subscription.plan_id)
+        .where(SubscriptionModel.status == "active")
+        .where(SubscriptionModel.id != subscription.id)
+    )
+    if (result.scalar() or 0) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Another active subscription already exists for this organization and plan"
+        )
+
+async def calculate_plan_total(db: AsyncSession, plan: PlanModel, tools: List[str], billing_cycle: str = "monthly") -> float:
+    seen = set()
+    for tool in tools or []:
+        if not tool or tool in seen:
+            continue
+        seen.add(tool)
+        plan_tool = await resolve_plan_tool(db, plan.id, tool)
+        if not plan_tool:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tool '{tool}' is not available for plan '{plan.id}'"
+            )
+    return float(getattr(plan, "cost", None) or plan.price_monthly or 0)
+
+async def sync_organization_requested_from_active_subscriptions(db: AsyncSession, organization_id: str):
+    org = await get_organization_by_id(db, organization_id)
+    if not org:
+        return
+    result = await db.execute(
+        select(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == organization_id)
+        .where(SubscriptionModel.status == "active")
+        .order_by(SubscriptionModel.created_at.desc())
+    )
+    active_subs = result.scalars().all()
+    org.requested_plan = json.dumps([sub.plan_id for sub in active_subs])
+    active_tools = []
+    for sub in active_subs:
+        active_tools.extend(await get_subscription_tools(db, sub))
+    org.requested_tools = json.dumps(active_tools)
+    org.updated_at = datetime.now(timezone.utc)
+
+async def set_upgrade_request_items(db: AsyncSession, request_id: str, selections: List[PlanSelectionItem]):
+    existing = await db.execute(
+        select(PlanUpgradeRequestItemModel).where(PlanUpgradeRequestItemModel.request_id == request_id)
+    )
+    for item in existing.scalars().all():
+        await db.execute(delete(PlanUpgradeRequestToolModel).where(PlanUpgradeRequestToolModel.request_item_id == item.id))
+    await db.execute(delete(PlanUpgradeRequestItemModel).where(PlanUpgradeRequestItemModel.request_id == request_id))
+
+    for selection in selections:
+        item = PlanUpgradeRequestItemModel(request_id=request_id, plan_id=selection.plan_id)
+        db.add(item)
+        await db.flush()
+        seen = set()
+        for tool in selection.tool_ids or []:
+            if not tool or tool in seen:
+                continue
+            seen.add(tool)
+            plan_tool = await resolve_plan_tool(db, selection.plan_id, tool)
+            if not plan_tool:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Tool '{tool}' is not available for plan '{selection.plan_id}'"
+                )
+            db.add(PlanUpgradeRequestToolModel(
+                request_item_id=item.id,
+                plan_tool_id=plan_tool.id,
+                tool_key=None
+            ))
+
+async def get_upgrade_request_items(db: AsyncSession, request: PlanUpgradeRequestModel) -> List[dict]:
+    result = await db.execute(
+        select(PlanUpgradeRequestItemModel)
+        .where(PlanUpgradeRequestItemModel.request_id == request.id)
+        .order_by(PlanUpgradeRequestItemModel.created_at.asc())
+    )
+    items = result.scalars().all()
+    if items:
+        details = []
+        for item in items:
+            plan_result = await db.execute(select(PlanModel).where(PlanModel.id == item.plan_id))
+            plan = plan_result.scalar_one_or_none()
+            tool_rows_result = await db.execute(
+                select(PlanUpgradeRequestToolModel)
+                .where(PlanUpgradeRequestToolModel.request_item_id == item.id)
+                .order_by(PlanUpgradeRequestToolModel.created_at.asc())
+            )
+            tools = []
+            for tool_row in tool_rows_result.scalars().all():
+                if tool_row.plan_tool_id:
+                    tool_result = await db.execute(select(PlanToolModel).where(PlanToolModel.id == tool_row.plan_tool_id))
+                    plan_tool = tool_result.scalar_one_or_none()
+                    tools.append(plan_tool.name if plan_tool else tool_row.plan_tool_id)
+                elif tool_row.tool_key:
+                    tools.append(tool_row.tool_key)
+            details.append({"plan_id": item.plan_id, "plan_name": plan.name if plan else item.plan_id, "tools": tools})
+        return details
+
+    if request.requested_plans_details:
+        try:
+            details = json.loads(request.requested_plans_details)
+            if isinstance(details, list):
+                return details
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return [{
+        "plan_id": request.requested_plan_id,
+        "plan_name": request.requested_plan_name,
+        "tools": parse_json_list(request.requested_tools)
+    }] if request.requested_plan_id else []
+
+async def create_organization_subscription_request(
+    db: AsyncSession,
+    organization_id: str,
+    plan_ids: List[str],
+    tools: List[str],
+    *,
+    status: str = "pending"
+) -> OrganizationSubscriptionRequestModel:
+    request = OrganizationSubscriptionRequestModel(
+        organization_id=organization_id,
+        status=status
+    )
+    db.add(request)
+    await db.flush()
+
+    unresolved_tools = set(tools or [])
+    for plan_id in plan_ids:
+        item = OrganizationSubscriptionRequestItemModel(request_id=request.id, plan_id=plan_id)
+        db.add(item)
+        await db.flush()
+        seen = set()
+        for tool in tools or []:
+            if not tool or tool in seen:
+                continue
+            seen.add(tool)
+            plan_tool = await resolve_plan_tool(db, plan_id, tool)
+            if not plan_tool:
+                if len(plan_ids) == 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Tool '{tool}' is not available for plan '{plan_id}'"
+                    )
+                continue
+            unresolved_tools.discard(tool)
+            db.add(OrganizationSubscriptionRequestToolModel(
+                request_item_id=item.id,
+                plan_tool_id=plan_tool.id,
+                tool_key=None
+            ))
+    if unresolved_tools:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tools are not available for selected plans: {sorted(unresolved_tools)}"
+        )
+    return request
+
+async def get_organization_requested_plan_details(db: AsyncSession, org: OrganizationModel) -> List[dict]:
+    request_result = await db.execute(
+        select(OrganizationSubscriptionRequestModel)
+        .where(OrganizationSubscriptionRequestModel.organization_id == org.id)
+        .order_by(OrganizationSubscriptionRequestModel.created_at.desc())
+    )
+    request = request_result.scalars().first()
+    if request:
+        item_result = await db.execute(
+            select(OrganizationSubscriptionRequestItemModel)
+            .where(OrganizationSubscriptionRequestItemModel.request_id == request.id)
+            .order_by(OrganizationSubscriptionRequestItemModel.created_at.asc())
+        )
+        details = []
+        for item in item_result.scalars().all():
+            plan_result = await db.execute(select(PlanModel).where(PlanModel.id == item.plan_id))
+            plan = plan_result.scalar_one_or_none()
+            tool_rows_result = await db.execute(
+                select(OrganizationSubscriptionRequestToolModel)
+                .where(OrganizationSubscriptionRequestToolModel.request_item_id == item.id)
+                .order_by(OrganizationSubscriptionRequestToolModel.created_at.asc())
+            )
+            tools = []
+            for tool_row in tool_rows_result.scalars().all():
+                if tool_row.plan_tool_id:
+                    tool_result = await db.execute(select(PlanToolModel).where(PlanToolModel.id == tool_row.plan_tool_id))
+                    plan_tool = tool_result.scalar_one_or_none()
+                    tools.append(plan_tool.name if plan_tool else tool_row.plan_tool_id)
+                elif tool_row.tool_key:
+                    tools.append(tool_row.tool_key)
+            details.append({"plan_id": item.plan_id, "plan_name": plan.name if plan else item.plan_id, "tools": tools})
+        if details:
+            return details
+
+    plan_ids = parse_json_list(org.requested_plan)
+    tools = parse_json_list(org.requested_tools)
+    return [{"plan_id": plan_id, "plan_name": await get_plan_name(db, plan_id, plan_id), "tools": tools} for plan_id in plan_ids]
+
+async def admin_to_dict(db: AsyncSession, admin: AdminModel) -> dict:
+    data = model_to_dict(admin)
+    data["organization_name"] = await get_organization_name(db, admin.organization_id, admin.organization_name)
+    return data
+
+async def user_to_dict(db: AsyncSession, user: UserModel) -> dict:
+    data = model_to_dict(user)
+    data["organization_name"] = await get_organization_name(db, user.organization_id, user.organization_name)
+    data["role_name"] = await get_role_name(db, user.role_id, user.role_name)
+    return data
+
+async def subscription_to_dict(db: AsyncSession, subscription: SubscriptionModel) -> dict:
+    data = model_to_dict(subscription, ["tools"])
+    data["organization_name"] = await get_organization_name(db, subscription.organization_id, subscription.organization_name)
+    data["plan_name"] = await get_plan_name(db, subscription.plan_id, subscription.plan_name)
+    data["tools"] = await get_subscription_tools(db, subscription)
+    return data
+
+async def billing_to_dict(db: AsyncSession, billing: BillingModel) -> dict:
+    data = model_to_dict(billing)
+    data["organization_name"] = await get_organization_name(db, billing.organization_id, billing.organization_name)
+    return data
+
+async def user_request_to_dict(db: AsyncSession, request: UserRequestModel) -> dict:
+    data = model_to_dict(request)
+    data["organization_name"] = await get_organization_name(db, request.organization_id, request.organization_name)
+    data["approved_business_unit"] = None
+    data["approved_team"] = None
+    if request.approved_business_unit_id:
+        bu_result = await db.execute(select(BusinessUnitModel).where(BusinessUnitModel.id == request.approved_business_unit_id))
+        business_unit = bu_result.scalar_one_or_none()
+        data["approved_business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
+    if request.approved_project_id:
+        project_result = await db.execute(select(ProjectModel).where(ProjectModel.id == request.approved_project_id))
+        project = project_result.scalar_one_or_none()
+        data["approved_team"] = model_to_dict(project) if project else None
+    return data
+
+async def organization_to_dict(db: AsyncSession, org: OrganizationModel) -> dict:
+    data = model_to_dict(org, ["requested_tools", "supported_domains", "gateway_environments"])
+    requested_details = await get_organization_requested_plan_details(db, org)
+    if requested_details:
+        data["requested_plan"] = json.dumps([detail["plan_id"] for detail in requested_details])
+        data["requested_plans"] = [detail["plan_id"] for detail in requested_details]
+        data["requested_tools"] = []
+        for detail in requested_details:
+            data["requested_tools"].extend(detail.get("tools", []))
+        data["requested_plan_details"] = requested_details
+    return data
+
+async def upgrade_request_to_dict(db: AsyncSession, request: PlanUpgradeRequestModel) -> dict:
+    data = model_to_dict(request, ["requested_tools"])
+    request_items = await get_upgrade_request_items(db, request)
+    data["organization_name"] = await get_organization_name(db, request.organization_id, request.organization_name)
+    data["current_plan_name"] = await get_plan_name(db, request.current_plan_id, request.current_plan_name)
+    if request.requested_plan_id:
+        data["requested_plan_name"] = await get_plan_name(db, request.requested_plan_id, request.requested_plan_name)
+    if request_items:
+        data["requested_plans_details"] = request_items
+        data["requested_plan_ids"] = [item["plan_id"] for item in request_items]
+        data["requested_tools"] = []
+        for item in request_items:
+            data["requested_tools"].extend(item.get("tools", []))
+        data["requested_plan_name"] = ", ".join([item["plan_name"] for item in request_items if item.get("plan_name")])
+    return data
+
 def create_token(admin_id: str, email: str, role: str, organization_id: Optional[str] = None) -> str:
     payload = {
         "sub": admin_id,
@@ -806,6 +1452,467 @@ def require_any_admin(payload: dict = Depends(verify_token)):
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+async def get_approved_org_for_admin(payload: dict, db: AsyncSession) -> OrganizationModel:
+    """Return the approved organization for the current org admin."""
+    if payload.get("role") != "org_admin":
+        raise HTTPException(status_code=403, detail="Organization admin access required")
+
+    org_id = payload.get("organization_id")
+    if not org_id:
+        raise HTTPException(status_code=404, detail="No organization linked to this account")
+
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if org.status != "approved":
+        raise HTTPException(status_code=400, detail="Organization is not approved")
+
+    return org
+
+async def assert_business_unit_unique(
+    db: AsyncSession,
+    *,
+    organization_id: str,
+    name: Optional[str] = None,
+    code: Optional[str] = None,
+    exclude_id: Optional[str] = None
+):
+    if name:
+        query = select(BusinessUnitModel).where(
+            BusinessUnitModel.organization_id == organization_id,
+            BusinessUnitModel.name == name
+        )
+        if exclude_id:
+            query = query.where(BusinessUnitModel.id != exclude_id)
+        result = await db.execute(query)
+        if result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Business unit name already exists in this organization")
+
+    if code:
+        query = select(BusinessUnitModel).where(
+            BusinessUnitModel.organization_id == organization_id,
+            BusinessUnitModel.code == code
+        )
+        if exclude_id:
+            query = query.where(BusinessUnitModel.id != exclude_id)
+        result = await db.execute(query)
+        if result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Business unit code already exists in this organization")
+
+async def assert_project_unique(
+    db: AsyncSession,
+    *,
+    organization_id: str,
+    name: Optional[str] = None,
+    code: Optional[str] = None,
+    exclude_id: Optional[str] = None
+):
+    if name:
+        query = select(ProjectModel).where(
+            ProjectModel.organization_id == organization_id,
+            ProjectModel.name == name
+        )
+        if exclude_id:
+            query = query.where(ProjectModel.id != exclude_id)
+        result = await db.execute(query)
+        if result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Project/team name already exists in this organization")
+
+    if code:
+        query = select(ProjectModel).where(
+            ProjectModel.organization_id == organization_id,
+            ProjectModel.code == code
+        )
+        if exclude_id:
+            query = query.where(ProjectModel.id != exclude_id)
+        result = await db.execute(query)
+        if result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Project/team code already exists in this organization")
+
+def normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+def derive_name_from_email(email: str) -> str:
+    local_part = email.split("@", 1)[0] if "@" in email else email
+    return local_part.replace(".", " ").replace("_", " ").replace("-", " ").title()
+
+def get_org_allowed_domains(org: OrganizationModel) -> List[str]:
+    domains = []
+    for value in parse_json_list(org.supported_domains):
+        if value:
+            domain = str(value).strip().lower()
+            domains.append(domain if domain.startswith("@") else f"@{domain}")
+    if org.domain:
+        domain = org.domain.strip().lower()
+        domains.append(domain if domain.startswith("@") else f"@{domain}")
+    return sorted(set(domains))
+
+def assert_email_allowed_for_org(email: str, org: OrganizationModel):
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail=f"Invalid email address: {email}")
+    email_domain = "@" + email.split("@", 1)[1].lower()
+    allowed_domains = get_org_allowed_domains(org)
+    if not allowed_domains:
+        raise HTTPException(status_code=400, detail="Organization has no supported email domains configured")
+    if email_domain not in allowed_domains:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Email {email} is not allowed. Allowed domains: {', '.join(allowed_domains)}"
+        )
+
+async def get_project_for_org(db: AsyncSession, project_id: str, organization_id: str) -> ProjectModel:
+    result = await db.execute(
+        select(ProjectModel).where(
+            ProjectModel.id == project_id,
+            ProjectModel.organization_id == organization_id
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project/team not found")
+    return project
+
+async def get_approved_org_by_id(db: AsyncSession, organization_id: str) -> OrganizationModel:
+    result = await db.execute(
+        select(OrganizationModel).where(
+            OrganizationModel.id == organization_id,
+            OrganizationModel.status == "approved"
+        )
+    )
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Approved organization not found")
+    return org
+
+async def create_business_unit_for_org(
+    db: AsyncSession,
+    org: OrganizationModel,
+    data: BusinessUnitCreate,
+    created_by: Optional[str] = None
+) -> BusinessUnitModel:
+    name = data.name.strip()
+    code = data.code.strip() if data.code else None
+    status = data.status or "active"
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Business unit name is required")
+    if status not in ["active", "inactive", "archived"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    if data.sync_status and data.sync_status not in ["synced", "pending", "failed"]:
+        raise HTTPException(status_code=400, detail="Invalid sync status")
+
+    await assert_business_unit_unique(db, organization_id=org.id, name=name, code=code)
+
+    business_unit = BusinessUnitModel(
+        organization_id=org.id,
+        name=name,
+        code=code,
+        description=data.description,
+        application_name=data.application_name,
+        application_id=data.application_id,
+        owner_name=data.owner_name,
+        go_live_date=data.go_live_date,
+        members_count=max(data.members_count or 0, 0),
+        consumers_count=max(data.consumers_count or 0, 0),
+        project_sme=data.project_sme,
+        tester=data.tester,
+        servicenow_group=data.servicenow_group,
+        last_synced_at=data.last_synced_at,
+        sync_status=data.sync_status or "synced",
+        tags=json.dumps(data.tags or []),
+        status=status,
+        created_by=created_by
+    )
+    db.add(business_unit)
+    await db.flush()
+    return business_unit
+
+async def create_project_for_org(
+    db: AsyncSession,
+    org: OrganizationModel,
+    data: ExternalProjectCreate,
+    created_by: Optional[str] = None
+) -> ProjectModel:
+    name = data.name.strip()
+    code = data.code.strip() if data.code else None
+    status = data.status or "active"
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Team name is required")
+    if status not in ["active", "inactive", "archived"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    bu_result = await db.execute(
+        select(BusinessUnitModel).where(
+            BusinessUnitModel.id == data.business_unit_id,
+            BusinessUnitModel.organization_id == org.id
+        )
+    )
+    if not bu_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Business unit not found in this organization")
+
+    await assert_project_unique(db, organization_id=org.id, name=name, code=code)
+
+    project = ProjectModel(
+        organization_id=org.id,
+        business_unit_id=data.business_unit_id,
+        name=name,
+        code=code,
+        description=data.description,
+        status=status,
+        created_by=created_by
+    )
+    db.add(project)
+    await db.flush()
+    return project
+
+async def get_or_create_default_org_role(db: AsyncSession, org: OrganizationModel) -> RoleModel:
+    result = await db.execute(
+        select(RoleModel)
+        .where(RoleModel.organization_id == org.id, RoleModel.name.in_(["User", "Member"]))
+        .order_by(RoleModel.name.asc())
+    )
+    role = result.scalars().first()
+    if role:
+        return role
+
+    role = RoleModel(
+        name="User",
+        organization_id=org.id,
+        permissions=json.dumps(["read"]),
+        description="Default project team member role"
+    )
+    db.add(role)
+    await db.flush()
+    return role
+
+async def create_invited_org_user(db: AsyncSession, org: OrganizationModel, email: str) -> UserModel:
+    role = await get_or_create_default_org_role(db, org)
+    user = UserModel(
+        email=email,
+        name=derive_name_from_email(email),
+        organization_id=org.id,
+        organization_name=org.name,
+        role_id=role.id,
+        role_name=role.name,
+        status="pending_verification",
+        email_verified=False,
+        password_set=False,
+        first_login_token=secrets.token_urlsafe(32)
+    )
+    db.add(user)
+    await db.flush()
+
+    auth0_result = await auth0_mgmt.create_user(
+        email=email,
+        name=user.name,
+        user_metadata={
+            "probestack_user_id": user.id,
+            "organization_id": org.id,
+            "organization_name": org.name
+        }
+    )
+    if auth0_result.get("success"):
+        user.auth0_user_id = auth0_result.get("auth0_user_id")
+        await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    elif auth0_result.get("exists"):
+        existing_user = await auth0_mgmt.get_user_by_email(email)
+        if existing_user.get("success"):
+            user.auth0_user_id = existing_user["user"]["user_id"]
+            await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    else:
+        logger.warning(f"Failed to create Auth0 user for {email}: {auth0_result.get('error')}")
+
+    return user
+
+def build_setup_account_url(email: str, token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    return f"{APP_URL.rstrip('/')}/setup-account?{urlencode({'email': email, 'token': token})}"
+
+def build_login_url() -> str:
+    return f"{APP_URL.rstrip('/')}/admin/login"
+
+def send_email(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> dict:
+    if not SMTP_HOST or not SMTP_FROM_EMAIL:
+        logger.warning(
+            "SMTP not configured; skipped email to %s. Subject: %s",
+            to_email,
+            subject
+        )
+        return {
+            "sent": False,
+            "reason": "SMTP not configured"
+        }
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    message["To"] = to_email
+    message.set_content(text_body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            if SMTP_USERNAME and SMTP_PASSWORD:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+        logger.info("Project invite email sent to %s", to_email)
+        return {"sent": True}
+    except Exception as exc:
+        logger.error("Failed to send project invite email to %s: %s", to_email, exc)
+        return {
+            "sent": False,
+            "reason": str(exc)
+        }
+
+def send_project_invite_email(
+    *,
+    to_email: str,
+    invitee_name: str,
+    organization_name: str,
+    project_name: str,
+    project_role: str,
+    setup_url: Optional[str],
+    invited_by_email: Optional[str]
+) -> dict:
+    action_url = setup_url or build_login_url()
+    action_label = "Set up your account" if setup_url else "Open ProbeStack"
+    subject = f"You're invited to {project_name} on ProbeStack"
+    safe_invitee_name = escape(invitee_name)
+    safe_organization_name = escape(organization_name)
+    safe_project_name = escape(project_name)
+    safe_project_role = escape(project_role)
+    safe_invited_by = escape(invited_by_email or "your organization admin")
+    safe_action_url = escape(action_url, quote=True)
+    safe_action_label = escape(action_label)
+    text_body = "\n".join([
+        f"Hi {invitee_name},",
+        "",
+        f"You have been invited to the {project_name} project in {organization_name} as {project_role}.",
+        f"Invited by: {invited_by_email or 'your organization admin'}",
+        "",
+        f"{action_label}: {action_url}",
+        "",
+        "If you were not expecting this invitation, you can ignore this email.",
+        "",
+        "ProbeStack"
+    ])
+    html_body = f"""
+    <p>Hi {safe_invitee_name},</p>
+    <p>You have been invited to the <strong>{safe_project_name}</strong> project in <strong>{safe_organization_name}</strong> as <strong>{safe_project_role}</strong>.</p>
+    <p>Invited by: {safe_invited_by}</p>
+    <p><a href="{safe_action_url}">{safe_action_label}</a></p>
+    <p>If you were not expecting this invitation, you can ignore this email.</p>
+    <p>ProbeStack</p>
+    """
+    result = send_email(to_email, subject, text_body, html_body)
+    if setup_url:
+        result["setup_url"] = setup_url
+    return result
+
+async def project_team_member_to_dict(db: AsyncSession, member: ProjectTeamMemberModel) -> dict:
+    data = model_to_dict(member)
+    if member.user_id:
+        result = await db.execute(select(UserModel).where(UserModel.id == member.user_id))
+        user = result.scalar_one_or_none()
+        data["user"] = await user_to_dict(db, user) if user else None
+    else:
+        data["user"] = None
+    return data
+
+async def validate_user_request_team_assignment(
+    db: AsyncSession,
+    organization_id: str,
+    project_id: Optional[str],
+    business_unit_id: Optional[str] = None
+) -> tuple[BusinessUnitModel, ProjectModel]:
+    if not project_id:
+        raise HTTPException(status_code=400, detail="Team is required when approving organization users")
+
+    project_result = await db.execute(
+        select(ProjectModel).where(
+            ProjectModel.id == project_id,
+            ProjectModel.organization_id == organization_id
+        )
+    )
+    project = project_result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Team not found in this organization")
+    if not project.business_unit_id:
+        raise HTTPException(status_code=400, detail="Selected team must be linked to a business unit")
+    if business_unit_id and project.business_unit_id != business_unit_id:
+        raise HTTPException(status_code=400, detail="Selected team does not belong to selected business unit")
+
+    bu_result = await db.execute(
+        select(BusinessUnitModel).where(
+            BusinessUnitModel.id == project.business_unit_id,
+            BusinessUnitModel.organization_id == organization_id
+        )
+    )
+    business_unit = bu_result.scalar_one_or_none()
+    if not business_unit:
+        raise HTTPException(status_code=404, detail="Business unit not found in this organization")
+
+    return business_unit, project
+
+async def assign_user_to_project_team(
+    db: AsyncSession,
+    user: UserModel,
+    project: ProjectModel,
+    project_role: str,
+    invited_by: Optional[str]
+) -> ProjectTeamMemberModel:
+    existing_result = await db.execute(
+        select(ProjectTeamMemberModel).where(
+            ProjectTeamMemberModel.project_id == project.id,
+            ProjectTeamMemberModel.email == user.email
+        )
+    )
+    existing_member = existing_result.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if existing_member:
+        existing_member.user_id = user.id
+        existing_member.name = user.name
+        existing_member.project_role = project_role
+        existing_member.status = "active" if user.status == "active" else "invited"
+        existing_member.invited_by = invited_by
+        existing_member.invited_at = now
+        existing_member.accepted_at = now if existing_member.status == "active" else None
+        existing_member.updated_at = now
+        return existing_member
+
+    member = ProjectTeamMemberModel(
+        organization_id=user.organization_id,
+        project_id=project.id,
+        user_id=user.id,
+        email=user.email,
+        name=user.name,
+        project_role=project_role,
+        status="active" if user.status == "active" else "invited",
+        invited_by=invited_by,
+        accepted_at=now if user.status == "active" else None
+    )
+    db.add(member)
+    await db.flush()
+    return member
+
+async def activate_project_memberships_for_user(db: AsyncSession, user: UserModel):
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(ProjectTeamMemberModel)
+        .where(
+            (ProjectTeamMemberModel.user_id == user.id) | (ProjectTeamMemberModel.email == user.email),
+            ProjectTeamMemberModel.organization_id == user.organization_id,
+            ProjectTeamMemberModel.status == "invited"
+        )
+        .values(status="active", accepted_at=now, updated_at=now)
+    )
 
 # ==================== UNIQUENESS HELPERS ====================
 
@@ -889,6 +1996,7 @@ async def login_admin(data: AdminLogin, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Account is disabled")
     
     token = create_token(admin.id, admin.email, admin.role, admin.organization_id)
+    organization_name = await get_organization_name(db, admin.organization_id, admin.organization_name)
     return {
         "token": token,
         "admin": {
@@ -897,7 +2005,7 @@ async def login_admin(data: AdminLogin, db: AsyncSession = Depends(get_db)):
             "name": admin.name,
             "role": admin.role,
             "organization_id": admin.organization_id,
-            "organization_name": admin.organization_name
+            "organization_name": organization_name
         }
     }
 
@@ -913,7 +2021,7 @@ async def get_current_admin(payload: dict = Depends(verify_token), db: AsyncSess
         "name": admin.name,
         "role": admin.role,
         "organization_id": admin.organization_id,
-        "organization_name": admin.organization_name,
+        "organization_name": await get_organization_name(db, admin.organization_id, admin.organization_name),
         "is_active": admin.is_active
     }
 
@@ -1055,7 +2163,7 @@ async def verify_first_login_token(email: str, token: str, db: AsyncSession = De
             "id": user.id,
             "email": user.email,
             "name": user.name,
-            "organization_name": user.organization_name,
+            "organization_name": await get_organization_name(db, user.organization_id, user.organization_name),
             "email_verified": user.email_verified,
             "password_set": user.password_set
         }
@@ -1130,6 +2238,7 @@ async def set_user_password(email: str, token: str, password: str, db: AsyncSess
     user.email_verified = True
     user.status = "active"
     user.first_login_token = None  # Clear the token after successful setup
+    await activate_project_memberships_for_user(db, user)
     
     await db.commit()
     
@@ -1182,6 +2291,8 @@ async def confirm_password_set(email: str, db: AsyncSession = Depends(get_db)):
     # Cleanup token (idempotent)
     if user.first_login_token:
         user.first_login_token = None
+
+    await activate_project_memberships_for_user(db, user)
 
     await db.commit()
 
@@ -1251,14 +2362,7 @@ async def get_all_admins(payload: dict = Depends(require_super_admin), db: Async
     """Get all admin users (super admin only)"""
     result = await db.execute(select(AdminModel).order_by(AdminModel.created_at.desc()))
     admins = result.scalars().all()
-    return [
-        {
-            "id": a.id, "email": a.email, "name": a.name, "role": a.role,
-            "organization_id": a.organization_id, "organization_name": a.organization_name,
-            "is_active": a.is_active, "created_at": a.created_at.isoformat() if a.created_at else None
-        }
-        for a in admins
-    ]
+    return [await admin_to_dict(db, a) for a in admins]
 
 @api_router.post("/admins", tags=["Admin Management"])
 async def create_admin(data: AdminCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -1304,7 +2408,7 @@ async def create_admin(data: AdminCreate, payload: dict = Depends(require_super_
         "name": admin.name,
         "role": admin.role,
         "organization_id": admin.organization_id,
-        "organization_name": admin.organization_name,
+        "organization_name": await get_organization_name(db, admin.organization_id, admin.organization_name),
         "message": "Admin created successfully"
     }
 
@@ -1396,7 +2500,7 @@ async def get_my_organization(payload: dict = Depends(require_any_admin), db: As
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    return model_to_dict(org, ["requested_tools", "supported_domains"])
+    return await organization_to_dict(db, org)
 
 @api_router.get("/my-organization/subscription", tags=["Org Admin"])
 async def get_my_subscription(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -1414,7 +2518,7 @@ async def get_my_subscription(payload: dict = Depends(require_any_admin), db: As
         .order_by(SubscriptionModel.created_at.desc())
     )
     subs = result.scalars().all()
-    return [model_to_dict(s, ["tools"]) for s in subs]
+    return [await subscription_to_dict(db, s) for s in subs]
 
 @api_router.get("/my-organization/users", tags=["Org Admin"])
 async def get_my_organization_users(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -1431,7 +2535,7 @@ async def get_my_organization_users(payload: dict = Depends(require_any_admin), 
         .where(UserModel.organization_id == org_id)
         .order_by(UserModel.created_at.desc())
     )
-    return [model_to_dict(u) for u in result.scalars().all()]
+    return [await user_to_dict(db, u) for u in result.scalars().all()]
 
 @api_router.get("/my-organization/roles", tags=["Org Admin"])
 async def get_my_organization_roles(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -1450,6 +2554,460 @@ async def get_my_organization_roles(payload: dict = Depends(require_any_admin), 
     )
     return [model_to_dict(r, ["permissions"]) for r in result.scalars().all()]
 
+@api_router.get("/my-organization/business-units", tags=["Org Admin - Business Units"])
+async def get_my_business_units(
+    include_projects: bool = False,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get BUs for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    result = await db.execute(
+        select(BusinessUnitModel)
+        .where(BusinessUnitModel.organization_id == org.id)
+        .order_by(BusinessUnitModel.name.asc())
+    )
+    business_units = result.scalars().all()
+    response = [model_to_dict(bu, ["tags"]) for bu in business_units]
+
+    if include_projects and business_units:
+        bu_ids = [bu.id for bu in business_units]
+        projects_result = await db.execute(
+            select(ProjectModel)
+            .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id.in_(bu_ids))
+            .order_by(ProjectModel.name.asc())
+        )
+        projects_by_bu = {}
+        for project in projects_result.scalars().all():
+            projects_by_bu.setdefault(project.business_unit_id, []).append(model_to_dict(project))
+
+        for bu_data in response:
+            bu_data["projects"] = projects_by_bu.get(bu_data["id"], [])
+
+    return response
+
+@api_router.post("/my-organization/business-units", tags=["Org Admin - Business Units"])
+async def create_my_business_unit(
+    data: BusinessUnitCreate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Onboard a BU for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+    business_unit = await create_business_unit_for_org(db, org, data, created_by=payload.get("sub"))
+    await db.commit()
+
+    return {"message": "Business unit created successfully", "business_unit": model_to_dict(business_unit, ["tags"])}
+
+@api_router.get("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
+async def get_my_business_unit(
+    business_unit_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get BU details and its projects for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    result = await db.execute(
+        select(BusinessUnitModel).where(
+            BusinessUnitModel.id == business_unit_id,
+            BusinessUnitModel.organization_id == org.id
+        )
+    )
+    business_unit = result.scalar_one_or_none()
+    if not business_unit:
+        raise HTTPException(status_code=404, detail="Business unit not found")
+
+    projects_result = await db.execute(
+        select(ProjectModel)
+        .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
+        .order_by(ProjectModel.name.asc())
+    )
+    response = model_to_dict(business_unit, ["tags"])
+    response["projects"] = [model_to_dict(project) for project in projects_result.scalars().all()]
+    return response
+
+@api_router.put("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
+async def update_my_business_unit(
+    business_unit_id: str,
+    data: BusinessUnitUpdate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update a BU for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    result = await db.execute(
+        select(BusinessUnitModel).where(
+            BusinessUnitModel.id == business_unit_id,
+            BusinessUnitModel.organization_id == org.id
+        )
+    )
+    business_unit = result.scalar_one_or_none()
+    if not business_unit:
+        raise HTTPException(status_code=404, detail="Business unit not found")
+
+    update_data = data.model_dump(exclude_unset=True)
+    if "name" in update_data:
+        update_data["name"] = update_data["name"].strip()
+        if not update_data["name"]:
+            raise HTTPException(status_code=400, detail="Business unit name is required")
+    if "code" in update_data:
+        update_data["code"] = update_data["code"].strip() if update_data["code"] else None
+    if "status" in update_data and update_data["status"] not in ["active", "inactive", "archived"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    if "sync_status" in update_data and update_data["sync_status"] not in ["synced", "pending", "failed"]:
+        raise HTTPException(status_code=400, detail="Invalid sync status")
+    for count_key in ["members_count", "consumers_count"]:
+        if count_key in update_data and update_data[count_key] is not None:
+            update_data[count_key] = max(update_data[count_key], 0)
+    if "tags" in update_data:
+        update_data["tags"] = json.dumps(update_data["tags"] or [])
+
+    await assert_business_unit_unique(
+        db,
+        organization_id=org.id,
+        name=update_data.get("name"),
+        code=update_data.get("code"),
+        exclude_id=business_unit_id
+    )
+
+    for key, value in update_data.items():
+        setattr(business_unit, key, value)
+    business_unit.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    return {"message": "Business unit updated successfully", "business_unit": model_to_dict(business_unit, ["tags"])}
+
+@api_router.get("/my-organization/business-units/{business_unit_id}/projects", tags=["Org Admin - Projects"])
+async def get_my_business_unit_projects(
+    business_unit_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get projects/teams for one BU in the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    bu_result = await db.execute(
+        select(BusinessUnitModel).where(
+            BusinessUnitModel.id == business_unit_id,
+            BusinessUnitModel.organization_id == org.id
+        )
+    )
+    if not bu_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Business unit not found")
+
+    result = await db.execute(
+        select(ProjectModel)
+        .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
+        .order_by(ProjectModel.name.asc())
+    )
+    return [model_to_dict(project) for project in result.scalars().all()]
+
+@api_router.get("/my-organization/projects", tags=["Org Admin - Projects"])
+async def get_my_projects(
+    business_unit_id: Optional[str] = None,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get projects/teams for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    query = select(ProjectModel).where(ProjectModel.organization_id == org.id)
+    if business_unit_id:
+        query = query.where(ProjectModel.business_unit_id == business_unit_id)
+
+    result = await db.execute(query.order_by(ProjectModel.name.asc()))
+    return [model_to_dict(project) for project in result.scalars().all()]
+
+@api_router.post("/my-organization/projects", tags=["Org Admin - Projects"])
+async def create_my_project(
+    data: ProjectCreate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Onboard a project/team for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+    if not data.business_unit_id:
+        raise HTTPException(status_code=400, detail="Business unit is required when onboarding a team")
+    project = await create_project_for_org(
+        db,
+        org,
+        ExternalProjectCreate(**data.model_dump()),
+        created_by=payload.get("sub")
+    )
+    await db.commit()
+
+    return {"message": "Project/team created successfully", "project": model_to_dict(project)}
+
+@api_router.get("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
+async def get_my_project(
+    project_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get project/team details for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    result = await db.execute(
+        select(ProjectModel).where(
+            ProjectModel.id == project_id,
+            ProjectModel.organization_id == org.id
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project/team not found")
+
+    response = model_to_dict(project)
+    if project.business_unit_id:
+        bu_result = await db.execute(
+            select(BusinessUnitModel).where(
+                BusinessUnitModel.id == project.business_unit_id,
+                BusinessUnitModel.organization_id == org.id
+            )
+        )
+        business_unit = bu_result.scalar_one_or_none()
+        response["business_unit"] = model_to_dict(business_unit) if business_unit else None
+    else:
+        response["business_unit"] = None
+
+    return response
+
+@api_router.put("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
+async def update_my_project(
+    project_id: str,
+    data: ProjectUpdate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update a project/team for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    result = await db.execute(
+        select(ProjectModel).where(
+            ProjectModel.id == project_id,
+            ProjectModel.organization_id == org.id
+        )
+    )
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project/team not found")
+
+    update_data = data.model_dump(exclude_unset=True)
+    if "name" in update_data:
+        update_data["name"] = update_data["name"].strip()
+        if not update_data["name"]:
+            raise HTTPException(status_code=400, detail="Project/team name is required")
+    if "code" in update_data:
+        update_data["code"] = update_data["code"].strip() if update_data["code"] else None
+    if "status" in update_data and update_data["status"] not in ["active", "inactive", "archived"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    if update_data.get("business_unit_id"):
+        bu_result = await db.execute(
+            select(BusinessUnitModel).where(
+                BusinessUnitModel.id == update_data["business_unit_id"],
+                BusinessUnitModel.organization_id == org.id
+            )
+        )
+        if not bu_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Business unit not found")
+
+    await assert_project_unique(
+        db,
+        organization_id=org.id,
+        name=update_data.get("name"),
+        code=update_data.get("code"),
+        exclude_id=project_id
+    )
+
+    for key, value in update_data.items():
+        setattr(project, key, value)
+    project.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    return {"message": "Project/team updated successfully", "project": model_to_dict(project)}
+
+@api_router.get("/my-organization/projects/{project_id}/team", tags=["Org Admin - Project Team"])
+async def get_my_project_team(
+    project_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get invited and active team members for a project in the current organization."""
+    org = await get_approved_org_for_admin(payload, db)
+    await get_project_for_org(db, project_id, org.id)
+
+    result = await db.execute(
+        select(ProjectTeamMemberModel)
+        .where(
+            ProjectTeamMemberModel.organization_id == org.id,
+            ProjectTeamMemberModel.project_id == project_id
+        )
+        .order_by(ProjectTeamMemberModel.invited_at.desc())
+    )
+    return [await project_team_member_to_dict(db, member) for member in result.scalars().all()]
+
+@api_router.get("/my-organization/project-team-members", tags=["Org Admin - Project Team"])
+async def get_my_project_team_members(
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get project/team members across all projects and business units."""
+    org = await get_approved_org_for_admin(payload, db)
+
+    result = await db.execute(
+        select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
+        .join(ProjectModel, ProjectTeamMemberModel.project_id == ProjectModel.id)
+        .outerjoin(BusinessUnitModel, ProjectModel.business_unit_id == BusinessUnitModel.id)
+        .where(
+            ProjectTeamMemberModel.organization_id == org.id,
+            ProjectModel.organization_id == org.id
+        )
+        .order_by(ProjectTeamMemberModel.invited_at.desc())
+    )
+
+    response = []
+    for member, project, business_unit in result.all():
+        member_data = await project_team_member_to_dict(db, member)
+        member_data["project"] = model_to_dict(project)
+        member_data["business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
+        member_data["business_unit_name"] = business_unit.name if business_unit else None
+        member_data["application_name"] = business_unit.application_name if business_unit else None
+        member_data["application_id"] = business_unit.application_id if business_unit else None
+        response.append(member_data)
+
+    return response
+
+@api_router.post("/my-organization/projects/{project_id}/team/invite", tags=["Org Admin - Project Team"])
+async def invite_my_project_team(
+    project_id: str,
+    data: ProjectTeamInviteCreate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Invite one or more organization-domain users to a project/team."""
+    org = await get_approved_org_for_admin(payload, db)
+    project = await get_project_for_org(db, project_id, org.id)
+    project_role = (data.project_role or "member").strip().lower()
+    if project_role not in ["manager", "member", "viewer"]:
+        raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
+
+    emails = []
+    seen = set()
+    for raw_email in data.emails or []:
+        email = normalize_email(raw_email)
+        if not email or email in seen:
+            continue
+        assert_email_allowed_for_org(email, org)
+        seen.add(email)
+        emails.append(email)
+
+    if not emails:
+        raise HTTPException(status_code=400, detail="At least one email address is required")
+
+    invited = []
+    skipped = []
+    for email in emails:
+        existing_member_result = await db.execute(
+            select(ProjectTeamMemberModel).where(
+                ProjectTeamMemberModel.project_id == project.id,
+                ProjectTeamMemberModel.email == email
+            )
+        )
+        existing_member = existing_member_result.scalar_one_or_none()
+        if existing_member:
+            if existing_member.status == "removed":
+                existing_member.status = "invited"
+                existing_member.project_role = project_role
+                existing_member.invited_by = payload.get("sub")
+                existing_member.invited_at = datetime.now(timezone.utc)
+                existing_member.updated_at = datetime.now(timezone.utc)
+                invited.append(existing_member)
+            else:
+                skipped.append({"email": email, "reason": "Already invited to this project"})
+            continue
+
+        user_result = await db.execute(select(UserModel).where(UserModel.email == email))
+        user = user_result.scalar_one_or_none()
+        if user and user.organization_id != org.id:
+            raise HTTPException(status_code=400, detail=f"User {email} belongs to another organization")
+
+        status = "active" if user and user.status == "active" else "invited"
+        accepted_at = datetime.now(timezone.utc) if status == "active" else None
+        if not user:
+            admin_result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+            admin = admin_result.scalar_one_or_none()
+            if admin and admin.organization_id != org.id:
+                raise HTTPException(status_code=400, detail=f"Admin {email} belongs to another organization")
+            if not admin:
+                user = await create_invited_org_user(db, org, email)
+                await db.execute(
+                    update(UserRequestModel)
+                    .where(
+                        UserRequestModel.email == email,
+                        UserRequestModel.organization_id == org.id,
+                        UserRequestModel.status == "pending"
+                    )
+                    .values(
+                        status="approved",
+                        approved_at=datetime.now(timezone.utc),
+                        updated_at=datetime.now(timezone.utc),
+                        approved_role_id=user.role_id
+                    )
+                )
+                status = "invited"
+                accepted_at = None
+            else:
+                status = "active"
+                accepted_at = datetime.now(timezone.utc)
+
+        member = ProjectTeamMemberModel(
+            organization_id=org.id,
+            project_id=project.id,
+            user_id=user.id if user else None,
+            email=email,
+            name=user.name if user else derive_name_from_email(email),
+            project_role=project_role,
+            status=status,
+            invited_by=payload.get("sub"),
+            accepted_at=accepted_at
+        )
+        db.add(member)
+        await db.flush()
+        invited.append(member)
+
+    await db.commit()
+
+    email_results = []
+    for member in invited:
+        member_user = None
+        if member.user_id:
+            member_user_result = await db.execute(select(UserModel).where(UserModel.id == member.user_id))
+            member_user = member_user_result.scalar_one_or_none()
+        setup_url = build_setup_account_url(member.email, member_user.first_login_token) if member_user else None
+        email_result = send_project_invite_email(
+            to_email=member.email,
+            invitee_name=member.name or derive_name_from_email(member.email),
+            organization_name=org.name,
+            project_name=project.name,
+            project_role=member.project_role,
+            setup_url=setup_url,
+            invited_by_email=payload.get("email")
+        )
+        email_results.append({
+            "email": member.email,
+            **email_result
+        })
+
+    return {
+        "message": f"Invited {len(invited)} team member(s) to {project.name}",
+        "invited": [await project_team_member_to_dict(db, member) for member in invited],
+        "skipped": skipped,
+        "emails": email_results
+    }
+
 @api_router.get("/my-organization/billing", tags=["Org Admin"])
 async def get_my_organization_billing(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
     """Get billing records for current organization (org admin only)"""
@@ -1465,7 +3023,7 @@ async def get_my_organization_billing(payload: dict = Depends(require_any_admin)
         .where(BillingModel.organization_id == org_id)
         .order_by(BillingModel.created_at.desc())
     )
-    return [model_to_dict(b) for b in result.scalars().all()]
+    return [await billing_to_dict(db, b) for b in result.scalars().all()]
 
 @api_router.get("/my-organization/user-requests", tags=["Org Admin"])
 async def get_my_organization_user_requests(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -1482,7 +3040,7 @@ async def get_my_organization_user_requests(payload: dict = Depends(require_any_
         .where(UserRequestModel.organization_id == org_id)
         .order_by(UserRequestModel.created_at.desc())
     )
-    return [model_to_dict(r) for r in result.scalars().all()]
+    return [await user_request_to_dict(db, r) for r in result.scalars().all()]
 
 @api_router.post("/my-organization/users/{user_id}/remove", tags=["Org Admin"])
 async def remove_user_from_my_organization(user_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -1508,7 +3066,15 @@ async def remove_user_from_my_organization(user_id: str, payload: dict = Depends
     return {"message": f"User {user.name} removed from organization"}
 
 @api_router.post("/my-organization/user-requests/{request_id}/approve", tags=["Org Admin"])
-async def approve_user_request_org_admin(request_id: str, role_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+async def approve_user_request_org_admin(
+    request_id: str,
+    role_id: str,
+    project_id: str,
+    business_unit_id: Optional[str] = None,
+    project_role: str = "member",
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
     """Approve a user request for current organization (org admin only)"""
     if payload.get("role") == "super_admin":
         raise HTTPException(status_code=400, detail="Super admins should use /user-requests/{id}/approve")
@@ -1534,6 +3100,10 @@ async def approve_user_request_org_admin(request_id: str, role_id: str, payload:
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Role not found in your organization")
+    project_role = (project_role or "member").strip().lower()
+    if project_role not in ["manager", "member", "viewer"]:
+        raise HTTPException(status_code=400, detail="Team role must be manager, member, or viewer")
+    business_unit, project = await validate_user_request_team_assignment(db, org_id, project_id, business_unit_id)
     # Check if user with this email already exists
     existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
     if existing_user.scalar_one_or_none():
@@ -1545,6 +3115,9 @@ async def approve_user_request_org_admin(request_id: str, role_id: str, payload:
     req.approved_at = now
     req.updated_at = now
     req.approved_role_id = role_id
+    req.approved_business_unit_id = business_unit.id
+    req.approved_project_id = project.id
+    req.approved_project_role = project_role
     
     # Create user with verification fields
     user = UserModel(
@@ -1561,6 +3134,7 @@ async def approve_user_request_org_admin(request_id: str, role_id: str, payload:
     )
     db.add(user)
     await db.flush()
+    team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
     
     # Create user in Auth0
     auth0_result = await auth0_mgmt.create_user(
@@ -1603,6 +3177,9 @@ async def approve_user_request_org_admin(request_id: str, role_id: str, payload:
             "auth0_user_id": user.auth0_user_id,
             "status": user.status
         },
+        "business_unit": model_to_dict(business_unit, ["tags"]),
+        "team": model_to_dict(project),
+        "team_member": await project_team_member_to_dict(db, team_member),
         "setup_url": setup_url,
         "next_steps": "User will receive an email to verify their email address and set their password."
     }
@@ -1654,7 +3231,7 @@ async def get_my_team(payload: dict = Depends(require_any_admin), db: AsyncSessi
         .where(AdminModel.organization_id == org_id)
         .order_by(AdminModel.created_at.desc())
     )
-    return [model_to_dict(a) for a in result.scalars().all()]
+    return [await admin_to_dict(db, a) for a in result.scalars().all()]
 
 class TeamMemberCreate(BaseModel):
     email: str
@@ -1766,7 +3343,7 @@ async def get_my_upgrade_requests(payload: dict = Depends(require_any_admin), db
         .where(PlanUpgradeRequestModel.organization_id == org_id)
         .order_by(PlanUpgradeRequestModel.created_at.desc())
     )
-    return [model_to_dict(r, ["requested_tools"]) for r in result.scalars().all()]
+    return [await upgrade_request_to_dict(db, r) for r in result.scalars().all()]
 
 @api_router.get("/my-organization/dashboard", tags=["Org Admin"])
 async def get_my_organization_dashboard(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -1782,17 +3359,21 @@ async def get_my_organization_dashboard(payload: dict = Depends(require_any_admi
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
     org = org_result.scalar_one_or_none()
     
-    # Get active subscription
+    # Get active subscriptions
     sub_result = await db.execute(
         select(SubscriptionModel)
         .where(SubscriptionModel.organization_id == org_id)
         .where(SubscriptionModel.status == "active")
+        .order_by(SubscriptionModel.created_at.desc())
     )
-    subscription = sub_result.scalar_one_or_none()
+    active_subscriptions = sub_result.scalars().all()
+    subscriptions_data = [await subscription_to_dict(db, sub) for sub in active_subscriptions]
     
     # Counts
     user_count = await db.scalar(select(func.count()).select_from(UserModel).where(UserModel.organization_id == org_id))
     role_count = await db.scalar(select(func.count()).select_from(RoleModel).where(RoleModel.organization_id == org_id))
+    business_unit_count = await db.scalar(select(func.count()).select_from(BusinessUnitModel).where(BusinessUnitModel.organization_id == org_id))
+    project_count = await db.scalar(select(func.count()).select_from(ProjectModel).where(ProjectModel.organization_id == org_id))
     pending_user_requests = await db.scalar(
         select(func.count()).select_from(UserRequestModel)
         .where(UserRequestModel.organization_id == org_id)
@@ -1807,10 +3388,14 @@ async def get_my_organization_dashboard(payload: dict = Depends(require_any_admi
     ) or 0
     
     return {
-        "organization": model_to_dict(org, ["requested_tools", "supported_domains"]) if org else None,
-        "subscription": model_to_dict(subscription, ["tools"]) if subscription else None,
+        "organization": await organization_to_dict(db, org) if org else None,
+        "subscription": subscriptions_data[0] if subscriptions_data else None,
+        "subscriptions": subscriptions_data,
+        "active_subscriptions": len(subscriptions_data),
         "total_users": user_count or 0,
         "total_roles": role_count or 0,
+        "total_business_units": business_unit_count or 0,
+        "total_projects": project_count or 0,
         "pending_user_requests": pending_user_requests or 0,
         "total_billed": total_billed
     }
@@ -1843,17 +3428,19 @@ async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(
     
     # Build current plan info
     current_plan_ids = [s.plan_id for s in current_subs]
-    current_plan_names = [s.plan_name for s in current_subs]
+    current_plan_names = [await get_plan_name(db, s.plan_id, s.plan_name) for s in current_subs]
     
+    requested_selections = normalize_plan_selections(data)
+
     # Validate requested plans exist and build details
-    if not data.requested_plans or len(data.requested_plans) == 0:
+    if not requested_selections:
         raise HTTPException(status_code=400, detail="At least one plan must be selected")
     
     requested_plan_ids = []
     requested_plans_details = []
     all_tools = []
     
-    for plan_selection in data.requested_plans:
+    for plan_selection in requested_selections:
         plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_selection.plan_id))
         plan = plan_result.scalar_one_or_none()
         if not plan:
@@ -1897,6 +3484,8 @@ async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(
         requested_by=payload["sub"]
     )
     db.add(upgrade_request)
+    await db.flush()
+    await set_upgrade_request_items(db, upgrade_request.id, requested_selections)
     
     # Create notification
     plan_names = [d["plan_name"] for d in requested_plans_details]
@@ -1930,7 +3519,7 @@ async def get_upgrade_requests(status: Optional[str] = None, payload: dict = Dep
     if status:
         query = query.where(PlanUpgradeRequestModel.status == status)
     result = await db.execute(query.order_by(PlanUpgradeRequestModel.created_at.desc()))
-    return [model_to_dict(r, ["requested_tools"]) for r in result.scalars().all()]
+    return [await upgrade_request_to_dict(db, r) for r in result.scalars().all()]
 
 @api_router.get("/upgrade-requests/pending", tags=["Upgrade Requests"])
 async def get_pending_upgrade_requests(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -1940,7 +3529,7 @@ async def get_pending_upgrade_requests(payload: dict = Depends(require_super_adm
         .where(PlanUpgradeRequestModel.status == "pending")
         .order_by(PlanUpgradeRequestModel.created_at.desc())
     )
-    return [model_to_dict(r, ["requested_tools"]) for r in result.scalars().all()]
+    return [await upgrade_request_to_dict(db, r) for r in result.scalars().all()]
 
 @api_router.post("/upgrade-requests/{request_id}/approve", tags=["Upgrade Requests"])
 async def approve_upgrade_request(request_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -1959,24 +3548,7 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
     req.approved_at = now
     req.updated_at = now
     
-    # Parse requested plans details
-    try:
-        requested_plans = json.loads(req.requested_plans_details) if req.requested_plans_details else []
-    except (json.JSONDecodeError, TypeError):
-        # Fallback for old format
-        requested_plans = [{
-            "plan_id": req.requested_plan_id,
-            "plan_name": req.requested_plan_name,
-            "tools": json.loads(req.requested_tools) if req.requested_tools else []
-        }]
-    
-    # Cancel all existing active subscriptions for this org
-    await db.execute(
-        update(SubscriptionModel)
-        .where(SubscriptionModel.organization_id == req.organization_id)
-        .where(SubscriptionModel.status == "active")
-        .values(status="cancelled")
-    )
+    requested_plans = await get_upgrade_request_items(db, req)
     
     # Create new subscriptions for each requested plan
     created_subs = []
@@ -1984,20 +3556,9 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
         plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_detail["plan_id"]))
         plan = plan_result.scalar_one_or_none()
         if plan:
-            # Calculate price based on selected tools
             tools = plan_detail.get("tools", [])
-            base_price = plan.price_monthly
-            
-            # Get tool prices
-            tools_result = await db.execute(
-                select(PlanToolModel).where(
-                    PlanToolModel.plan_id == plan.id,
-                    PlanToolModel.name.in_(tools)
-                )
-            )
-            plan_tools = tools_result.scalars().all()
-            tools_price = sum(t.price_monthly for t in plan_tools)
-            total_price = base_price + tools_price
+            total_price = await calculate_plan_total(db, plan, tools, "monthly")
+            await cancel_active_real_org_subscription_for_plan(db, req.organization_id, plan.id)
             
             new_sub = SubscriptionModel(
                 organization_id=req.organization_id,
@@ -2012,7 +3573,10 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
                 amount=total_price
             )
             db.add(new_sub)
+            await db.flush()
+            await set_subscription_tools(db, new_sub.id, plan.id, tools)
             created_subs.append({"plan": plan.name, "tools": tools})
+    await sync_organization_requested_from_active_subscriptions(db, req.organization_id)
     
     # Create notification
     plan_names = [p.get("plan_name", p.get("plan_id", "Unknown")) for p in requested_plans]
@@ -2065,7 +3629,7 @@ async def get_plan_upgrade_requests(status: Optional[str] = None, payload: dict 
         query = query.where(PlanUpgradeRequestModel.status == status)
     query = query.order_by(PlanUpgradeRequestModel.created_at.desc())
     result = await db.execute(query)
-    return [model_to_dict(r, ["requested_tools"]) for r in result.scalars().all()]
+    return [await upgrade_request_to_dict(db, r) for r in result.scalars().all()]
 
 @api_router.get("/plan-upgrade-requests/pending", tags=["Plan Upgrade Requests"])
 async def get_pending_plan_upgrade_requests(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -2075,7 +3639,7 @@ async def get_pending_plan_upgrade_requests(payload: dict = Depends(require_supe
         .where(PlanUpgradeRequestModel.status == "pending")
         .order_by(PlanUpgradeRequestModel.created_at.desc())
     )
-    return [model_to_dict(r, ["requested_tools"]) for r in result.scalars().all()]
+    return [await upgrade_request_to_dict(db, r) for r in result.scalars().all()]
 
 @api_router.post("/plan-upgrade-requests", tags=["Plan Upgrade Requests"])
 async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -2094,18 +3658,25 @@ async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = D
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    # Get current subscription
+    # Get current active subscriptions
     sub_result = await db.execute(
         select(SubscriptionModel)
         .where(SubscriptionModel.organization_id == org_id)
         .where(SubscriptionModel.status == "active")
+        .order_by(SubscriptionModel.created_at.desc())
     )
-    current_sub = sub_result.scalar_one_or_none()
-    if not current_sub:
+    current_subs = sub_result.scalars().all()
+    if not current_subs:
         raise HTTPException(status_code=404, detail="No active subscription found")
     
+    requested_selections = normalize_plan_selections(data)
+    if not requested_selections:
+        raise HTTPException(status_code=400, detail="At least one plan must be selected")
+    primary_selection = requested_selections[0]
+    current_sub = next((sub for sub in current_subs if sub.plan_id == primary_selection.plan_id), current_subs[0])
+
     # Validate requested plan exists
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == data.requested_plan_id))
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == primary_selection.plan_id))
     plan = plan_result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Requested plan not found")
@@ -2124,14 +3695,20 @@ async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = D
         organization_id=org_id,
         organization_name=org.name,
         current_plan_id=current_sub.plan_id,
-        current_plan_name=current_sub.plan_name,
-        requested_plan_id=data.requested_plan_id,
+        current_plan_name=await get_plan_name(db, current_sub.plan_id, current_sub.plan_name),
+        requested_plan_id=primary_selection.plan_id,
         requested_plan_name=plan.name,
-        requested_tools=json.dumps(data.requested_tools),
+        requested_plan_ids=json.dumps([selection.plan_id for selection in requested_selections]),
+        requested_plans_details=json.dumps([
+            {"plan_id": selection.plan_id, "tools": selection.tool_ids} for selection in requested_selections
+        ]),
+        requested_tools=json.dumps([tool for selection in requested_selections for tool in selection.tool_ids]),
         reason=data.reason,
         requested_by=payload["sub"]
     )
     db.add(upgrade_request)
+    await db.flush()
+    await set_upgrade_request_items(db, upgrade_request.id, requested_selections)
     
     # Create notification for super admin
     notif = NotificationModel(
@@ -2143,7 +3720,7 @@ async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = D
     db.add(notif)
     
     await db.commit()
-    return model_to_dict(upgrade_request, ["requested_tools"])
+    return await upgrade_request_to_dict(db, upgrade_request)
 
 @api_router.post("/plan-upgrade-requests/{request_id}/approve", tags=["Plan Upgrade Requests"])
 async def approve_plan_upgrade_request(request_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -2160,23 +3737,32 @@ async def approve_plan_upgrade_request(request_id: str, payload: dict = Depends(
     request.approved_at = now
     request.updated_at = now
     
-    # Update current subscription
-    sub_result = await db.execute(
-        select(SubscriptionModel)
-        .where(SubscriptionModel.organization_id == request.organization_id)
-        .where(SubscriptionModel.status == "active")
-    )
-    subscription = sub_result.scalar_one_or_none()
-    if subscription:
-        subscription.plan_id = request.requested_plan_id
-        subscription.plan_name = request.requested_plan_name
-        subscription.tools = request.requested_tools
-        
-        # Get new plan pricing
-        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == request.requested_plan_id))
+    request_items = await get_upgrade_request_items(db, request)
+
+    for item in request_items:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == item["plan_id"]))
         plan = plan_result.scalar_one_or_none()
-        if plan:
-            subscription.amount = plan.price_monthly
+        if not plan:
+            continue
+        tools = item.get("tools", [])
+        total_price = await calculate_plan_total(db, plan, tools, "monthly")
+        await cancel_active_real_org_subscription_for_plan(db, request.organization_id, plan.id)
+        subscription = SubscriptionModel(
+            organization_id=request.organization_id,
+            organization_name=await get_organization_name(db, request.organization_id, request.organization_name),
+            plan_id=plan.id,
+            plan_name=plan.name,
+            tools=json.dumps(tools),
+            status="active",
+            start_date=now,
+            end_date=now + timedelta(days=30),
+            billing_cycle="monthly",
+            amount=total_price
+        )
+        db.add(subscription)
+        await db.flush()
+        await set_subscription_tools(db, subscription.id, plan.id, tools)
+    await sync_organization_requested_from_active_subscriptions(db, request.organization_id)
     
     # Create notification
     notif = NotificationModel(
@@ -2228,10 +3814,10 @@ async def get_dashboard_stats(payload: dict = Depends(require_super_admin), db: 
     total_revenue = await db.scalar(select(func.sum(BillingModel.amount)).where(BillingModel.status == "paid")) or 0
     
     result = await db.execute(select(OrganizationModel).order_by(OrganizationModel.created_at.desc()).limit(5))
-    recent_orgs = [model_to_dict(o, ["requested_tools", "supported_domains"]) for o in result.scalars().all()]
+    recent_orgs = [await organization_to_dict(db, o) for o in result.scalars().all()]
     
     result = await db.execute(select(SubscriptionModel).order_by(SubscriptionModel.created_at.desc()).limit(5))
-    recent_subs = [model_to_dict(s, ["tools"]) for s in result.scalars().all()]
+    recent_subs = [await subscription_to_dict(db, s) for s in result.scalars().all()]
     
     # Calculate real monthly revenue from billing data for the last 6 months
     from datetime import datetime, timedelta
@@ -2275,7 +3861,7 @@ async def get_dashboard_stats(payload: dict = Depends(require_super_admin), db: 
     mig_count = 0
     
     for sub in active_subscriptions:
-        tools = json.loads(sub.tools) if sub.tools else []
+        tools = await get_subscription_tools(db, sub)
         if "api_platform" in tools:
             api_count += 1
         if "ai_agentic" in tools:
@@ -2309,12 +3895,118 @@ async def get_organizations(status: Optional[str] = None, search: Optional[str] 
         query = query.where((OrganizationModel.name.ilike(f"%{search}%")) | (OrganizationModel.email.ilike(f"%{search}%")))
     query = query.order_by(OrganizationModel.created_at.desc())
     result = await db.execute(query)
-    return [model_to_dict(o, ["requested_tools", "supported_domains"]) for o in result.scalars().all()]
+    return [await organization_to_dict(db, o) for o in result.scalars().all()]
 
 @api_router.get("/organizations/pending")
 async def get_pending_organizations(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(OrganizationModel).where(OrganizationModel.status == "pending").order_by(OrganizationModel.created_at.desc()))
-    return [model_to_dict(o, ["requested_tools", "supported_domains"]) for o in result.scalars().all()]
+    return [await organization_to_dict(db, o) for o in result.scalars().all()]
+
+@api_router.get("/organizations/{org_id}/details")
+async def get_organization_details(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Get one organization's full BU, team, and team-member structure."""
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    bu_result = await db.execute(
+        select(BusinessUnitModel)
+        .where(BusinessUnitModel.organization_id == org_id)
+        .order_by(BusinessUnitModel.name.asc())
+    )
+    business_units = [model_to_dict(bu, ["tags"]) for bu in bu_result.scalars().all()]
+
+    project_result = await db.execute(
+        select(ProjectModel)
+        .where(ProjectModel.organization_id == org_id)
+        .order_by(ProjectModel.name.asc())
+    )
+    teams = [model_to_dict(project) for project in project_result.scalars().all()]
+
+    member_result = await db.execute(
+        select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
+        .join(ProjectModel, ProjectTeamMemberModel.project_id == ProjectModel.id)
+        .outerjoin(BusinessUnitModel, ProjectModel.business_unit_id == BusinessUnitModel.id)
+        .where(ProjectTeamMemberModel.organization_id == org_id)
+        .order_by(ProjectTeamMemberModel.invited_at.desc())
+    )
+    team_members = []
+    for member, project, business_unit in member_result.all():
+        member_data = await project_team_member_to_dict(db, member)
+        member_data["team"] = model_to_dict(project)
+        member_data["business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
+        team_members.append(member_data)
+
+    return {
+        "organization": await organization_to_dict(db, org),
+        "business_units": business_units,
+        "teams": teams,
+        "team_members": team_members
+    }
+
+@api_router.get("/organizations/{org_id}/business-units")
+async def get_organization_business_units(
+    org_id: str,
+    include_teams: bool = True,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all BUs for one organization, optionally including teams under each BU."""
+    org_result = await db.execute(select(OrganizationModel.id).where(OrganizationModel.id == org_id))
+    if not org_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    result = await db.execute(
+        select(BusinessUnitModel)
+        .where(BusinessUnitModel.organization_id == org_id)
+        .order_by(BusinessUnitModel.name.asc())
+    )
+    business_units = result.scalars().all()
+    response = [model_to_dict(bu, ["tags"]) for bu in business_units]
+
+    if include_teams and business_units:
+        bu_ids = [bu.id for bu in business_units]
+        projects_result = await db.execute(
+            select(ProjectModel)
+            .where(ProjectModel.organization_id == org_id, ProjectModel.business_unit_id.in_(bu_ids))
+            .order_by(ProjectModel.name.asc())
+        )
+        projects_by_bu = {}
+        for project in projects_result.scalars().all():
+            projects_by_bu.setdefault(project.business_unit_id, []).append(model_to_dict(project))
+        for bu_data in response:
+            bu_data["teams"] = projects_by_bu.get(bu_data["id"], [])
+            bu_data["projects"] = bu_data["teams"]
+
+    return response
+
+@api_router.get("/organizations/{org_id}/teams")
+async def get_organization_teams(
+    org_id: str,
+    business_unit_id: Optional[str] = None,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all teams for one organization, optionally filtered by BU."""
+    org_result = await db.execute(select(OrganizationModel.id).where(OrganizationModel.id == org_id))
+    if not org_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    query = select(ProjectModel).where(ProjectModel.organization_id == org_id)
+    if business_unit_id:
+        bu_result = await db.execute(
+            select(BusinessUnitModel.id).where(
+                BusinessUnitModel.id == business_unit_id,
+                BusinessUnitModel.organization_id == org_id
+            )
+        )
+        if not bu_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Business unit not found")
+        query = query.where(ProjectModel.business_unit_id == business_unit_id)
+
+    result = await db.execute(query.order_by(ProjectModel.name.asc()))
+    return [model_to_dict(project) for project in result.scalars().all()]
 
 @api_router.get("/organizations/{org_id}")
 async def get_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -2322,26 +4014,38 @@ async def get_organization(org_id: str, payload: dict = Depends(require_super_ad
     org = result.scalar_one_or_none()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
-    return model_to_dict(org, ["requested_tools", "supported_domains"])
+    return await organization_to_dict(db, org)
 
 @api_router.post("/organizations")
 async def create_organization(data: OrganizationCreate, db: AsyncSession = Depends(get_db)):
     org = OrganizationModel(
         name=data.name, email=data.email, domain=data.domain,
-        requested_plan=data.requested_plan, requested_tools=json.dumps(data.requested_tools),
+        requested_plan=json.dumps(data.requested_plans), requested_tools=json.dumps(data.requested_tools),
         contact_person=data.contact_person, phone=data.phone, address=data.address,
-        description=data.description
+        description=data.description,
+        gateway_region=data.gateway_region,
+        gateway_organization_name=data.gateway_organization_name,
+        gateway_environment_type=data.gateway_environment_type,
+        gateway_environments=json.dumps(data.gateway_environments) if data.gateway_environments else None
     )
     db.add(org)
+    await db.flush()
+    await create_organization_subscription_request(
+        db,
+        org.id,
+        data.requested_plans,
+        data.requested_tools,
+        status=org.status
+    )
     
     notif = NotificationModel(
         title="New Organization Request",
-        message=f"{data.name} has requested to join with {data.requested_plan} plan",
+        message=f"{data.name} has requested to join with {', '.join(data.requested_plans)} plan(s)",
         type="info", link=f"/organizations/{org.id}"
     )
     db.add(notif)
     await db.commit()
-    return model_to_dict(org, ["requested_tools", "supported_domains"])
+    return await organization_to_dict(db, org)
 
 # ==================== PUBLIC API - Organization Identification ====================
 
@@ -3031,16 +4735,14 @@ async def create_individual_user_request(data: IndividualUserRequestCreate, db: 
             }
         )
 
-    # Calculate total price (sum of all plans + selected tools)
-    base_monthly = sum(plans[pid].price_monthly for pid in data.requested_plans)
-    base_yearly = sum(plans[pid].price_yearly for pid in data.requested_plans)
-    
+    # Legacy response fields are retained; manual plan cost is now the source of truth.
     selected_tool_objects = [available_tools[t] for t in data.selected_tools]
-    tools_monthly = sum(t.price_monthly for t in selected_tool_objects)
-    tools_yearly = sum(t.price_yearly for t in selected_tool_objects)
-    
-    total_monthly = base_monthly + tools_monthly
-    total_yearly = base_yearly + tools_yearly
+    base_monthly = sum((getattr(plans[pid], "cost", None) or plans[pid].price_monthly or 0) for pid in data.requested_plans)
+    base_yearly = base_monthly
+    tools_monthly = 0
+    tools_yearly = 0
+    total_monthly = base_monthly
+    total_yearly = base_yearly
 
     # Create request - store plans as JSON array
     request = IndividualUserRequestModel(
@@ -3153,7 +4855,7 @@ async def get_pending_individual_user_requests(
             "email": r.email,
             "name": r.name,
             "requested_tools": json.loads(r.requested_tools) if r.requested_tools else [],
-            "requested_plans": json.loads(r.requested_plans) if r.requested_plans else [],
+            "requested_plans": parse_json_list(r.requested_plan),
             "purpose": r.purpose,
             "company_name": r.company_name,
             "job_title": r.job_title,
@@ -3302,6 +5004,7 @@ async def approve_individual_user_request(
     )
     db.add(subscription)
     await db.flush()
+    await set_subscription_tools(db, subscription.id, plan.id, requested_tools)
     
     # Update request
     request.status = "approved"
@@ -3391,6 +5094,8 @@ async def update_organization(org_id: str, data: OrganizationUpdate, payload: di
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
     if 'supported_domains' in update_data and isinstance(update_data['supported_domains'], list):
         update_data['supported_domains'] = json.dumps(update_data['supported_domains'])
+    if 'gateway_environments' in update_data and isinstance(update_data['gateway_environments'], list):
+        update_data['gateway_environments'] = json.dumps(update_data['gateway_environments'])
 
     if 'external_org_id' in update_data and update_data['external_org_id']:
         existing = await db.execute(
@@ -3405,7 +5110,7 @@ async def update_organization(org_id: str, data: OrganizationUpdate, payload: di
         setattr(org, key, value)
     org.updated_at = datetime.now(timezone.utc)
     await db.commit()
-    return model_to_dict(org, ["requested_tools"])
+    return await organization_to_dict(db, org)
 
 @api_router.post("/organizations/{org_id}/approve")
 async def approve_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -3421,51 +5126,66 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     org.approved_at = now
     org.updated_at = now
     
-    # Parse requested_plan - can be a JSON array or single string
-    requested_plan_raw = org.requested_plan
-    try:
-        plan_ids = json.loads(requested_plan_raw) if requested_plan_raw.startswith('[') else [requested_plan_raw]
-    except (json.JSONDecodeError, AttributeError):
-        plan_ids = [requested_plan_raw] if requested_plan_raw else []
-    
-    primary_plan_id = plan_ids[0] if plan_ids else None
-    
-    # Get plan details
-    plan = None
-    if primary_plan_id:
-        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == primary_plan_id))
+    requested_plan_details = await get_organization_requested_plan_details(db, org)
+    subscription_ids = []
+
+    for plan_detail in requested_plan_details:
+        plan_id = plan_detail.get("plan_id")
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
         plan = plan_result.scalar_one_or_none()
-    plan_name = plan.name if plan else (primary_plan_id or "Unknown")
-    plan_amount = plan.price_monthly if plan else 99.0
-    
-    # Create subscription with explicit ID
-    subscription_id = str(uuid.uuid4())
-    tools = json.loads(org.requested_tools) if isinstance(org.requested_tools, str) else org.requested_tools
-    subscription = SubscriptionModel(
-        id=subscription_id,
-        organization_id=org_id, organization_name=org.name,
-        plan_id=primary_plan_id or "unknown", plan_name=plan_name,
-        tools=json.dumps(tools), status="active",
-        start_date=now, end_date=now + timedelta(days=30), amount=plan_amount
+        if not plan:
+            continue
+
+        tools = plan_detail.get("tools", [])
+        plan_amount = await calculate_plan_total(db, plan, tools, "monthly")
+        await cancel_active_real_org_subscription_for_plan(db, org_id, plan.id)
+        subscription_id = str(uuid.uuid4())
+        subscription = SubscriptionModel(
+            id=subscription_id,
+            organization_id=org_id,
+            organization_name=org.name,
+            plan_id=plan.id,
+            plan_name=plan.name,
+            tools=json.dumps(tools),
+            status="active",
+            start_date=now,
+            end_date=now + timedelta(days=30),
+            amount=plan_amount
+        )
+        db.add(subscription)
+        await db.flush()
+        await set_subscription_tools(db, subscription_id, plan.id, tools)
+        subscription_ids.append(subscription_id)
+
+        billing = BillingModel(
+            organization_id=org_id,
+            organization_name=org.name,
+            subscription_id=subscription_id,
+            amount=plan_amount,
+            status="pending",
+            invoice_number=f"INV-{now.strftime('%Y%m%d')}-{org_id[:8].upper()}-{len(subscription_ids)}",
+            billing_date=now,
+            due_date=now + timedelta(days=7)
+        )
+        db.add(billing)
+
+    await db.execute(
+        update(OrganizationSubscriptionRequestModel)
+        .where(OrganizationSubscriptionRequestModel.organization_id == org_id)
+        .where(OrganizationSubscriptionRequestModel.status == "pending")
+        .values(status="approved", approved_at=now, updated_at=now)
     )
-    db.add(subscription)
-    
-    # Flush to ensure subscription is written to DB before creating billing (needed for MySQL foreign key)
-    await db.flush()
-    
-    # Create billing record with the known subscription ID
-    billing = BillingModel(
-        organization_id=org_id, organization_name=org.name,
-        subscription_id=subscription_id, amount=plan_amount, status="pending",
-        invoice_number=f"INV-{now.strftime('%Y%m%d')}-{org_id[:8].upper()}",
-        billing_date=now, due_date=now + timedelta(days=7)
-    )
-    db.add(billing)
+    await sync_organization_requested_from_active_subscriptions(db, org_id)
     
     notif = NotificationModel(title="Organization Approved", message=f"{org.name} has been approved", type="success")
     db.add(notif)
     await db.commit()
-    return {"message": "Organization approved", "subscription_id": subscription_id, "plan_ids": plan_ids}
+    return {
+        "message": "Organization approved",
+        "subscription_id": subscription_ids[0] if subscription_ids else None,
+        "subscription_ids": subscription_ids,
+        "plan_ids": [detail["plan_id"] for detail in requested_plan_details]
+    }
 
 @api_router.post("/organizations/{org_id}/reject")
 async def reject_organization(org_id: str, reason: str = "", payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -3481,6 +5201,12 @@ async def reject_organization(org_id: str, reason: str = "", payload: dict = Dep
     org.rejected_at = now
     org.rejection_reason = reason
     org.updated_at = now
+    await db.execute(
+        update(OrganizationSubscriptionRequestModel)
+        .where(OrganizationSubscriptionRequestModel.organization_id == org_id)
+        .where(OrganizationSubscriptionRequestModel.status == "pending")
+        .values(status="rejected", rejected_at=now, updated_at=now)
+    )
     
     notif = NotificationModel(title="Organization Rejected", message=f"{org.name} has been rejected", type="warning")
     db.add(notif)
@@ -3508,6 +5234,10 @@ class OrganizationFullUpdate(BaseModel):
     external_org_id: Optional[str] = None
     auth0_org_id: Optional[str] = None
     supported_domains: Optional[List[str]] = None
+    gateway_region: Optional[str] = None
+    gateway_organization_name: Optional[str] = None
+    gateway_environment_type: Optional[str] = None
+    gateway_environments: Optional[List[str]] = None
 
 
 @api_router.put("/organizations/{org_id}")
@@ -3539,11 +5269,19 @@ async def update_organization_full(org_id: str, data: OrganizationFullUpdate, pa
         org.auth0_org_id = data.auth0_org_id if data.auth0_org_id else None
     if data.supported_domains is not None:
         org.supported_domains = json.dumps(data.supported_domains) if data.supported_domains else None
+    if data.gateway_region is not None:
+        org.gateway_region = data.gateway_region if data.gateway_region else None
+    if data.gateway_organization_name is not None:
+        org.gateway_organization_name = data.gateway_organization_name if data.gateway_organization_name else None
+    if data.gateway_environment_type is not None:
+        org.gateway_environment_type = data.gateway_environment_type if data.gateway_environment_type else None
+    if data.gateway_environments is not None:
+        org.gateway_environments = json.dumps(data.gateway_environments) if data.gateway_environments else None
     
     org.updated_at = datetime.now(timezone.utc)
     await db.commit()
     
-    return {"message": "Organization updated successfully", "organization": model_to_dict(org, ["requested_tools", "supported_domains"])}
+    return {"message": "Organization updated successfully", "organization": await organization_to_dict(db, org)}
 
 
 @api_router.put("/organizations/{org_id}/subscription")
@@ -3557,15 +5295,7 @@ async def update_organization_subscription(org_id: str, data: SubscriptionUpdate
     
     now = datetime.now(timezone.utc)
     
-    # Cancel all existing active subscriptions
-    await db.execute(
-        update(SubscriptionModel)
-        .where(SubscriptionModel.organization_id == org_id)
-        .where(SubscriptionModel.status == "active")
-        .values(status="cancelled")
-    )
-    
-    # Create new subscriptions for each selected plan
+    # Replace only the submitted plans; other active org plans stay active.
     created_subs = []
     for plan_selection in data.plan_selections:
         plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_selection.plan_id))
@@ -3573,21 +5303,9 @@ async def update_organization_subscription(org_id: str, data: SubscriptionUpdate
         if not plan:
             raise HTTPException(status_code=404, detail=f"Plan {plan_selection.plan_id} not found")
         
-        # Calculate price
-        base_price = plan.price_monthly if data.billing_cycle == "monthly" else plan.price_yearly
-        
-        # Get tool prices
-        tools_result = await db.execute(
-            select(PlanToolModel).where(
-                PlanToolModel.plan_id == plan.id,
-                PlanToolModel.name.in_(plan_selection.tool_ids)
-            )
-        )
-        plan_tools = tools_result.scalars().all()
-        tools_price = sum(t.price_monthly if data.billing_cycle == "monthly" else t.price_yearly for t in plan_tools)
-        total_price = base_price + tools_price
-        
+        total_price = await calculate_plan_total(db, plan, plan_selection.tool_ids, data.billing_cycle)
         end_date = now + timedelta(days=30) if data.billing_cycle == "monthly" else now + timedelta(days=365)
+        await cancel_active_real_org_subscription_for_plan(db, org_id, plan.id)
         
         new_sub = SubscriptionModel(
             organization_id=org_id,
@@ -3602,6 +5320,8 @@ async def update_organization_subscription(org_id: str, data: SubscriptionUpdate
             amount=total_price
         )
         db.add(new_sub)
+        await db.flush()
+        await set_subscription_tools(db, new_sub.id, plan.id, plan_selection.tool_ids)
         created_subs.append({
             "plan_id": plan.id,
             "plan_name": plan.name,
@@ -3609,15 +5329,7 @@ async def update_organization_subscription(org_id: str, data: SubscriptionUpdate
             "amount": total_price
         })
     
-    # Update org's requested_plan and requested_tools
-    all_plan_ids = [s["plan_id"] for s in created_subs]
-    all_tools = []
-    for s in created_subs:
-        all_tools.extend(s["tools"])
-    
-    org.requested_plan = json.dumps(all_plan_ids)
-    org.requested_tools = json.dumps(all_tools)
-    org.updated_at = now
+    await sync_organization_requested_from_active_subscriptions(db, org_id)
     
     await db.commit()
     
@@ -3730,10 +5442,7 @@ async def update_individual_user_subscription(user_id: str, data: SubscriptionUp
         if not plan:
             raise HTTPException(status_code=404, detail=f"Plan {plan_selection.plan_id} not found")
         
-        # Calculate price
-        base_price = plan.price_monthly if data.billing_cycle == "monthly" else plan.price_yearly
-        
-        # Get tool prices
+        # Validate selected tools and use the plan's manual cost.
         tools_result = await db.execute(
             select(PlanToolModel).where(
                 PlanToolModel.plan_id == plan.id,
@@ -3741,8 +5450,7 @@ async def update_individual_user_subscription(user_id: str, data: SubscriptionUp
             )
         )
         plan_tools = tools_result.scalars().all()
-        tools_price = sum(t.price_monthly if data.billing_cycle == "monthly" else t.price_yearly for t in plan_tools)
-        total_price = base_price + tools_price
+        total_price = float(getattr(plan, "cost", None) or plan.price_monthly or 0)
         
         end_date = now + timedelta(days=30) if data.billing_cycle == "monthly" else now + timedelta(days=365)
         
@@ -3760,6 +5468,7 @@ async def update_individual_user_subscription(user_id: str, data: SubscriptionUp
         )
         db.add(new_sub)
         await db.flush()  # Get the ID
+        await set_subscription_tools(db, new_sub.id, plan.id, plan_selection.tool_ids)
         
         if primary_sub_id is None:
             primary_sub_id = new_sub.id
@@ -3799,7 +5508,7 @@ async def get_subscriptions(status: Optional[str] = None, payload: dict = Depend
     if status:
         query = query.where(SubscriptionModel.status == status)
     result = await db.execute(query.order_by(SubscriptionModel.created_at.desc()))
-    return [model_to_dict(s, ["tools"]) for s in result.scalars().all()]
+    return [await subscription_to_dict(db, s) for s in result.scalars().all()]
 
 @api_router.get("/subscriptions/{sub_id}")
 async def get_subscription(sub_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -3807,7 +5516,7 @@ async def get_subscription(sub_id: str, payload: dict = Depends(require_super_ad
     sub = result.scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
-    return model_to_dict(sub, ["tools"])
+    return await subscription_to_dict(db, sub)
 
 @api_router.post("/subscriptions/{sub_id}/pause")
 async def pause_subscription(sub_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -3819,9 +5528,12 @@ async def pause_subscription(sub_id: str, payload: dict = Depends(require_super_
 
 @api_router.post("/subscriptions/{sub_id}/resume")
 async def resume_subscription(sub_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(update(SubscriptionModel).where(SubscriptionModel.id == sub_id).values(status="active"))
-    if result.rowcount == 0:
+    result = await db.execute(select(SubscriptionModel).where(SubscriptionModel.id == sub_id))
+    sub = result.scalar_one_or_none()
+    if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
+    await ensure_can_activate_subscription(db, sub)
+    sub.status = "active"
     await db.commit()
     return {"message": "Subscription resumed"}
 
@@ -3879,9 +5591,14 @@ async def get_plan(plan_id: str, payload: dict = Depends(require_any_admin), db:
 
 @api_router.post("/plans")
 async def create_plan(data: PlanCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    cost = float(data.cost or data.price_monthly or 0)
     plan = PlanModel(
         name=data.name, tool=data.tool, description=data.description,
-        features=json.dumps(data.features), price_monthly=data.price_monthly, price_yearly=data.price_yearly
+        features=json.dumps(data.features),
+        api_limit=data.api_limit or 0,
+        cost=cost,
+        price_monthly=cost,
+        price_yearly=cost
     )
     db.add(plan)
     await db.commit()
@@ -3898,18 +5615,37 @@ async def update_plan(plan_id: str, data: PlanCreate, payload: dict = Depends(re
     plan.tool = data.tool
     plan.description = data.description
     plan.features = json.dumps(data.features)
-    plan.price_monthly = data.price_monthly
-    plan.price_yearly = data.price_yearly
+    plan.api_limit = data.api_limit or 0
+    plan.cost = float(data.cost or data.price_monthly or 0)
+    plan.price_monthly = plan.cost
+    plan.price_yearly = plan.cost
     await db.commit()
     return model_to_dict(plan, ["features"])
 
 @api_router.delete("/plans/{plan_id}")
 async def delete_plan(plan_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(delete(PlanModel).where(PlanModel.id == plan_id))
-    if result.rowcount == 0:
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan = plan_result.scalar_one_or_none()
+    if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
-    # Also delete associated plan tools
+
+    dependency_count = await db.scalar(
+        select(func.count()).select_from(SubscriptionModel).where(SubscriptionModel.plan_id == plan_id)
+    ) or 0
+    dependency_count += await db.scalar(
+        select(func.count()).select_from(PlanUpgradeRequestItemModel).where(PlanUpgradeRequestItemModel.plan_id == plan_id)
+    ) or 0
+    dependency_count += await db.scalar(
+        select(func.count()).select_from(OrganizationSubscriptionRequestItemModel).where(OrganizationSubscriptionRequestItemModel.plan_id == plan_id)
+    ) or 0
+
+    if dependency_count > 0:
+        plan.is_active = False
+        await db.commit()
+        return {"message": "Plan is in use and was deactivated instead of deleted"}
+
     await db.execute(delete(PlanToolModel).where(PlanToolModel.plan_id == plan_id))
+    await db.execute(delete(PlanModel).where(PlanModel.id == plan_id))
     await db.commit()
     return {"message": "Plan deleted"}
 
@@ -3984,6 +5720,27 @@ async def update_plan_tool(plan_id: str, tool_id: str, data: PlanToolUpdate, pay
 @api_router.delete("/plans/{plan_id}/tools/{tool_id}", tags=["Plans"])
 async def delete_plan_tool(plan_id: str, tool_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     """Delete a tool from a plan"""
+    dependency_count = await db.scalar(
+        select(func.count()).select_from(SubscriptionToolModel).where(SubscriptionToolModel.plan_tool_id == tool_id)
+    ) or 0
+    dependency_count += await db.scalar(
+        select(func.count()).select_from(PlanUpgradeRequestToolModel).where(PlanUpgradeRequestToolModel.plan_tool_id == tool_id)
+    ) or 0
+    dependency_count += await db.scalar(
+        select(func.count()).select_from(OrganizationSubscriptionRequestToolModel).where(OrganizationSubscriptionRequestToolModel.plan_tool_id == tool_id)
+    ) or 0
+
+    if dependency_count > 0:
+        result = await db.execute(
+            update(PlanToolModel)
+            .where(PlanToolModel.id == tool_id, PlanToolModel.plan_id == plan_id)
+            .values(is_active=False)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Tool not found")
+        await db.commit()
+        return {"message": "Tool is in use and was deactivated instead of deleted"}
+
     result = await db.execute(
         delete(PlanToolModel).where(
             PlanToolModel.id == tool_id,
@@ -4010,16 +5767,19 @@ async def calculate_plan_price(plan_id: str, tool_ids: str = "", payload: dict =
     # Get selected tools
     selected_tool_ids = [t.strip() for t in tool_ids.split(",") if t.strip()]
 
+    plan_cost = float(getattr(plan, "cost", None) or plan.price_monthly or 0)
     if not selected_tool_ids:
         return {
             "plan_id": plan_id,
             "plan_name": plan.name,
-            "base_price_monthly": plan.price_monthly,
-            "base_price_yearly": plan.price_yearly,
+            "api_limit": getattr(plan, "api_limit", 0),
+            "cost": plan_cost,
+            "base_price_monthly": plan_cost,
+            "base_price_yearly": plan_cost,
             "tools_price_monthly": 0,
             "tools_price_yearly": 0,
-            "total_price_monthly": plan.price_monthly,
-            "total_price_yearly": plan.price_yearly,
+            "total_price_monthly": plan_cost,
+            "total_price_yearly": plan_cost,
             "selected_tools": []
         }
 
@@ -4032,19 +5792,18 @@ async def calculate_plan_price(plan_id: str, tool_ids: str = "", payload: dict =
     )
     tools = result.scalars().all()
 
-    tools_price_monthly = sum(t.price_monthly for t in tools)
-    tools_price_yearly = sum(t.price_yearly for t in tools)
-
     return {
         "plan_id": plan_id,
         "plan_name": plan.name,
-        "base_price_monthly": plan.price_monthly,
-        "base_price_yearly": plan.price_yearly,
-        "tools_price_monthly": tools_price_monthly,
-        "tools_price_yearly": tools_price_yearly,
-        "total_price_monthly": plan.price_monthly + tools_price_monthly,
-        "total_price_yearly": plan.price_yearly + tools_price_yearly,
-        "selected_tools": [{"id": t.id, "name": t.name, "price_monthly": t.price_monthly, "price_yearly": t.price_yearly} for t in tools]
+        "api_limit": getattr(plan, "api_limit", 0),
+        "cost": plan_cost,
+        "base_price_monthly": plan_cost,
+        "base_price_yearly": plan_cost,
+        "tools_price_monthly": 0,
+        "tools_price_yearly": 0,
+        "total_price_monthly": plan_cost,
+        "total_price_yearly": plan_cost,
+        "selected_tools": [{"id": t.id, "name": t.name} for t in tools]
     }
 
 # ==================== USERS ROUTES (Super Admin Only) ====================
@@ -4058,7 +5817,7 @@ async def get_users(organization_id: Optional[str] = None, status: Optional[str]
     if status:
         query = query.where(UserModel.status == status)
     result = await db.execute(query.order_by(UserModel.created_at.desc()))
-    return [model_to_dict(u) for u in result.scalars().all()]
+    return [await user_to_dict(db, u) for u in result.scalars().all()]
 
 @api_router.get("/users/{user_id}")
 async def get_user(user_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -4066,7 +5825,7 @@ async def get_user(user_id: str, payload: dict = Depends(require_super_admin), d
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return model_to_dict(user)
+    return await user_to_dict(db, user)
 
 @api_router.post("/users")
 async def create_user(data: UserCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -4090,7 +5849,7 @@ async def create_user(data: UserCreate, payload: dict = Depends(require_super_ad
     )
     db.add(user)
     await db.commit()
-    return model_to_dict(user)
+    return await user_to_dict(db, user)
 
 @api_router.put("/users/{user_id}/status")
 async def update_user_status(user_id: str, status: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -4204,7 +5963,7 @@ async def get_billing_records(organization_id: Optional[str] = None, status: Opt
     if status:
         query = query.where(BillingModel.status == status)
     result = await db.execute(query.order_by(BillingModel.created_at.desc()))
-    return [model_to_dict(b) for b in result.scalars().all()]
+    return [await billing_to_dict(db, b) for b in result.scalars().all()]
 
 @api_router.get("/billing/{billing_id}")
 async def get_billing_record(billing_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -4212,7 +5971,7 @@ async def get_billing_record(billing_id: str, payload: dict = Depends(require_su
     record = result.scalar_one_or_none()
     if not record:
         raise HTTPException(status_code=404, detail="Billing record not found")
-    return model_to_dict(record)
+    return await billing_to_dict(db, record)
 
 @api_router.post("/billing/{billing_id}/mark-paid")
 async def mark_billing_paid(billing_id: str, payment_method: str = "card", payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -4273,7 +6032,7 @@ async def generate_monthly_bills(payload: dict = Depends(require_super_admin), d
         
         billing = BillingModel(
             organization_id=sub.organization_id,
-            organization_name=sub.organization_name,
+            organization_name=await get_organization_name(db, sub.organization_id, sub.organization_name),
             subscription_id=sub.id,
             amount=sub.amount,
             status="pending",
@@ -4332,7 +6091,16 @@ async def seed_data(db: AsyncSession = Depends(get_db)):
     """Seed initial data for testing"""
     # Clear existing data
     await db.execute(delete(NotificationModel))
+    await db.execute(delete(OrganizationSubscriptionRequestToolModel))
+    await db.execute(delete(OrganizationSubscriptionRequestItemModel))
+    await db.execute(delete(OrganizationSubscriptionRequestModel))
+    await db.execute(delete(PlanUpgradeRequestToolModel))
+    await db.execute(delete(PlanUpgradeRequestItemModel))
+    await db.execute(delete(SubscriptionToolModel))
     await db.execute(delete(BillingModel))
+    await db.execute(delete(ProjectTeamMemberModel))
+    await db.execute(delete(ProjectModel))
+    await db.execute(delete(BusinessUnitModel))
     await db.execute(delete(UserModel))
     await db.execute(delete(UserRequestModel))
     await db.execute(delete(PlanUpgradeRequestModel))
@@ -4369,7 +6137,17 @@ async def seed_data(db: AsyncSession = Depends(get_db)):
         {"id": "plan_mig_enterprise", "name": "Enterprise", "tool": "migration_tool", "description": "Enterprise migrations", "features": ["Unlimited migrations", "Custom integrations", "Dedicated support", "SLA"], "price_monthly": 349.0, "price_yearly": 3490.0},
     ]
     for p in plans_data:
-        db.add(PlanModel(id=p["id"], name=p["name"], tool=p["tool"], description=p["description"], features=json.dumps(p["features"]), price_monthly=p["price_monthly"], price_yearly=p["price_yearly"]))
+        db.add(PlanModel(
+            id=p["id"],
+            name=p["name"],
+            tool=p["tool"],
+            description=p["description"],
+            features=json.dumps(p["features"]),
+            price_monthly=p["price_monthly"],
+            price_yearly=p["price_monthly"],
+            api_limit=0,
+            cost=p["price_monthly"]
+        ))
     
     # Create organizations
     orgs_data = [
@@ -4526,16 +6304,13 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
             }
         )
 
-    # Calculate total price (sum of all plans + selected tools)
-    base_monthly = sum(plans[pid].price_monthly for pid in data.plan_ids)
-    base_yearly = sum(plans[pid].price_yearly for pid in data.plan_ids)
-    
     selected_tool_objects = [available_tools[t] for t in data.selected_tools]
-    tools_monthly = sum(t.price_monthly for t in selected_tool_objects)
-    tools_yearly = sum(t.price_yearly for t in selected_tool_objects)
-    
-    total_monthly = base_monthly + tools_monthly
-    total_yearly = base_yearly + tools_yearly
+    base_monthly = sum((getattr(plans[pid], "cost", None) or plans[pid].price_monthly or 0) for pid in data.plan_ids)
+    base_yearly = base_monthly
+    tools_monthly = 0
+    tools_yearly = 0
+    total_monthly = base_monthly
+    total_yearly = base_yearly
     
     # Check if organization with same email already exists
     existing = await db.execute(select(OrganizationModel).where(OrganizationModel.email == data.email))
@@ -4555,9 +6330,21 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
         contact_person=data.contact_person,
         phone=data.contact_phone,
         address=data.company_address,
-        description=data.description
+        description=data.description,
+        gateway_region=data.gateway_region,
+        gateway_organization_name=data.gateway_organization_name,
+        gateway_environment_type=data.gateway_environment_type,
+        gateway_environments=json.dumps(data.gateway_environments) if data.gateway_environments else None
     )
     db.add(org)
+    await db.flush()
+    await create_organization_subscription_request(
+        db,
+        org.id,
+        data.plan_ids,
+        data.selected_tools,
+        status=org.status
+    )
     
     # Create notification for admin
     tools_str = ', '.join(data.selected_tools[:3])
@@ -4634,6 +6421,162 @@ async def get_organization_request_status(request_id: str, db: AsyncSession = De
     
     return response
 
+@api_router.post("/public/onboarding/organizations/request", tags=["External Onboarding"])
+async def external_create_organization_request(data: OrganizationRequest, db: AsyncSession = Depends(get_db)):
+    """Create an organization onboarding request with the latest organization metadata."""
+    return await request_organization_subscription(data, db)
+
+@api_router.get("/public/onboarding/organizations/{organization_id}", tags=["External Onboarding"])
+async def external_get_organization(organization_id: str, db: AsyncSession = Depends(get_db)):
+    """Fetch one organization request/record by ID."""
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == organization_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return await organization_to_dict(db, org)
+
+@api_router.get("/public/onboarding/organizations/{organization_id}/details", tags=["External Onboarding"])
+async def external_get_organization_details(organization_id: str, db: AsyncSession = Depends(get_db)):
+    """Fetch organization details, BUs, teams, and team members for another app."""
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == organization_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    bu_result = await db.execute(
+        select(BusinessUnitModel)
+        .where(BusinessUnitModel.organization_id == organization_id)
+        .order_by(BusinessUnitModel.name.asc())
+    )
+    business_units = [model_to_dict(bu, ["tags"]) for bu in bu_result.scalars().all()]
+
+    project_result = await db.execute(
+        select(ProjectModel)
+        .where(ProjectModel.organization_id == organization_id)
+        .order_by(ProjectModel.name.asc())
+    )
+    teams = [model_to_dict(project) for project in project_result.scalars().all()]
+
+    member_result = await db.execute(
+        select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
+        .join(ProjectModel, ProjectTeamMemberModel.project_id == ProjectModel.id)
+        .outerjoin(BusinessUnitModel, ProjectModel.business_unit_id == BusinessUnitModel.id)
+        .where(ProjectTeamMemberModel.organization_id == organization_id)
+        .order_by(ProjectTeamMemberModel.invited_at.desc())
+    )
+    team_members = []
+    for member, project, business_unit in member_result.all():
+        member_data = await project_team_member_to_dict(db, member)
+        member_data["team"] = model_to_dict(project)
+        member_data["business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
+        team_members.append(member_data)
+
+    return {
+        "organization": await organization_to_dict(db, org),
+        "business_units": business_units,
+        "teams": teams,
+        "team_members": team_members
+    }
+
+@api_router.get("/public/onboarding/organizations/{organization_id}/business-units", tags=["External Onboarding"])
+async def external_get_business_units(organization_id: str, include_teams: bool = True, db: AsyncSession = Depends(get_db)):
+    """Fetch BUs for an approved organization."""
+    org = await get_approved_org_by_id(db, organization_id)
+    result = await db.execute(
+        select(BusinessUnitModel)
+        .where(BusinessUnitModel.organization_id == org.id)
+        .order_by(BusinessUnitModel.name.asc())
+    )
+    business_units = result.scalars().all()
+    response = [model_to_dict(bu, ["tags"]) for bu in business_units]
+
+    if include_teams and business_units:
+        bu_ids = [bu.id for bu in business_units]
+        projects_result = await db.execute(
+            select(ProjectModel)
+            .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id.in_(bu_ids))
+            .order_by(ProjectModel.name.asc())
+        )
+        projects_by_bu = {}
+        for project in projects_result.scalars().all():
+            projects_by_bu.setdefault(project.business_unit_id, []).append(model_to_dict(project))
+        for bu_data in response:
+            bu_data["teams"] = projects_by_bu.get(bu_data["id"], [])
+
+    return response
+
+@api_router.post("/public/onboarding/organizations/{organization_id}/business-units", tags=["External Onboarding"])
+async def external_create_business_unit(organization_id: str, data: BusinessUnitCreate, db: AsyncSession = Depends(get_db)):
+    """Onboard a BU for an approved organization."""
+    org = await get_approved_org_by_id(db, organization_id)
+    business_unit = await create_business_unit_for_org(db, org, data)
+    await db.commit()
+    return {"message": "Business unit created successfully", "business_unit": model_to_dict(business_unit, ["tags"])}
+
+@api_router.get("/public/onboarding/organizations/{organization_id}/business-units/{business_unit_id}", tags=["External Onboarding"])
+async def external_get_business_unit(organization_id: str, business_unit_id: str, db: AsyncSession = Depends(get_db)):
+    """Fetch one BU and its teams."""
+    org = await get_approved_org_by_id(db, organization_id)
+    result = await db.execute(
+        select(BusinessUnitModel).where(
+            BusinessUnitModel.id == business_unit_id,
+            BusinessUnitModel.organization_id == org.id
+        )
+    )
+    business_unit = result.scalar_one_or_none()
+    if not business_unit:
+        raise HTTPException(status_code=404, detail="Business unit not found")
+    response = model_to_dict(business_unit, ["tags"])
+    teams_result = await db.execute(
+        select(ProjectModel)
+        .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
+        .order_by(ProjectModel.name.asc())
+    )
+    response["teams"] = [model_to_dict(project) for project in teams_result.scalars().all()]
+    return response
+
+@api_router.get("/public/onboarding/organizations/{organization_id}/teams", tags=["External Onboarding"])
+async def external_get_teams(organization_id: str, business_unit_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    """Fetch teams for an approved organization, optionally filtered by BU."""
+    org = await get_approved_org_by_id(db, organization_id)
+    query = select(ProjectModel).where(ProjectModel.organization_id == org.id)
+    if business_unit_id:
+        query = query.where(ProjectModel.business_unit_id == business_unit_id)
+    result = await db.execute(query.order_by(ProjectModel.name.asc()))
+    return [model_to_dict(project) for project in result.scalars().all()]
+
+@api_router.post("/public/onboarding/organizations/{organization_id}/teams", tags=["External Onboarding"])
+async def external_create_team(organization_id: str, data: ExternalProjectCreate, db: AsyncSession = Depends(get_db)):
+    """Onboard a team for an approved organization. The team must belong to a BU."""
+    org = await get_approved_org_by_id(db, organization_id)
+    project = await create_project_for_org(db, org, data)
+    await db.commit()
+    return {"message": "Team created successfully", "team": model_to_dict(project)}
+
+@api_router.get("/public/onboarding/organizations/{organization_id}/teams/{team_id}", tags=["External Onboarding"])
+async def external_get_team(organization_id: str, team_id: str, db: AsyncSession = Depends(get_db)):
+    """Fetch one team with its BU and members."""
+    org = await get_approved_org_by_id(db, organization_id)
+    project = await get_project_for_org(db, team_id, org.id)
+    response = model_to_dict(project)
+    response["business_unit"] = None
+    if project.business_unit_id:
+        bu_result = await db.execute(
+            select(BusinessUnitModel).where(
+                BusinessUnitModel.id == project.business_unit_id,
+                BusinessUnitModel.organization_id == org.id
+            )
+        )
+        business_unit = bu_result.scalar_one_or_none()
+        response["business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
+    members_result = await db.execute(
+        select(ProjectTeamMemberModel)
+        .where(ProjectTeamMemberModel.organization_id == org.id, ProjectTeamMemberModel.project_id == project.id)
+        .order_by(ProjectTeamMemberModel.invited_at.desc())
+    )
+    response["members"] = [await project_team_member_to_dict(db, member) for member in members_result.scalars().all()]
+    return response
+
 
 @api_router.get("/public/plans", tags=["Public API"])
 async def get_available_plans(tool: Optional[str] = None, db: AsyncSession = Depends(get_db)):
@@ -4650,7 +6593,7 @@ async def get_available_plans(tool: Optional[str] = None, db: AsyncSession = Dep
     if tool:
         query = query.where(PlanModel.tool == tool)
     
-    result = await db.execute(query.order_by(PlanModel.tool, PlanModel.price_monthly))
+    result = await db.execute(query.order_by(PlanModel.tool, PlanModel.cost))
     plans = result.scalars().all()
     # Build plans with their tools
     plans_with_tools = []
@@ -4663,9 +6606,7 @@ async def get_available_plans(tool: Optional[str] = None, db: AsyncSession = Dep
         )
         plan_tools = tools_result.scalars().all()
 
-        # Calculate total if all tools selected
-        total_tools_monthly = sum(t.price_monthly for t in plan_tools)
-        total_tools_yearly = sum(t.price_yearly for t in plan_tools)
+        plan_cost = float(getattr(p, "cost", None) or p.price_monthly or 0)
 
         plans_with_tools.append({
             "id": p.id,
@@ -4673,21 +6614,21 @@ async def get_available_plans(tool: Optional[str] = None, db: AsyncSession = Dep
             "tool": p.tool,
             "description": p.description,
             "features": json.loads(p.features) if isinstance(p.features, str) else p.features,
-            "base_price_monthly": p.price_monthly,
-            "base_price_yearly": p.price_yearly,
+            "api_limit": getattr(p, "api_limit", 0),
+            "cost": plan_cost,
+            "base_price_monthly": plan_cost,
+            "base_price_yearly": plan_cost,
             "available_tools": [
                 {
                     "id": t.id,
                     "name": t.name,
-                    "description": t.description,
-                    "price_monthly": t.price_monthly,
-                    "price_yearly": t.price_yearly
+                    "description": t.description
                 }
                 for t in plan_tools
             ],
             "total_tools_count": len(plan_tools),
-            "max_price_monthly": p.price_monthly + total_tools_monthly,
-            "max_price_yearly": p.price_yearly + total_tools_yearly
+            "max_price_monthly": plan_cost,
+            "max_price_yearly": plan_cost
         })
     return {
         "plans": plans_with_tools,
@@ -4731,16 +6672,16 @@ async def get_plan_tools_public(plan_id: str, db: AsyncSession = Depends(get_db)
             "name": plan.name,
             "tool": plan.tool,
             "description": plan.description,
-            "base_price_monthly": plan.price_monthly,
-            "base_price_yearly": plan.price_yearly
+            "api_limit": getattr(plan, "api_limit", 0),
+            "cost": float(getattr(plan, "cost", None) or plan.price_monthly or 0),
+            "base_price_monthly": float(getattr(plan, "cost", None) or plan.price_monthly or 0),
+            "base_price_yearly": float(getattr(plan, "cost", None) or plan.price_monthly or 0)
         },
         "available_tools": [
             {
                 "id": t.id,
                 "name": t.name,
-                "description": t.description,
-                "price_monthly": t.price_monthly,
-                "price_yearly": t.price_yearly
+                "description": t.description
             }
             for t in tools
         ],
@@ -4951,7 +6892,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             
             # Parse tools and avoid duplicates
             try:
-                sub_tools = json.loads(sub.tools) if sub.tools else []
+                sub_tools = await get_subscription_tools(db, sub)
                 for tool in sub_tools:
                     if tool not in tools:
                         tools.append(tool)
@@ -4964,11 +6905,11 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "email": user.email,
             "name": user.name,
             "organization_id": user.organization_id,
-            "organization_name": user.organization_name,
+            "organization_name": await get_organization_name(db, user.organization_id, user.organization_name),
             "user_type": user_type,
             "role_id": user.role_id,
-            "role_name": user.role_name,
-            "role": admin.role if admin else user.role_name.lower().replace(" ", "_"),
+            "role_name": await get_role_name(db, user.role_id, user.role_name),
+            "role": admin.role if admin else (await get_role_name(db, user.role_id, user.role_name) or "user").lower().replace(" ", "_"),
             "permissions": permissions,
             "is_admin": admin is not None,
             "status": user.status,
@@ -4978,7 +6919,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "subscriptions": [
                 {
                     "id": sub.id,
-                    "plan_name": sub.plan_name,
+                    "plan_name": await get_plan_name(db, sub.plan_id, sub.plan_name),
                     "status": sub.status,
                     "start_date": sub.start_date.isoformat() if sub.start_date else None,
                     "end_date": sub.end_date.isoformat() if sub.end_date else None
@@ -4995,7 +6936,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
                 "name": admin.name,
                 "role": admin.role,
                 "organization_id": admin.organization_id,
-                "organization_name": admin.organization_name,
+                "organization_name": await get_organization_name(db, admin.organization_id, admin.organization_name),
                 "theme_preference": getattr(admin, 'theme_preference', 'light'),
                 "is_active": admin.is_active,
                 "created_at": admin.created_at.isoformat() if admin.created_at else None
@@ -5058,7 +6999,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
                         plans.append({"id": p.id, "name": p.name, "tool": p.tool})
             
             try:
-                sub_tools = json.loads(sub.tools) if sub.tools else []
+                sub_tools = await get_subscription_tools(db, sub)
                 for tool in sub_tools:
                     if tool not in tools:
                         tools.append(tool)
@@ -5070,7 +7011,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "email": admin.email,
             "name": admin.name,
             "organization_id": admin.organization_id,
-            "organization_name": admin.organization_name,
+            "organization_name": await get_organization_name(db, admin.organization_id, admin.organization_name),
             "user_type": user_type,
             "role": admin.role,
             "permissions": ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"],
@@ -5082,7 +7023,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "subscriptions": [
                 {
                     "id": sub.id,
-                    "plan_name": sub.plan_name,
+                    "plan_name": await get_plan_name(db, sub.plan_id, sub.plan_name),
                     "status": sub.status,
                     "start_date": sub.start_date.isoformat() if sub.start_date else None,
                     "end_date": sub.end_date.isoformat() if sub.end_date else None
@@ -5171,7 +7112,7 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                             plans.append({"id": p.id, "name": p.name, "tool": p.tool})
                 
                 try:
-                    sub_tools = json.loads(sub.tools) if sub.tools else []
+                    sub_tools = await get_subscription_tools(db, sub)
                     for tool in sub_tools:
                         if tool not in tools:
                             tools.append(tool)
@@ -5182,11 +7123,11 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 "email": user.email,
                 "name": user.name,
                 "organization_id": user.organization_id,
-                "organization_name": user.organization_name,
+                "organization_name": await get_organization_name(db, user.organization_id, user.organization_name),
                 "user_type": user_type,
                 "role_id": user.role_id,
-                "role_name": user.role_name,
-                "role": admin.role if admin else user.role_name.lower().replace(" ", "_"),
+                "role_name": await get_role_name(db, user.role_id, user.role_name),
+                "role": admin.role if admin else (await get_role_name(db, user.role_id, user.role_name) or "user").lower().replace(" ", "_"),
                 "permissions": permissions,
                 "is_admin": admin is not None,
                 "status": user.status,
@@ -5196,7 +7137,7 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 "subscriptions": [
                     {
                         "id": sub.id,
-                        "plan_name": sub.plan_name,
+                        "plan_name": await get_plan_name(db, sub.plan_id, sub.plan_name),
                         "status": sub.status,
                         "start_date": sub.start_date.isoformat() if sub.start_date else None,
                         "end_date": sub.end_date.isoformat() if sub.end_date else None
@@ -5213,7 +7154,7 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                     "name": admin.name,
                     "role": admin.role,
                     "organization_id": admin.organization_id,
-                    "organization_name": admin.organization_name,
+                    "organization_name": await get_organization_name(db, admin.organization_id, admin.organization_name),
                     "is_active": admin.is_active
                 }
             
@@ -5273,7 +7214,7 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                             plans.append({"id": p.id, "name": p.name, "tool": p.tool})
                 
                 try:
-                    sub_tools = json.loads(sub.tools) if sub.tools else []
+                    sub_tools = await get_subscription_tools(db, sub)
                     for tool in sub_tools:
                         if tool not in tools:
                             tools.append(tool)
@@ -5284,7 +7225,7 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 "email": admin.email,
                 "name": admin.name,
                 "organization_id": admin.organization_id,
-                "organization_name": admin.organization_name,
+                "organization_name": await get_organization_name(db, admin.organization_id, admin.organization_name),
                 "user_type": user_type,
                 "role": admin.role,
                 "permissions": ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"],
@@ -5296,7 +7237,7 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 "subscriptions": [
                     {
                         "id": sub.id,
-                        "plan_name": sub.plan_name,
+                        "plan_name": await get_plan_name(db, sub.plan_id, sub.plan_name),
                         "status": sub.status,
                         "start_date": sub.start_date.isoformat() if sub.start_date else None,
                         "end_date": sub.end_date.isoformat() if sub.end_date else None
@@ -5396,7 +7337,7 @@ async def get_user_requests(
     result = await db.execute(query.order_by(UserRequestModel.created_at.desc()))
     requests = result.scalars().all()
     
-    return [model_to_dict(r) for r in requests]
+    return [await user_request_to_dict(db, r) for r in requests]
 
 
 @api_router.get("/user-requests/pending", tags=["User Requests"])
@@ -5407,7 +7348,7 @@ async def get_pending_user_requests(payload: dict = Depends(verify_token), db: A
         .where(UserRequestModel.status == "pending")
         .order_by(UserRequestModel.created_at.desc())
     )
-    return [model_to_dict(r) for r in result.scalars().all()]
+    return [await user_request_to_dict(db, r) for r in result.scalars().all()]
 
 
 @api_router.get("/user-requests/{request_id}", tags=["User Requests"])
@@ -5417,13 +7358,16 @@ async def get_user_request(request_id: str, payload: dict = Depends(verify_token
     req = result.scalar_one_or_none()
     if not req:
         raise HTTPException(status_code=404, detail="User request not found")
-    return model_to_dict(req)
+    return await user_request_to_dict(db, req)
 
 
 @api_router.post("/user-requests/{request_id}/approve", tags=["User Requests"])
 async def approve_user_request(
     request_id: str,
     role_id: str,
+    project_id: str,
+    business_unit_id: Optional[str] = None,
+    project_role: str = "member",
     payload: dict = Depends(verify_token),
     db: AsyncSession = Depends(get_db)
 ):
@@ -5450,6 +7394,10 @@ async def approve_user_request(
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Role not found in this organization")
+    project_role = (project_role or "member").strip().lower()
+    if project_role not in ["manager", "member", "viewer"]:
+        raise HTTPException(status_code=400, detail="Team role must be manager, member, or viewer")
+    business_unit, project = await validate_user_request_team_assignment(db, req.organization_id, project_id, business_unit_id)
     
     now = datetime.now(timezone.utc)
     
@@ -5458,6 +7406,9 @@ async def approve_user_request(
     req.approved_at = now
     req.updated_at = now
     req.approved_role_id = role_id
+    req.approved_business_unit_id = business_unit.id
+    req.approved_project_id = project.id
+    req.approved_project_role = project_role
     
     # Create the user
     user = UserModel(
@@ -5474,6 +7425,7 @@ async def approve_user_request(
     )
     db.add(user)
     await db.flush()
+    team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
     
     # Create user in Auth0
     auth0_result = await auth0_mgmt.create_user(
@@ -5525,6 +7477,9 @@ async def approve_user_request(
             "auth0_user_id": user.auth0_user_id,
             "status": user.status
         },
+        "business_unit": model_to_dict(business_unit, ["tags"]),
+        "team": model_to_dict(project),
+        "team_member": await project_team_member_to_dict(db, team_member),
         "setup_url": setup_url,
         "next_steps": "User will receive an email to verify their email address and set their password."
     }
