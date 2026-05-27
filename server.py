@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON, UniqueConstraint
+from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON, UniqueConstraint, text
 from sqlalchemy.dialects.mysql import LONGTEXT
 
 import os
@@ -6238,8 +6238,21 @@ async def seed_data(db: AsyncSession = Depends(get_db)):
 # ==================== ROOT ROUTE ====================
 
 @api_router.get("/")
-async def root():
-    return {"message": "ProbeStack Admin Dashboard API", "version": "1.0.0", "database": "MySQL"}
+async def root(db: AsyncSession = Depends(get_db)):
+    active_database = None
+    try:
+        result = await db.execute(text("SELECT DATABASE()"))
+        active_database = result.scalar()
+    except Exception as e:
+        logger.warning(f"Could not read active database name: {e}")
+
+    return {
+        "message": "ProbeStack Admin Dashboard API",
+        "version": "1.0.0",
+        "database": "MySQL",
+        "configured_database": DB_NAME,
+        "active_database": active_database,
+    }
 
 # ==================== PUBLIC API FOR EXTERNAL APPLICATIONS ====================
 
@@ -7546,12 +7559,13 @@ async def db_health_check(db: AsyncSession = Depends(get_db)):
     Check the database connection health.
     """
     try:
-        # Execute a simple query
-        from sqlalchemy import text
-        result = await db.execute(text("SELECT 1"))
+        result = await db.execute(text("SELECT DATABASE()"))
+        active_database = result.scalar()
         return {
             "status": "healthy",
             "database": "connected",
+            "configured_database": DB_NAME,
+            "active_database": active_database,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
