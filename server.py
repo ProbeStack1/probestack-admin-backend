@@ -1210,6 +1210,42 @@ async def plan_to_dict(db: AsyncSession, plan: PlanModel, include_tools: bool = 
         plan_dict["plan_tools"] = [model_to_dict(t) for t in tools_result.scalars().all()]
     return plan_dict
 
+async def public_plan_to_dict(db: AsyncSession, plan: PlanModel) -> dict:
+    product = await get_plan_product(db, plan)
+    plan_cost = float(plan.cost or plan.price_monthly or 0)
+    price_label = plan.price_label or (f"${plan_cost:g}" if plan_cost else "$0")
+    tools_result = await db.execute(
+        select(PlanToolModel)
+        .where(PlanToolModel.plan_id == plan.id, PlanToolModel.is_active == True)
+        .order_by(PlanToolModel.display_order, PlanToolModel.name)
+    )
+    plan_tools = [model_to_dict(tool) for tool in tools_result.scalars().all()]
+    return {
+        "id": plan.id,
+        "name": plan.name,
+        "product_id": product.id if product else plan.product_id,
+        "product_key": product.key if product else plan.tool,
+        "product_name": product.name if product else None,
+        "tool": product.key if product else plan.tool,
+        "description": plan.description,
+        "features": parse_json_list(plan.features),
+        "price": price_label,
+        "price_label": price_label,
+        "period": plan.billing_period,
+        "billing_period": plan.billing_period,
+        "api_limit": getattr(plan, "api_limit", 0),
+        "cost": plan_cost,
+        "price_monthly": float(plan.price_monthly or plan_cost),
+        "price_yearly": float(plan.price_yearly or plan_cost),
+        "base_price_monthly": plan_cost,
+        "base_price_yearly": plan_cost,
+        "popular": bool(plan.is_popular),
+        "is_popular": bool(plan.is_popular),
+        "is_contact_sales": price_label.lower() == "contact sales",
+        "is_active": bool(plan.is_active),
+        "plan_tools": plan_tools,
+    }
+
 def normalize_plan_selections(data: PlanUpgradeCreate) -> List[PlanSelectionItem]:
     if data.requested_plans:
         return data.requested_plans
@@ -6343,11 +6379,11 @@ async def calculate_plan_price(plan_id: str, tool_ids: str = "", payload: dict =
             "plan_name": plan.name,
             "api_limit": getattr(plan, "api_limit", 0),
             "cost": plan_cost,
-            "price": p.price_label or (f"${plan_cost:g}" if plan_cost else "$0"),
-            "price_label": p.price_label or (f"${plan_cost:g}" if plan_cost else "$0"),
-            "period": p.billing_period,
-            "billing_period": p.billing_period,
-            "popular": bool(p.is_popular),
+            "price": plan.price_label or (f"${plan_cost:g}" if plan_cost else "$0"),
+            "price_label": plan.price_label or (f"${plan_cost:g}" if plan_cost else "$0"),
+            "period": plan.billing_period,
+            "billing_period": plan.billing_period,
+            "popular": bool(plan.is_popular),
             "base_price_monthly": plan_cost,
             "base_price_yearly": plan_cost,
             "tools_price_monthly": 0,
@@ -7232,6 +7268,44 @@ async def get_public_pricing(db: AsyncSession = Depends(get_db)):
         "products": products,
         "product_types": [{"id": product["key"], "name": product["name"]} for product in products],
     }
+
+@api_router.get("/public/plans", tags=["Public API"])
+async def get_public_plans(
+    product_id: Optional[str] = None,
+    product_key: Optional[str] = None,
+    tool: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public flat plan catalog for external onboarding pages.
+    Supports the new product-backed plans while retaining the legacy `tool` filter.
+    """
+    query = select(PlanModel).where(PlanModel.is_active == True)
+    product_filter = product_id or product_key or tool
+    if product_filter:
+        product = await get_product_by_id_or_key(db, product_filter)
+        if product:
+            query = query.where(PlanModel.product_id == product.id)
+        else:
+            query = query.where(PlanModel.tool == product_filter)
+
+    result = await db.execute(query.order_by(PlanModel.created_at.desc()))
+    plans = result.scalars().all()
+    product_order = {item["key"]: index for index, item in enumerate(DEFAULT_PRODUCTS)}
+    plan_name_order = {"starter": 0, "enterprise": 1, "enterprise - plus": 2, "enterprise plus": 2}
+    plan_rows = []
+    for plan in plans:
+        plan_dict = await public_plan_to_dict(db, plan)
+        plan_rows.append(plan_dict)
+    plan_rows.sort(
+        key=lambda item: (
+            product_order.get(item.get("product_key"), 99),
+            plan_name_order.get((item.get("name") or "").lower(), 99),
+            item.get("cost") or 0,
+            item.get("name") or "",
+        )
+    )
+    return plan_rows
 
 # ==================== PUBLIC API - USER REQUESTS ====================
 
