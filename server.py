@@ -11,7 +11,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import Any, List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
 import jwt
@@ -84,6 +84,8 @@ AsyncSessionLocal = async_sessionmaker(
 # JWT Config
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
+PROBESTACK_TOKEN_ISSUER = os.environ.get("PROBESTACK_TOKEN_ISSUER", "https://auth.probestack.io")
+PROBESTACK_TOKEN_AUDIENCE = ["probestack-api", "probestack-ui"]
 
 # Application email config. When SMTP_HOST is not set, email sending is skipped
 # and the generated setup link is returned/logged for local testing.
@@ -451,7 +453,7 @@ class RoleModel(Base):
     __tablename__ = "roles"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     permissions: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -745,8 +747,9 @@ class OrganizationCreate(BaseModel):
     name: str
     email: str
     domain: Optional[str] = None
-    requested_plans: List[str]
-    requested_tools: List[str]
+    requested_plans: Optional[List[Any]] = None
+    requested_tools: Optional[List[str]] = None
+    plans: Optional[List[Any]] = None
     contact_person: str
     phone: Optional[str] = None
     address: Optional[str] = None
@@ -761,8 +764,10 @@ class OrganizationRequest(BaseModel):
     name: str
     email: str
     domain: Optional[str] = None
-    plan_ids: List[str]  # List of Plan IDs like ["plan_api_enterprise", "plan_ai_enterprise"]
-    selected_tools: List[str]
+    plan_ids: Optional[List[str]] = None  # Legacy list of Plan IDs like ["plan_forgeq_enterprise"]
+    selected_tools: Optional[List[str]] = None  # Legacy flat list of selected tool IDs/names
+    plans: Optional[List[Any]] = None  # New product-plan payload from /public/plans
+    requested_plans: Optional[List[Any]] = None  # Alternate product-plan payload key
     contact_person: str
     contact_phone: Optional[str] = None
     company_address: Optional[str] = None
@@ -893,7 +898,7 @@ class UserRequestCreate(BaseModel):
     email: str
     name: str
     organization_id: str
-    requested_role: str  # Role name like 'Admin', 'Developer', 'Viewer'
+    requested_role: str  # Standard role name like 'Designer' or 'Read-Only / Auditor'
     job_title: Optional[str] = None
     department: Optional[str] = None
     phone: Optional[str] = None
@@ -1097,6 +1102,256 @@ def parse_json_list(value) -> List[str]:
             return [value] if value else []
     return [value]
 
+STANDARD_ROLE_PRODUCTS = [
+    ("forgecatalog", "ForgeCatalog"),
+    ("forgesphere", "ForgeSphere"),
+    ("forgefuzz", "ForgeFuzz"),
+    ("forgehub", "ForgeHub"),
+    ("forgearmor", "ForgeArmor"),
+    ("forgeflux", "ForgeFlux"),
+    ("forgeshift", "ForgeShift"),
+    ("platform_admin", "Platform Admin"),
+]
+
+STANDARD_ROLE_DEFINITIONS = [
+    {
+        "name": "Org Admin / Owner",
+        "description": "Admin access across all ProbeStack products and platform administration.",
+        "access": {
+            "forgecatalog": "admin",
+            "forgesphere": "admin",
+            "forgefuzz": "admin",
+            "forgehub": "admin",
+            "forgearmor": "admin",
+            "forgeflux": "admin",
+            "forgeshift": "admin",
+            "platform_admin": "admin",
+        },
+    },
+    {
+        "name": "Business Unit Admin",
+        "description": "Manage own Business Unit, projects, and resources under that Business Unit.",
+        "access": {
+            "forgecatalog": "manage_bu",
+            "forgesphere": "manage_bu",
+            "forgefuzz": "manage_bu",
+            "forgehub": "manage_bu",
+            "forgearmor": "manage_bu",
+            "forgeflux": "manage_bu",
+            "forgeshift": "manage_bu",
+            "platform_admin": "manage_bu",
+        },
+    },
+    {
+        "name": "Project Admin",
+        "description": "Manage own project and related resources under the assigned Business Unit.",
+        "access": {
+            "forgecatalog": "manage_project",
+            "forgesphere": "manage_project",
+            "forgefuzz": "manage_project",
+            "forgehub": "manage_project",
+            "forgearmor": "manage_project",
+            "forgeflux": "manage_project",
+            "forgeshift": "manage_project",
+            "platform_admin": "manage_project",
+        },
+    },
+    {
+        "name": "Designer",
+        "description": "Design/edit access in catalog and lifecycle tools with view access elsewhere.",
+        "access": {
+            "forgecatalog": "edit",
+            "forgesphere": "edit",
+            "forgefuzz": "view",
+            "forgehub": "view",
+            "forgearmor": "view",
+            "forgeflux": "view",
+            "forgeshift": "view",
+            "platform_admin": "view",
+        },
+    },
+    {
+        "name": "Platform/Lifecycle Owner",
+        "description": "Lifecycle ownership across ForgeSphere with approval/edit access for platform flow.",
+        "access": {
+            "forgecatalog": "edit",
+            "forgesphere": "admin",
+            "forgefuzz": "view",
+            "forgehub": "edit",
+            "forgearmor": "view",
+            "forgeflux": "approve",
+            "forgeshift": "view",
+            "platform_admin": "view",
+        },
+    },
+    {
+        "name": "QA / Test Engineer",
+        "description": "Testing ownership in ForgeFuzz with view access elsewhere.",
+        "access": {
+            "forgecatalog": "view",
+            "forgesphere": "view",
+            "forgefuzz": "admin",
+            "forgehub": "view",
+            "forgearmor": "view",
+            "forgeflux": "view",
+            "forgeshift": "view",
+            "platform_admin": "view",
+        },
+    },
+    {
+        "name": "Platform Engineer",
+        "description": "Platform engineering ownership in ForgeHub with edit access to catalog/lifecycle.",
+        "access": {
+            "forgecatalog": "edit",
+            "forgesphere": "edit",
+            "forgefuzz": "view",
+            "forgehub": "admin",
+            "forgearmor": "view",
+            "forgeflux": "view",
+            "forgeshift": "view",
+            "platform_admin": "view",
+        },
+    },
+    {
+        "name": "Security Engineer / AppSec",
+        "description": "Security administration in ForgeArmor with approval/edit access for security workflows.",
+        "access": {
+            "forgecatalog": "view",
+            "forgesphere": "approve",
+            "forgefuzz": "edit",
+            "forgehub": "edit",
+            "forgearmor": "admin",
+            "forgeflux": "approve",
+            "forgeshift": "view",
+            "platform_admin": "edit",
+        },
+    },
+    {
+        "name": "DevOps / Release Engineer",
+        "description": "Release ownership in ForgeFlux with migration/edit access where needed.",
+        "access": {
+            "forgecatalog": "view",
+            "forgesphere": "edit",
+            "forgefuzz": "view",
+            "forgehub": "view",
+            "forgearmor": "view",
+            "forgeflux": "admin",
+            "forgeshift": "edit",
+            "platform_admin": "view",
+        },
+    },
+    {
+        "name": "API/Agent Consumer",
+        "description": "Consumer read access to API and agent-facing products only.",
+        "access": {
+            "forgecatalog": "view",
+            "forgesphere": "view",
+            "forgefuzz": "view",
+            "forgehub": "view",
+            "forgearmor": "none",
+            "forgeflux": "none",
+            "forgeshift": "none",
+            "platform_admin": "none",
+        },
+    },
+    {
+        "name": "Read-Only / Auditor",
+        "description": "Read-only auditor access across all products and platform administration.",
+        "access": {
+            "forgecatalog": "view",
+            "forgesphere": "view",
+            "forgefuzz": "view",
+            "forgehub": "view",
+            "forgearmor": "view",
+            "forgeflux": "view",
+            "forgeshift": "view",
+            "platform_admin": "view",
+        },
+    },
+]
+
+STANDARD_ROLE_NAMES = [role["name"] for role in STANDARD_ROLE_DEFINITIONS]
+STANDARD_ROLE_NAME_LOOKUP = {role["name"].lower(): role for role in STANDARD_ROLE_DEFINITIONS}
+
+def standard_role_slug(name: str) -> str:
+    return normalize_token_value(name, "role")
+
+def standard_role_id(role_name: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"probestack-role:global:{standard_role_slug(role_name)}"))
+
+def standard_role_permissions(role_definition: dict) -> List[str]:
+    return [
+        f"{product_key}:{role_definition['access'].get(product_key, 'none')}"
+        for product_key, _ in STANDARD_ROLE_PRODUCTS
+    ]
+
+def map_to_standard_role_name(role_name: Optional[str], fallback: str = "Read-Only / Auditor") -> str:
+    if not role_name:
+        return fallback
+    normalized = role_name.strip().lower()
+    if normalized in STANDARD_ROLE_NAME_LOOKUP:
+        return STANDARD_ROLE_NAME_LOOKUP[normalized]["name"]
+    legacy_mapping = {
+        "admin": "Org Admin / Owner",
+        "org admin": "Org Admin / Owner",
+        "org_admin": "Org Admin / Owner",
+        "owner": "Org Admin / Owner",
+        "developer": "Designer",
+        "designer": "Designer",
+        "viewer": "Read-Only / Auditor",
+        "read only": "Read-Only / Auditor",
+        "read-only": "Read-Only / Auditor",
+        "auditor": "Read-Only / Auditor",
+        "user": "API/Agent Consumer",
+        "member": "API/Agent Consumer",
+        "individual user": "API/Agent Consumer",
+    }
+    return legacy_mapping.get(normalized, fallback)
+
+async def ensure_standard_roles_for_organization(db: AsyncSession, organization_id: Optional[str] = None) -> List[RoleModel]:
+    roles = []
+    for role_definition in STANDARD_ROLE_DEFINITIONS:
+        role_id = standard_role_id(role_definition["name"])
+        result = await db.execute(
+            select(RoleModel).where(
+                (RoleModel.id == role_id)
+                | ((RoleModel.organization_id.is_(None)) & (RoleModel.name == role_definition["name"]))
+            )
+        )
+        role = result.scalars().first()
+        permissions = standard_role_permissions(role_definition)
+        if role:
+            role.organization_id = None
+            role.name = role_definition["name"]
+            role.permissions = json.dumps(permissions)
+            role.description = role_definition["description"]
+        else:
+            role = RoleModel(
+                id=role_id,
+                name=role_definition["name"],
+                organization_id=None,
+                permissions=json.dumps(permissions),
+                description=role_definition["description"],
+            )
+            db.add(role)
+        roles.append(role)
+    await db.flush()
+    return roles
+
+async def get_standard_role(db: AsyncSession, organization_id: str, role_name: Optional[str] = None) -> RoleModel:
+    standard_name = map_to_standard_role_name(role_name, "API/Agent Consumer")
+    await ensure_standard_roles_for_organization(db)
+    result = await db.execute(
+        select(RoleModel).where(
+            RoleModel.organization_id.is_(None),
+            RoleModel.name == standard_name,
+        )
+    )
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=500, detail=f"Standard role '{standard_name}' could not be created")
+    return role
+
 DEFAULT_PRODUCTS = [
     {"id": "prod_forgeshift", "key": "forgeshift", "name": "ForgeShift - Gateway Migration", "description": "Automated migration and transformation of API proxies across disparate gateway environments.", "display_order": 10},
     {"id": "prod_forgestudio", "key": "forgestudio", "name": "ForgeStudio - API Design", "description": "Powerful API design and development studio for modern collaborative teams.", "display_order": 20},
@@ -1252,6 +1507,70 @@ def normalize_plan_selections(data: PlanUpgradeCreate) -> List[PlanSelectionItem
     if data.requested_plan_id:
         return [PlanSelectionItem(plan_id=data.requested_plan_id, tool_ids=data.requested_tools or [])]
     return []
+
+def payload_to_dict(value: Any) -> dict:
+    if isinstance(value, BaseModel):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, dict):
+        return value
+    return {}
+
+def normalize_tool_values(values: Any) -> List[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+
+    tools = []
+    for value in values:
+        if isinstance(value, str):
+            tool_value = value
+        else:
+            item = payload_to_dict(value)
+            tool_value = item.get("id") or item.get("tool_id") or item.get("name") or item.get("tool_key") or item.get("key")
+        if tool_value and tool_value not in tools:
+            tools.append(tool_value)
+    return tools
+
+def normalize_organization_plan_selections(data: Any) -> List[PlanSelectionItem]:
+    raw_plans = data.plans or data.requested_plans or []
+    selections_by_plan = {}
+
+    for raw_plan in raw_plans:
+        if isinstance(raw_plan, str):
+            plan_id = raw_plan
+            plan_payload = {}
+        else:
+            plan_payload = payload_to_dict(raw_plan)
+            plan_id = (
+                plan_payload.get("plan_id")
+                or plan_payload.get("id")
+                or plan_payload.get("requested_plan_id")
+            )
+        if not plan_id:
+            raise HTTPException(status_code=400, detail="Each selected plan must include an id or plan_id")
+
+        tool_values = (
+            normalize_tool_values(plan_payload.get("tool_ids"))
+            or normalize_tool_values(plan_payload.get("selected_tools"))
+            or normalize_tool_values(plan_payload.get("tools"))
+            or normalize_tool_values(plan_payload.get("plan_tools"))
+        )
+        selections_by_plan.setdefault(plan_id, [])
+        for tool in tool_values:
+            if tool not in selections_by_plan[plan_id]:
+                selections_by_plan[plan_id].append(tool)
+
+    if not selections_by_plan and data.plan_ids:
+        for plan_id in data.plan_ids:
+            selections_by_plan.setdefault(plan_id, [])
+
+    return [
+        PlanSelectionItem(plan_id=plan_id, tool_ids=tool_ids)
+        for plan_id, tool_ids in selections_by_plan.items()
+    ]
 
 async def resolve_plan_tool(db: AsyncSession, plan_id: str, tool_value: str) -> Optional[PlanToolModel]:
     result = await db.execute(
@@ -1514,6 +1833,42 @@ async def create_organization_subscription_request(
         )
     return request
 
+async def create_organization_subscription_request_from_selections(
+    db: AsyncSession,
+    organization_id: str,
+    selections: List[PlanSelectionItem],
+    *,
+    status: str = "pending"
+) -> OrganizationSubscriptionRequestModel:
+    request = OrganizationSubscriptionRequestModel(
+        organization_id=organization_id,
+        status=status
+    )
+    db.add(request)
+    await db.flush()
+
+    for selection in selections:
+        item = OrganizationSubscriptionRequestItemModel(request_id=request.id, plan_id=selection.plan_id)
+        db.add(item)
+        await db.flush()
+        seen = set()
+        for tool in selection.tool_ids or []:
+            if not tool or tool in seen:
+                continue
+            seen.add(tool)
+            plan_tool = await resolve_plan_tool(db, selection.plan_id, tool)
+            if not plan_tool:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Tool '{tool}' is not available for plan '{selection.plan_id}'"
+                )
+            db.add(OrganizationSubscriptionRequestToolModel(
+                request_item_id=item.id,
+                plan_tool_id=plan_tool.id,
+                tool_key=None
+            ))
+    return request
+
 async def get_organization_requested_plan_details(db: AsyncSession, org: OrganizationModel) -> List[dict]:
     request_result = await db.execute(
         select(OrganizationSubscriptionRequestModel)
@@ -1581,6 +1936,20 @@ async def user_to_dict(db: AsyncSession, user: UserModel) -> dict:
     data["organization_name"] = await get_organization_name(db, user.organization_id, user.organization_name)
     data["role_name"] = await get_role_name(db, user.role_id, user.role_name)
     return data
+
+async def user_access_summary_to_dict(
+    db: AsyncSession,
+    user: UserModel,
+    role: Optional[RoleModel] = None,
+    business_units: Optional[List[dict]] = None,
+) -> dict:
+    """Return the compact organization/BU/team role summary for one user."""
+    return {
+        "user_name": user.name,
+        "user_email": user.email,
+        "org_role": role.name if role else await get_role_name(db, user.role_id, user.role_name),
+        "business_units": business_units or [],
+    }
 
 async def subscription_to_dict(db: AsyncSession, subscription: SubscriptionModel) -> dict:
     data = model_to_dict(subscription, ["tools"])
@@ -1884,17 +2253,121 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
         "tools": subscription_context["tools"],
     }
 
+def normalize_token_value(value: Optional[str], fallback: str = "member") -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in (value or "").strip())
+    normalized = "_".join(part for part in normalized.split("_") if part)
+    return normalized or fallback
+
+def normalize_scoped_role(role: Optional[str], scope: str, is_admin_scope: bool = False) -> str:
+    role_key = normalize_token_value(role, "member")
+    if is_admin_scope or role_key in {"admin", f"{scope}_admin"}:
+        return f"{scope}_admin"
+    return role_key
+
+def build_role_assignments_claim(user_context: dict) -> dict:
+    organization = user_context.get("organization") or {}
+    org_role = user_context.get("org_role") or {}
+    admin = user_context.get("admin") or {}
+    is_org_admin = bool(user_context.get("is_org_admin"))
+
+    organization_role = admin.get("role") or org_role.get("name")
+    if is_org_admin:
+        organization_role = "org_admin"
+
+    role_assignments = {
+        "organization": {
+            "name": organization.get("name"),
+            "key": organization.get("external_org_id") or organization.get("auth0_org_id") or organization.get("id"),
+            "role": normalize_scoped_role(organization_role, "org", is_org_admin),
+        },
+        "business_units": [],
+    }
+
+    for business_unit in user_context.get("business_units") or []:
+        bu_is_admin = is_org_admin or business_unit.get("role") == "admin" or business_unit.get("business_unit_role") == "admin"
+        bu_claim = {
+            "name": business_unit.get("name"),
+            "code": business_unit.get("code"),
+            "role": normalize_scoped_role(
+                business_unit.get("business_unit_role") or business_unit.get("role"),
+                "bu",
+                bu_is_admin,
+            ),
+            "projects": [],
+        }
+        for project in business_unit.get("projects") or []:
+            project_is_admin = is_org_admin or project.get("role") == "admin" or project.get("project_role") == "admin"
+            bu_claim["projects"].append({
+                "name": project.get("name"),
+                "code": project.get("code"),
+                "role": normalize_scoped_role(
+                    project.get("project_role") or project.get("role"),
+                    "project",
+                    project_is_admin,
+                ),
+            })
+        role_assignments["business_units"].append(bu_claim)
+
+    for project in user_context.get("projects_without_business_unit") or []:
+        project_is_admin = is_org_admin or project.get("role") == "admin" or project.get("project_role") == "admin"
+        role_assignments["business_units"].append({
+            "name": None,
+            "code": None,
+            "role": "member",
+            "projects": [{
+                "name": project.get("name"),
+                "code": project.get("code"),
+                "role": normalize_scoped_role(
+                    project.get("project_role") or project.get("role"),
+                    "project",
+                    project_is_admin,
+                ),
+            }],
+        })
+
+    return role_assignments
+
+def build_entitlements_claim(user_context: dict) -> dict:
+    products = []
+    seen_products = set()
+
+    for plan in user_context.get("plans") or []:
+        product_key = plan.get("product_key") or plan.get("tool") or plan.get("product_id")
+        if not product_key:
+            continue
+        entitlement_key = str(product_key)
+        if entitlement_key in seen_products:
+            continue
+        seen_products.add(entitlement_key)
+        products.append({
+            "key": entitlement_key,
+            "plan": normalize_token_value(plan.get("name"), "unknown"),
+        })
+
+    return {"products": products}
+
+def build_user_context_token_claims(user_context: dict, issued_at: int, expires_at: int) -> dict:
+    user = user_context["user"]
+    return {
+        "iss": PROBESTACK_TOKEN_ISSUER,
+        "aud": PROBESTACK_TOKEN_AUDIENCE,
+        "sub": user["id"],
+        "email": user["email"],
+        "name": user.get("name") or user["email"],
+        "type": "user",
+        "role_assignments": build_role_assignments_claim(user_context),
+        "entitlements": build_entitlements_claim(user_context),
+        "token_type": "probestack_user_context",
+        "jti": str(uuid.uuid4()),
+        "iat": issued_at,
+        "nbf": issued_at,
+        "exp": expires_at,
+    }
+
 def create_user_context_token(user_context: dict) -> tuple[str, int]:
     expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
     issued_at = int(datetime.now(timezone.utc).timestamp())
-    payload = {
-        **user_context,
-        "sub": user_context["user"]["id"],
-        "email": user_context["user"]["email"],
-        "token_type": "probestack_user_context",
-        "iat": issued_at,
-        "exp": expires_at,
-    }
+    payload = build_user_context_token_claims(user_context, issued_at, expires_at)
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM), expires_at
 
 async def billing_to_dict(db: AsyncSession, billing: BillingModel) -> dict:
@@ -2219,24 +2692,7 @@ async def resolve_organization_user_label(
     return f"{user.name} <{user.email}>"
 
 async def get_or_create_default_org_role(db: AsyncSession, org: OrganizationModel) -> RoleModel:
-    result = await db.execute(
-        select(RoleModel)
-        .where(RoleModel.organization_id == org.id, RoleModel.name.in_(["User", "Member"]))
-        .order_by(RoleModel.name.asc())
-    )
-    role = result.scalars().first()
-    if role:
-        return role
-
-    role = RoleModel(
-        name="User",
-        organization_id=org.id,
-        permissions=json.dumps(["read"]),
-        description="Default project member role"
-    )
-    db.add(role)
-    await db.flush()
-    return role
+    return await get_standard_role(db, org.id, "API/Agent Consumer")
 
 async def create_invited_org_user(db: AsyncSession, org: OrganizationModel, email: str) -> UserModel:
     role = await get_or_create_default_org_role(db, org)
@@ -3097,10 +3553,13 @@ async def get_my_organization_roles(payload: dict = Depends(require_any_admin), 
     if not org_id:
         raise HTTPException(status_code=404, detail="No organization linked to this account")
     
+    await ensure_standard_roles_for_organization(db, org_id)
+    await db.commit()
     result = await db.execute(
         select(RoleModel)
-        .where(RoleModel.organization_id == org_id)
-        .order_by(RoleModel.created_at.desc())
+        .where(RoleModel.organization_id.is_(None))
+        .where(RoleModel.name.in_(STANDARD_ROLE_NAMES))
+        .order_by(RoleModel.name.asc())
     )
     return [model_to_dict(r, ["permissions"]) for r in result.scalars().all()]
 
@@ -3630,13 +4089,18 @@ async def approve_user_request_org_admin(
     if req.status != "pending":
         raise HTTPException(status_code=400, detail="Request is not pending")
     
-    # Validate role exists in this organization
+    await ensure_standard_roles_for_organization(db, org_id)
+    # Validate role exists in the global standard role catalog.
     role_result = await db.execute(
-        select(RoleModel).where(RoleModel.id == role_id, RoleModel.organization_id == org_id)
+        select(RoleModel).where(
+            RoleModel.id == role_id,
+            RoleModel.organization_id.is_(None),
+            RoleModel.name.in_(STANDARD_ROLE_NAMES),
+        )
     )
     role = role_result.scalar_one_or_none()
     if not role:
-        raise HTTPException(status_code=404, detail="Role not found in your organization")
+        raise HTTPException(status_code=404, detail="Standard role not found")
     project_role = (project_role or "member").strip().lower()
     if project_role not in ["manager", "member", "viewer"]:
         raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
@@ -3908,7 +4372,7 @@ async def get_my_organization_dashboard(payload: dict = Depends(require_any_admi
     
     # Counts
     user_count = await db.scalar(select(func.count()).select_from(UserModel).where(UserModel.organization_id == org_id))
-    role_count = await db.scalar(select(func.count()).select_from(RoleModel).where(RoleModel.organization_id == org_id))
+    role_count = await db.scalar(select(func.count()).select_from(RoleModel).where(RoleModel.organization_id.is_(None), RoleModel.name.in_(STANDARD_ROLE_NAMES)))
     business_unit_count = await db.scalar(select(func.count()).select_from(BusinessUnitModel).where(BusinessUnitModel.organization_id == org_id))
     project_count = await db.scalar(select(func.count()).select_from(ProjectModel).where(ProjectModel.organization_id == org_id))
     pending_user_requests = await db.scalar(
@@ -4548,6 +5012,94 @@ async def get_organization_teams(
     result = await db.execute(query.order_by(ProjectModel.name.asc()))
     return [model_to_dict(project) for project in result.scalars().all()]
 
+@api_router.get("/organizations/{org_id}/users-with-roles")
+async def get_organization_users_with_roles(
+    org_id: str,
+    status: Optional[str] = None,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get organization users with compact org, Business unit, and team role details."""
+    if payload.get("role") == "org_admin" and payload.get("organization_id") != org_id:
+        raise HTTPException(status_code=403, detail="Organization admin access required for this organization")
+
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    org = org_result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    query = (
+        select(UserModel, RoleModel)
+        .outerjoin(RoleModel, UserModel.role_id == RoleModel.id)
+        .where(UserModel.organization_id == org_id)
+    )
+    if status:
+        query = query.where(UserModel.status == status)
+
+    result = await db.execute(query.order_by(UserModel.created_at.desc()))
+    user_rows = result.all()
+
+    summaries_by_user_id = {}
+    user_ids = []
+    user_emails = []
+    for user, role in user_rows:
+        summaries_by_user_id[user.id] = {
+            "user": user,
+            "role": role,
+            "business_units_by_id": {},
+        }
+        user_ids.append(user.id)
+        user_emails.append(user.email)
+
+    if user_rows:
+        member_result = await db.execute(
+            select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
+            .join(ProjectModel, ProjectTeamMemberModel.project_id == ProjectModel.id)
+            .outerjoin(BusinessUnitModel, ProjectModel.business_unit_id == BusinessUnitModel.id)
+            .where(
+                ProjectTeamMemberModel.organization_id == org_id,
+                ProjectModel.organization_id == org_id,
+                ProjectTeamMemberModel.status == "active",
+                (
+                    ProjectTeamMemberModel.user_id.in_(user_ids)
+                    | ProjectTeamMemberModel.email.in_(user_emails)
+                ),
+            )
+            .order_by(BusinessUnitModel.name.asc(), ProjectModel.name.asc())
+        )
+        summaries_by_email = {
+            entry["user"].email.lower(): entry
+            for entry in summaries_by_user_id.values()
+        }
+        for member, project, business_unit in member_result.all():
+            summary = summaries_by_user_id.get(member.user_id) or summaries_by_email.get(member.email.lower())
+            if not summary or not business_unit:
+                continue
+
+            bu_entry = summary["business_units_by_id"].setdefault(
+                business_unit.id,
+                {
+                    "bu_name": business_unit.name,
+                    "bu_role": "member",
+                    "teams": [],
+                },
+            )
+            if not any(team["team_name"] == project.name for team in bu_entry["teams"]):
+                bu_entry["teams"].append({
+                    "team_name": project.name,
+                    "team_role": member.project_role,
+                })
+
+    return [
+        await user_access_summary_to_dict(
+            db,
+            entry["user"],
+            entry["role"],
+            list(entry["business_units_by_id"].values()),
+        )
+        for entry in summaries_by_user_id.values()
+    ]
+
 @api_router.get("/organizations/{org_id}")
 async def get_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
@@ -4558,9 +5110,39 @@ async def get_organization(org_id: str, payload: dict = Depends(require_super_ad
 
 @api_router.post("/organizations")
 async def create_organization(data: OrganizationCreate, db: AsyncSession = Depends(get_db)):
+    plan_selections = normalize_organization_plan_selections(data)
+    if not plan_selections:
+        raise HTTPException(status_code=400, detail="At least one requested plan is required")
+
+    plan_ids = [selection.plan_id for selection in plan_selections]
+    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+    plans = {plan.id: plan for plan in plans_result.scalars().all()}
+    invalid_plans = [plan_id for plan_id in plan_ids if plan_id not in plans]
+    if invalid_plans:
+        raise HTTPException(status_code=400, detail=f"Invalid requested plans: {invalid_plans}")
+
+    for tool in data.requested_tools or []:
+        matched_selection = None
+        for selection in plan_selections:
+            if await resolve_plan_tool(db, selection.plan_id, tool):
+                matched_selection = selection
+                break
+        if not matched_selection:
+            raise HTTPException(status_code=400, detail=f"Tool '{tool}' is not available for selected plans")
+        if tool not in matched_selection.tool_ids:
+            matched_selection.tool_ids.append(tool)
+
+    selected_tools = []
+    for selection in plan_selections:
+        for tool in selection.tool_ids or []:
+            if not await resolve_plan_tool(db, selection.plan_id, tool):
+                raise HTTPException(status_code=400, detail=f"Tool '{tool}' is not available for plan '{selection.plan_id}'")
+            if tool not in selected_tools:
+                selected_tools.append(tool)
+
     org = OrganizationModel(
         name=data.name, email=data.email, domain=data.domain,
-        requested_plan=json.dumps(data.requested_plans), requested_tools=json.dumps(data.requested_tools),
+        requested_plan=json.dumps(plan_ids), requested_tools=json.dumps(selected_tools),
         contact_person=data.contact_person, phone=data.phone, address=data.address,
         description=data.description,
         gateway_region=data.gateway_region,
@@ -4570,17 +5152,18 @@ async def create_organization(data: OrganizationCreate, db: AsyncSession = Depen
     )
     db.add(org)
     await db.flush()
-    await create_organization_subscription_request(
+    await ensure_standard_roles_for_organization(db, org.id)
+    await create_organization_subscription_request_from_selections(
         db,
         org.id,
-        data.requested_plans,
-        data.requested_tools,
+        plan_selections,
         status=org.status
     )
     
+    plan_names = [plans[plan_id].name for plan_id in plan_ids]
     notif = NotificationModel(
         title="New Organization Request",
-        message=f"{data.name} has requested to join with {', '.join(data.requested_plans)} plan(s)",
+        message=f"{data.name} has requested to join with {', '.join(plan_names)} plan(s)",
         type="info", link=f"/organizations/{org.id}"
     )
     db.add(notif)
@@ -4796,7 +5379,7 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
         name=email.split("@")[0].replace(".", " ").title(),
         organization_id=matched_org.id,
         organization_name=matched_org.name,
-        requested_role="Member",
+        requested_role="API/Agent Consumer",
         status="pending"
     )
     db.add(user_request)
@@ -5075,31 +5658,15 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
         )
         existing_user = result.scalar_one_or_none()
 
-        # Process Auth0 roles - create if not exists
+        await ensure_standard_roles_for_organization(db, org.id)
         for role_name in auth0_roles:
             if not role_name:
                 continue
-            # Check if role exists in the organization
-            result = await db.execute(
-                select(RoleModel).where(
-                    RoleModel.name == role_name,
-                    RoleModel.organization_id == org.id
-                )
-            )
-            role = result.scalar_one_or_none()
-
-            if not role:
-                # Create new role
-                role = RoleModel(
-                    name=role_name,
-                    organization_id=org.id,
-                    permissions=json.dumps(["read"]),  # Default permissions
-                    description=f"Auto-created from Auth0 role: {role_name}"
-                )
-                db.add(role)
-                await db.flush()
-
-            synced_roles.append({"id": role.id, "name": role.name})
+            standard_name = map_to_standard_role_name(role_name, "API/Agent Consumer")
+            role = await get_standard_role(db, org.id, standard_name)
+            role_payload = {"id": role.id, "name": role.name}
+            if role_payload not in synced_roles:
+                synced_roles.append(role_payload)
 
         # Determine the primary role (first role or default)
         primary_role = synced_roles[0] if synced_roles else None
@@ -5113,27 +5680,9 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
             existing_user.last_login = datetime.now(timezone.utc)
             synced_user = existing_user
         else:
-            # Create new user
-            # If no role from Auth0, create/get a default "User" role
+            # Create new user with a standard role.
             if not primary_role:
-                result = await db.execute(
-                    select(RoleModel).where(
-                        RoleModel.name == "User",
-                        RoleModel.organization_id == org.id
-                    )
-                )
-                default_role = result.scalar_one_or_none()
-
-                if not default_role:
-                    default_role = RoleModel(
-                        name="User",
-                        organization_id=org.id,
-                        permissions=json.dumps(["read"]),
-                        description="Default user role"
-                    )
-                    db.add(default_role)
-                    await db.flush()
-
+                default_role = await get_standard_role(db, org.id, "API/Agent Consumer")
                 primary_role = {"id": default_role.id, "name": default_role.name}
 
             new_user = UserModel(
@@ -5468,24 +6017,7 @@ async def approve_individual_user_request(
         db.add(no_org)
         await db.flush()
     
-    # Create or get a default role for individual users
-    result = await db.execute(
-        select(RoleModel).where(
-            RoleModel.name == "Individual User",
-            RoleModel.organization_id == "no_organization"
-        )
-    )
-    role = result.scalar_one_or_none()
-    
-    if not role:
-        role = RoleModel(
-            name="Individual User",
-            organization_id="no_organization",
-            permissions=json.dumps(["read", "write"]),
-            description="Default role for individual users"
-        )
-        db.add(role)
-        await db.flush()
+    role = await get_standard_role(db, "no_organization", "API/Agent Consumer")
     
     # Create user with first_login_token for setup flow
     user = UserModel(
@@ -5665,6 +6197,7 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     org.status = "approved"
     org.approved_at = now
     org.updated_at = now
+    await ensure_standard_roles_for_organization(db, org.id)
     
     requested_plan_details = await get_organization_requested_plan_details(db, org)
     subscription_ids = []
@@ -5910,16 +6443,18 @@ async def update_user_full(user_id: str, data: UserFullUpdate, payload: dict = D
             raise HTTPException(status_code=400, detail="Invalid theme preference")
         user.theme_preference = data.theme_preference
     if data.role_id is not None:
-        # Validate role exists in user's organization
+        await ensure_standard_roles_for_organization(db, user.organization_id)
+        # Validate role exists in user's organization and belongs to the standard role catalog.
         role_result = await db.execute(
             select(RoleModel).where(
                 RoleModel.id == data.role_id,
-                RoleModel.organization_id == user.organization_id
+                RoleModel.organization_id.is_(None),
+                RoleModel.name.in_(STANDARD_ROLE_NAMES),
             )
         )
         role = role_result.scalar_one_or_none()
         if not role:
-            raise HTTPException(status_code=404, detail="Role not found in user's organization")
+            raise HTTPException(status_code=404, detail="Standard role not found")
         user.role_id = role.id
         user.role_name = role.name
     
@@ -6089,6 +6624,8 @@ async def cancel_subscription(sub_id: str, payload: dict = Depends(require_super
 
 @api_router.get("/products")
 async def get_products(include_plans: bool = False, include_inactive: bool = False, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+    if include_inactive and payload.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
     query = select(ProductModel).order_by(ProductModel.display_order, ProductModel.name)
     if not include_inactive:
         query = query.where(ProductModel.is_active == True)
@@ -6096,7 +6633,12 @@ async def get_products(include_plans: bool = False, include_inactive: bool = Fal
     products = []
     for product in result.scalars().all():
         product_dict = model_to_dict(product)
-        plans_result = await db.execute(select(PlanModel).where(PlanModel.product_id == product.id))
+        plans_result = await db.execute(
+            select(PlanModel).where(
+                PlanModel.product_id == product.id,
+                PlanModel.is_active == True,
+            )
+        )
         product_plans = plans_result.scalars().all()
         product_dict["plan_count"] = len(product_plans)
         if include_plans:
@@ -6160,7 +6702,7 @@ async def delete_product(product_id: str, payload: dict = Depends(require_super_
 @api_router.get("/plans")
 async def get_plans(product_id: Optional[str] = None, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
     """Get all plans - accessible by any admin (Super Admin or Org Admin)"""
-    query = select(PlanModel)
+    query = select(PlanModel).where(PlanModel.is_active == True)
     if product_id:
         product = await get_product_by_id_or_key(db, product_id)
         if not product:
@@ -6171,9 +6713,22 @@ async def get_plans(product_id: Optional[str] = None, payload: dict = Depends(re
 
     return [await plan_to_dict(db, plan) for plan in plans]
 
+@api_router.get("/plans/inactive")
+async def get_inactive_plans(product_id: Optional[str] = None, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Management-only list of deactivated plans so super admins can restore them."""
+    query = select(PlanModel).where(PlanModel.is_active == False)
+    if product_id:
+        product = await get_product_by_id_or_key(db, product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        query = query.where(PlanModel.product_id == product.id)
+    result = await db.execute(query.order_by(PlanModel.created_at.desc()))
+    plans = result.scalars().all()
+    return [await plan_to_dict(db, plan) for plan in plans]
+
 @api_router.get("/plans/{plan_id}")
 async def get_plan(plan_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -6201,7 +6756,7 @@ async def create_plan(data: PlanCreate, payload: dict = Depends(require_super_ad
 
 @api_router.put("/plans/{plan_id}")
 async def update_plan(plan_id: str, data: PlanCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -6224,6 +6779,16 @@ async def update_plan(plan_id: str, data: PlanCreate, payload: dict = Depends(re
         .where(SubscriptionModel.plan_id == plan.id)
         .values(plan_name=plan.name)
     )
+    await db.commit()
+    return await plan_to_dict(db, plan)
+
+@api_router.post("/plans/{plan_id}/activate")
+async def activate_plan(plan_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan = plan_result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    plan.is_active = True
     await db.commit()
     return await plan_to_dict(db, plan)
 
@@ -6260,7 +6825,7 @@ async def delete_plan(plan_id: str, payload: dict = Depends(require_super_admin)
 async def get_plan_tools(plan_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
     """Get all tools for a specific plan"""
     # Verify plan exists
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
     plan = plan_result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -6276,7 +6841,7 @@ async def get_plan_tools(plan_id: str, payload: dict = Depends(require_any_admin
 async def create_plan_tool(plan_id: str, data: PlanToolCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     """Add a new tool to a plan"""
     # Verify plan exists
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
     plan = plan_result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -6364,7 +6929,7 @@ async def calculate_plan_price(plan_id: str, tool_ids: str = "", payload: dict =
     tool_ids: Comma-separated list of tool IDs
     """
     # Verify plan exists
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
     plan = plan_result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -6442,16 +7007,23 @@ async def create_user(data: UserCreate, payload: dict = Depends(require_super_ad
     # Check if email already exists
     existing_user = await db.execute(select(UserModel).where(UserModel.email == data.email))
     if existing_user.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="A user with this email already exists")
+        raise HTTPException(status_code=409, detail="A user with this email already exists")
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == data.organization_id))
     org = org_result.scalar_one_or_none()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    role_result = await db.execute(select(RoleModel).where(RoleModel.id == data.role_id))
+    await ensure_standard_roles_for_organization(db, data.organization_id)
+    role_result = await db.execute(
+        select(RoleModel).where(
+            RoleModel.id == data.role_id,
+            RoleModel.organization_id.is_(None),
+            RoleModel.name.in_(STANDARD_ROLE_NAMES),
+        )
+    )
     role = role_result.scalar_one_or_none()
     if not role:
-        raise HTTPException(status_code=404, detail="Role not found")
+        raise HTTPException(status_code=404, detail="Standard role not found")
     
     user = UserModel(
         email=data.email, name=data.name, organization_id=data.organization_id,
@@ -6516,10 +7088,10 @@ async def delete_user(user_id: str, payload: dict = Depends(require_super_admin)
 
 @api_router.get("/roles")
 async def get_roles(organization_id: Optional[str] = None, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    query = select(RoleModel)
-    if organization_id:
-        query = query.where(RoleModel.organization_id == organization_id)
-    result = await db.execute(query.order_by(RoleModel.created_at.desc()))
+    await ensure_standard_roles_for_organization(db)
+    await db.commit()
+    query = select(RoleModel).where(RoleModel.organization_id.is_(None), RoleModel.name.in_(STANDARD_ROLE_NAMES))
+    result = await db.execute(query.order_by(RoleModel.name.asc()))
     return [model_to_dict(r, ["permissions"]) for r in result.scalars().all()]
 
 @api_router.get("/roles/{role_id}")
@@ -6532,35 +7104,15 @@ async def get_role(role_id: str, payload: dict = Depends(require_super_admin), d
 
 @api_router.post("/roles")
 async def create_role(data: RoleCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    role = RoleModel(
-        name=data.name, organization_id=data.organization_id,
-        permissions=json.dumps(data.permissions), description=data.description
-    )
-    db.add(role)
-    await db.commit()
-    return model_to_dict(role, ["permissions"])
+    raise HTTPException(status_code=400, detail="Roles are standardized and cannot be created per organization")
 
 @api_router.put("/roles/{role_id}")
 async def update_role(role_id: str, data: RoleCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(RoleModel).where(RoleModel.id == role_id))
-    role = result.scalar_one_or_none()
-    if not role:
-        raise HTTPException(status_code=404, detail="Role not found")
-    
-    role.name = data.name
-    role.organization_id = data.organization_id
-    role.permissions = json.dumps(data.permissions)
-    role.description = data.description
-    await db.commit()
-    return model_to_dict(role, ["permissions"])
+    raise HTTPException(status_code=400, detail="Roles are standardized and cannot be edited per organization")
 
 @api_router.delete("/roles/{role_id}")
 async def delete_role(role_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(delete(RoleModel).where(RoleModel.id == role_id))
-    if result.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Role not found")
-    await db.commit()
-    return {"message": "Role deleted"}
+    raise HTTPException(status_code=400, detail="Roles are standardized and cannot be deleted per organization")
 
 # ==================== BILLING ROUTES (Super Admin Only) ====================
 
@@ -6789,27 +7341,27 @@ async def seed_data(db: AsyncSession = Depends(get_db)):
         db.add(SubscriptionModel(id=s["id"], organization_id=s["organization_id"], organization_name=s["organization_name"], plan_id=s["plan_id"], plan_name=s["plan_name"], tools=json.dumps(s["tools"]), status="active", start_date=now - timedelta(days=15), end_date=now + timedelta(days=15), amount=s["amount"]))
         db.add(BillingModel(organization_id=s["organization_id"], organization_name=s["organization_name"], subscription_id=s["id"], amount=s["amount"], status="paid", invoice_number=f"INV-{now.strftime('%Y%m%d')}-{s['organization_id'][-4:].upper()}", billing_date=now - timedelta(days=15), due_date=now - timedelta(days=8), paid_date=now - timedelta(days=10), payment_method="card"))
     
-    # Create roles
-    roles_data = [
-        {"id": "role_org1_admin", "name": "Admin", "organization_id": "org_1", "permissions": ["all"], "description": "Full access"},
-        {"id": "role_org1_dev", "name": "Developer", "organization_id": "org_1", "permissions": ["read", "write", "test"], "description": "Development access"},
-        {"id": "role_org2_admin", "name": "Admin", "organization_id": "org_2", "permissions": ["all"], "description": "Full access"},
-        {"id": "role_org2_viewer", "name": "Viewer", "organization_id": "org_2", "permissions": ["read"], "description": "Read-only access"},
-        {"id": "role_org5_admin", "name": "Admin", "organization_id": "org_5", "permissions": ["all"], "description": "Full access"},
-    ]
-    for r in roles_data:
-        db.add(RoleModel(id=r["id"], name=r["name"], organization_id=r["organization_id"], permissions=json.dumps(r["permissions"]), description=r["description"]))
+    for o in orgs_data:
+        await ensure_standard_roles_for_organization(db, o["id"])
     
     # Create users
     users_data = [
-        {"email": "john@techcorp.io", "name": "John Smith", "organization_id": "org_1", "organization_name": "TechCorp Inc", "role_id": "role_org1_admin", "role_name": "Admin"},
-        {"email": "jane@techcorp.io", "name": "Jane Doe", "organization_id": "org_1", "organization_name": "TechCorp Inc", "role_id": "role_org1_dev", "role_name": "Developer"},
-        {"email": "sarah@dataflow.dev", "name": "Sarah Chen", "organization_id": "org_2", "organization_name": "DataFlow Systems", "role_id": "role_org2_admin", "role_name": "Admin"},
-        {"email": "tom@dataflow.dev", "name": "Tom Harris", "organization_id": "org_2", "organization_name": "DataFlow Systems", "role_id": "role_org2_viewer", "role_name": "Viewer"},
-        {"email": "robert@enterprise-sol.com", "name": "Robert Wilson", "organization_id": "org_5", "organization_name": "Enterprise Solutions", "role_id": "role_org5_admin", "role_name": "Admin"},
+        {"email": "john@techcorp.io", "name": "John Smith", "organization_id": "org_1", "organization_name": "TechCorp Inc", "role_name": "Org Admin / Owner"},
+        {"email": "jane@techcorp.io", "name": "Jane Doe", "organization_id": "org_1", "organization_name": "TechCorp Inc", "role_name": "Designer"},
+        {"email": "sarah@dataflow.dev", "name": "Sarah Chen", "organization_id": "org_2", "organization_name": "DataFlow Systems", "role_name": "Org Admin / Owner"},
+        {"email": "tom@dataflow.dev", "name": "Tom Harris", "organization_id": "org_2", "organization_name": "DataFlow Systems", "role_name": "Read-Only / Auditor"},
+        {"email": "robert@enterprise-sol.com", "name": "Robert Wilson", "organization_id": "org_5", "organization_name": "Enterprise Solutions", "role_name": "Org Admin / Owner"},
     ]
     for u in users_data:
-        db.add(UserModel(**u))
+        role = await get_standard_role(db, u["organization_id"], u["role_name"])
+        db.add(UserModel(
+            email=u["email"],
+            name=u["name"],
+            organization_id=u["organization_id"],
+            organization_name=u["organization_name"],
+            role_id=role.id,
+            role_name=role.name,
+        ))
     
     # Create notifications
     notifs_data = [
@@ -6884,8 +7436,11 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     - `name`: Organization name (required)
     - `email`: Organization email (required)
     - `domain`: Company domain (optional)
-    - `plan_ids`: List of Plan IDs to subscribe to (required) - e.g., ['plan_api_enterprise', 'plan_ai_enterprise']
-    - `selected_tools`: List of tool names from the plans (required)
+    - `plans`: New product-plan selections from GET /api/public/plans, e.g.
+      [{"id": "plan_forgeq_enterprise", "product_key": "forgeq", "tool_ids": ["pt_forgeq_enterprise"]}]
+    - `requested_plans`: Alternate key for the same product-plan selection format
+    - `plan_ids`: Legacy list of Plan IDs to subscribe to
+    - `selected_tools`: Legacy flat list of selected tool IDs/names
     - `contact_person`: Primary contact name (required)
     - `contact_phone`: Contact phone number (optional)
     - `company_address`: Company address (optional)
@@ -6897,11 +7452,20 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     2. Submit this request with selected plan_ids and tools
     """
 
+    plan_selections = normalize_organization_plan_selections(data)
+    if not plan_selections:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one plan is required. Send plans/requested_plans with id or plan_id, or legacy plan_ids."
+        )
+
+    plan_ids = [selection.plan_id for selection in plan_selections]
+
     # Validate all plans exist
-    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(data.plan_ids)))
+    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
     plans = {p.id: p for p in plans_result.scalars().all()}
     
-    invalid_plans = [pid for pid in data.plan_ids if pid not in plans]
+    invalid_plans = [pid for pid in plan_ids if pid not in plans]
     if invalid_plans:
         # Get available plans
         all_plans_result = await db.execute(select(PlanModel).where(PlanModel.is_active == True))
@@ -6916,29 +7480,65 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
                 "available_plans": available_plans
             }
         )
-    
-    # Get available tools from ALL selected plans
+
+    # Get available tools from ALL selected plans for validation errors and legacy payload support.
     tools_result = await db.execute(
         select(PlanToolModel).where(
-            PlanToolModel.plan_id.in_(data.plan_ids),
+            PlanToolModel.plan_id.in_(plan_ids),
             PlanToolModel.is_active == True
         )
     )
-    available_tools = {t.name: t for t in tools_result.scalars().all()}
+    available_tool_rows = tools_result.scalars().all()
+    available_tools = [
+        {"id": t.id, "name": t.name, "plan_id": t.plan_id}
+        for t in available_tool_rows
+    ]
 
-    # Validate selected tools exist in at least one of the selected plans
-    invalid_tools = [t for t in data.selected_tools if t not in available_tools]
-    if invalid_tools:
+    # Legacy flat selected_tools are assigned to the first selected plan that owns the tool.
+    invalid_legacy_tools = []
+    for tool in data.selected_tools or []:
+        matched_selection = None
+        for selection in plan_selections:
+            if await resolve_plan_tool(db, selection.plan_id, tool):
+                matched_selection = selection
+                break
+        if not matched_selection:
+            invalid_legacy_tools.append(tool)
+            continue
+        if tool not in matched_selection.tool_ids:
+            matched_selection.tool_ids.append(tool)
+
+    if invalid_legacy_tools:
         raise HTTPException(
             status_code=400,
             detail={
-                "error": f"Invalid tools for selected plans: {invalid_tools}",
-                "available_tools": list(available_tools.keys())
+                "error": f"Invalid tools for selected plans: {invalid_legacy_tools}",
+                "available_tools": available_tools
             }
         )
 
-    selected_tool_objects = [available_tools[t] for t in data.selected_tools]
-    base_monthly = sum((getattr(plans[pid], "cost", None) or plans[pid].price_monthly or 0) for pid in data.plan_ids)
+    for selection in plan_selections:
+        for tool in selection.tool_ids or []:
+            if not await resolve_plan_tool(db, selection.plan_id, tool):
+                plan_available_tools = [
+                    tool_row for tool_row in available_tools
+                    if tool_row["plan_id"] == selection.plan_id
+                ]
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": f"Tool '{tool}' is not available for plan '{selection.plan_id}'",
+                        "available_tools": plan_available_tools,
+                    }
+                )
+
+    selected_tools = []
+    for selection in plan_selections:
+        for tool in selection.tool_ids or []:
+            if tool not in selected_tools:
+                selected_tools.append(tool)
+
+    base_monthly = sum((getattr(plans[pid], "cost", None) or plans[pid].price_monthly or 0) for pid in plan_ids)
     base_yearly = base_monthly
     tools_monthly = 0
     tools_yearly = 0
@@ -6958,8 +7558,8 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
         name=data.name,
         email=data.email,
         domain=data.domain,
-        requested_plan=json.dumps(data.plan_ids),  # Store as JSON array
-        requested_tools=json.dumps(data.selected_tools),
+        requested_plan=json.dumps(plan_ids),  # Store as JSON array
+        requested_tools=json.dumps(selected_tools),
         contact_person=data.contact_person,
         phone=data.contact_phone,
         address=data.company_address,
@@ -6971,19 +7571,19 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     )
     db.add(org)
     await db.flush()
-    await create_organization_subscription_request(
+    await ensure_standard_roles_for_organization(db, org.id)
+    await create_organization_subscription_request_from_selections(
         db,
         org.id,
-        data.plan_ids,
-        data.selected_tools,
+        plan_selections,
         status=org.status
     )
     
     # Create notification for admin
-    tools_str = ', '.join(data.selected_tools[:3])
-    if len(data.selected_tools) > 3:
-        tools_str += f" +{len(data.selected_tools) - 3} more"
-    plans_str = ', '.join([plans[pid].name for pid in data.plan_ids])
+    tools_str = ', '.join(selected_tools[:3])
+    if len(selected_tools) > 3:
+        tools_str += f" +{len(selected_tools) - 3} more"
+    plans_str = ', '.join([plans[pid].name for pid in plan_ids])
     notif = NotificationModel(
         title="New Organization Request",
         message=f"{data.name} has requested {plans_str} with tools: {tools_str}",
@@ -6995,7 +7595,18 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     await db.commit()
     
     # Build response with plan details
-    plan_names = [{"id": pid, "name": plans[pid].name} for pid in data.plan_ids]
+    plan_names = []
+    selected_tools_by_plan = {selection.plan_id: selection.tool_ids for selection in plan_selections}
+    for pid in plan_ids:
+        product = await get_plan_product(db, plans[pid])
+        plan_names.append({
+            "id": pid,
+            "name": plans[pid].name,
+            "product_id": product.id if product else plans[pid].product_id,
+            "product_key": product.key if product else plans[pid].tool,
+            "product_name": product.name if product else None,
+            "selected_tools": selected_tools_by_plan.get(pid, []),
+        })
     
     return {
         "request_id": org.id,
@@ -7005,7 +7616,7 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
             "name": org.name,
             "email": org.email,
             "plans": plan_names,
-            "selected_tools": data.selected_tools,
+            "selected_tools": selected_tools,
             "pricing": {
                 "base_monthly": base_monthly,
                 "base_yearly": base_yearly,
@@ -7318,7 +7929,7 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
     - `email`: User's email address (required)
     - `name`: User's full name (required)
     - `organization_id`: Organization ID to add user to (required)
-    - `requested_role`: Requested role name like 'Admin', 'Developer', 'Viewer' (required)
+    - `requested_role`: Standard role name like 'Designer' or 'Read-Only / Auditor' (required)
     - `job_title`: User's job title (optional)
     - `department`: User's department (optional)
     - `phone`: User's phone number (optional)
@@ -7359,13 +7970,15 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
     if existing_request.scalar_one_or_none():
         raise HTTPException(status_code=409, detail=f"A pending request for {data.email} already exists")
     
+    requested_role = map_to_standard_role_name(data.requested_role, "API/Agent Consumer")
+
     # Create user request
     user_request = UserRequestModel(
         email=data.email,
         name=data.name,
         organization_id=data.organization_id,
         organization_name=org.name,
-        requested_role=data.requested_role,
+        requested_role=requested_role,
         job_title=data.job_title,
         department=data.department,
         phone=data.phone,
@@ -7376,7 +7989,7 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
     # Create notification for admin
     notif = NotificationModel(
         title="New User Request",
-        message=f"{data.name} ({data.email}) requested to join {org.name} as {data.requested_role}",
+        message=f"{data.name} ({data.email}) requested to join {org.name} as {requested_role}",
         type="info",
         link="/user-requests"
     )
@@ -7392,7 +8005,7 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
             "name": data.name,
             "email": data.email,
             "organization": org.name,
-            "requested_role": data.requested_role
+            "requested_role": requested_role
         }
     }
 
@@ -7943,6 +8556,8 @@ async def update_user_preferences(email: str, data: dict, db: AsyncSession = Dep
         return {"message": "Preferences updated", "theme_preference": theme}
     
     raise HTTPException(status_code=404, detail="User not found")
+
+@api_router.get("/public/organizations/{org_id}/roles", tags=["Public API"])
 async def get_organization_roles(org_id: str, db: AsyncSession = Depends(get_db)):
     """
     Get available roles for an organization. External apps can use this to show role options.
@@ -7959,7 +8574,13 @@ async def get_organization_roles(org_id: str, db: AsyncSession = Depends(get_db)
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    result = await db.execute(select(RoleModel).where(RoleModel.organization_id == org_id))
+    await ensure_standard_roles_for_organization(db)
+    await db.commit()
+    result = await db.execute(
+        select(RoleModel)
+        .where(RoleModel.organization_id.is_(None), RoleModel.name.in_(STANDARD_ROLE_NAMES))
+        .order_by(RoleModel.name.asc())
+    )
     roles = result.scalars().all()
     
     return {
@@ -7969,6 +8590,8 @@ async def get_organization_roles(org_id: str, db: AsyncSession = Depends(get_db)
             {
                 "id": r.id,
                 "name": r.name,
+                "organization_id": r.organization_id,
+                "permissions": parse_json_list(r.permissions),
                 "description": r.description
             }
             for r in roles
@@ -8045,13 +8668,18 @@ async def approve_user_request(
     existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
     if existing_user.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="A user with this email already exists")
-    # Validate role exists and belongs to the organization
+    await ensure_standard_roles_for_organization(db)
+    # Validate role exists in the global standard role catalog.
     role_result = await db.execute(
-        select(RoleModel).where(RoleModel.id == role_id, RoleModel.organization_id == req.organization_id)
+        select(RoleModel).where(
+            RoleModel.id == role_id,
+            RoleModel.organization_id.is_(None),
+            RoleModel.name.in_(STANDARD_ROLE_NAMES),
+        )
     )
     role = role_result.scalar_one_or_none()
     if not role:
-        raise HTTPException(status_code=404, detail="Role not found in this organization")
+        raise HTTPException(status_code=404, detail="Standard role not found")
     project_role = (project_role or "member").strip().lower()
     if project_role not in ["manager", "member", "viewer"]:
         raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
@@ -8316,7 +8944,6 @@ async def ensure_default_products():
                     plan.billing_period = plan_data.get("period")
                     plan.cost = cost
                     plan.is_popular = bool(plan_data.get("popular", False))
-                    plan.is_active = True
         plans_result = await db.execute(select(PlanModel))
         for plan in plans_result.scalars().all():
             product = products_by_key.get(plan.tool)
