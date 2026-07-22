@@ -1360,6 +1360,7 @@ DEFAULT_PRODUCTS = [
     {"id": "prod_forgeai", "key": "forgeai", "name": "ForgeAi - AI Gateway", "description": "AI Gateway to monitor, secure, and route your LLM & AI provider traffic seamlessly.", "display_order": 50},
     {"id": "prod_agentic_ai", "key": "agentic_ai", "name": "Agentic AI Platform", "description": "End-to-end intelligent agent workflow orchestration and autonomous task execution.", "display_order": 60},
 ]
+DEFAULT_PRODUCTS_BY_ID = {product["id"]: product for product in DEFAULT_PRODUCTS}
 
 DEFAULT_PRICING_CATALOG = [
     {
@@ -7902,14 +7903,23 @@ async def get_individual_account_products(db: AsyncSession = Depends(get_db)):
         if product.id in seen_product_ids:
             continue
         seen_product_ids.add(product.id)
+        canonical_product = DEFAULT_PRODUCTS_BY_ID.get(product.id, {})
+        product_key_value = canonical_product.get("key", product.key)
+        product_name_value = canonical_product.get("name", product.name)
+        product_description_value = canonical_product.get("description", product.description)
+        display_order_value = canonical_product.get("display_order", product.display_order)
+        starter_plan_dict = await public_plan_to_dict(db, starter_plan)
+        starter_plan_dict["product_key"] = product_key_value
+        starter_plan_dict["product_name"] = product_name_value
+        starter_plan_dict["tool"] = product_key_value
 
         products.append({
             "id": product.id,
-            "key": product.key,
-            "name": product.name,
-            "description": product.description,
-            "display_order": product.display_order,
-            "starter_plan": await public_plan_to_dict(db, starter_plan),
+            "key": product_key_value,
+            "name": product_name_value,
+            "description": product_description_value,
+            "display_order": display_order_value,
+            "starter_plan": starter_plan_dict,
         })
 
     return {
