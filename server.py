@@ -7889,16 +7889,20 @@ async def get_public_plans(
 ):
     """
     Public flat plan catalog for external onboarding pages.
-    Supports the new product-backed plans while retaining the legacy `tool` filter.
+    Returns only active plans attached to active products. Legacy tool-only
+    rows are intentionally excluded from the public catalog.
     """
-    query = select(PlanModel).where(PlanModel.is_active == True)
+    query = (
+        select(PlanModel)
+        .join(ProductModel, PlanModel.product_id == ProductModel.id)
+        .where(PlanModel.is_active == True, ProductModel.is_active == True)
+    )
     product_filter = product_id or product_key or tool
     if product_filter:
         product = await get_product_by_id_or_key(db, product_filter)
-        if product:
-            query = query.where(PlanModel.product_id == product.id)
-        else:
-            query = query.where(PlanModel.tool == product_filter)
+        if not product or not product.is_active:
+            return []
+        query = query.where(PlanModel.product_id == product.id)
 
     result = await db.execute(query.order_by(PlanModel.created_at.desc()))
     plans = result.scalars().all()
