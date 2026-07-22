@@ -7880,6 +7880,46 @@ async def get_public_pricing(db: AsyncSession = Depends(get_db)):
         "product_types": [{"id": product["key"], "name": product["name"]} for product in products],
     }
 
+@api_router.get("/public/individual-account/products", tags=["Public API"])
+async def get_individual_account_products(db: AsyncSession = Depends(get_db)):
+    """
+    Public product list for individual account signup.
+    Returns only active products that have an active Starter plan.
+    """
+    products_result = await db.execute(
+        select(ProductModel)
+        .where(ProductModel.is_active == True)
+        .where(ProductModel.key.in_([item["key"] for item in DEFAULT_PRODUCTS]))
+        .order_by(ProductModel.display_order, ProductModel.name)
+    )
+    products = []
+    for product in products_result.scalars().all():
+        starter_result = await db.execute(
+            select(PlanModel).where(
+                PlanModel.product_id == product.id,
+                PlanModel.is_active == True,
+                func.lower(PlanModel.name) == "starter",
+            )
+        )
+        starter_plan = starter_result.scalars().first()
+        if not starter_plan:
+            continue
+
+        products.append({
+            "id": product.id,
+            "key": product.key,
+            "name": product.name,
+            "description": product.description,
+            "display_order": product.display_order,
+            "starter_plan": await public_plan_to_dict(db, starter_plan),
+        })
+
+    return {
+        "source": "probestack-admin-backend",
+        "products": products,
+        "product_types": [{"id": product["key"], "name": product["name"]} for product in products],
+    }
+
 @api_router.get("/public/plans", tags=["Public API"])
 async def get_public_plans(
     product_id: Optional[str] = None,
