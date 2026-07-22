@@ -7886,24 +7886,22 @@ async def get_individual_account_products(db: AsyncSession = Depends(get_db)):
     Public product list for individual account signup.
     Returns only active products that have an active Starter plan.
     """
-    products_result = await db.execute(
-        select(ProductModel)
-        .where(ProductModel.is_active == True)
-        .where(ProductModel.key.in_([item["key"] for item in DEFAULT_PRODUCTS]))
-        .order_by(ProductModel.display_order, ProductModel.name)
+    starter_result = await db.execute(
+        select(PlanModel, ProductModel)
+        .join(ProductModel, PlanModel.product_id == ProductModel.id)
+        .where(
+            ProductModel.is_active == True,
+            PlanModel.is_active == True,
+            func.lower(func.trim(PlanModel.name)) == "starter",
+        )
+        .order_by(ProductModel.display_order, ProductModel.name, PlanModel.created_at.desc())
     )
     products = []
-    for product in products_result.scalars().all():
-        starter_result = await db.execute(
-            select(PlanModel).where(
-                PlanModel.product_id == product.id,
-                PlanModel.is_active == True,
-                func.lower(PlanModel.name) == "starter",
-            )
-        )
-        starter_plan = starter_result.scalars().first()
-        if not starter_plan:
+    seen_product_ids = set()
+    for starter_plan, product in starter_result.all():
+        if product.id in seen_product_ids:
             continue
+        seen_product_ids.add(product.id)
 
         products.append({
             "id": product.id,
