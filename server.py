@@ -101,6 +101,8 @@ SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ["1", "true", "
 DEFAULT_CORS_ORIGINS = [
     "https://probestack.io",
     "https://www.probestack.io",
+    "https://community.probestack.io",
+    "http://community.probestack.io"
 ]
 CORS_ORIGINS = sorted({
     origin.strip().rstrip("/")
