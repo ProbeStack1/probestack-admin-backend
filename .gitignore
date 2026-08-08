@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+
+# Local database exports and backups
+/admin_dashboard*.sql
+/db_Cloud_SQL_Export_*.sql*
+/*.bak*
+/migrations/db_Cloud_SQL_Export_*.sql
+/migrations/probestack_admin_before_*.sql
+
+# Local API test reports
+/*Safe Curl Run Report.*
+/*.postman_collection.json
+/*.postman_environment.json

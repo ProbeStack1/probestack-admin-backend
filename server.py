@@ -13,11 +13,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, List, Optional
 import uuid
+import calendar
 from datetime import datetime, timezone, timedelta
 import jwt
 import bcrypt
 import json
 import httpx
+import base64
 from urllib.parse import urlencode
 import secrets
 import smtplib
@@ -36,6 +38,7 @@ if os.path.exists(ROOT_DIR / ".env"):
     load_dotenv(ROOT_DIR / ".env")
 
 # Auth0 Config
+AUTH0_ENABLED = os.environ.get("AUTH0_ENABLED", "false").lower() in ["1", "true", "yes"]
 AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'probestack-usa-dev.us.auth0.com')
 AUTH0_CLIENT_ID = os.environ.get('AUTH0_CLIENT_ID', '')
 AUTH0_CLIENT_SECRET = os.environ.get('AUTH0_CLIENT_SECRET', '')
@@ -45,7 +48,60 @@ AUTH0_MGMT_CLIENT_ID = os.environ.get('AUTH0_MGMT_CLIENT_ID', '')
 AUTH0_MGMT_CLIENT_SECRET = os.environ.get('AUTH0_MGMT_CLIENT_SECRET', '')
 AUTH0_DB_CONNECTION_NAME = os.environ.get('AUTH0_DB_CONNECTION_NAME', 'Username-Password-Authentication')
 AUTH0_DB_CONNECTION_ID = os.environ.get('AUTH0_DB_CONNECTION_ID', '')
-AUTH0_CALLBACK_URI = "https://probestack.io/callback"
+AUTH0_REDIRECT_URIS = {
+    "probestack": os.environ.get("AUTH0_PROBESTACK_CALLBACK_URI", AUTH0_CALLBACK_URI),
+    "forgecatalog": os.environ.get("AUTH0_FORGECATALOG_CALLBACK_URI", "https://forgecatalog.com/auth/auth0/callback"),
+    "forgefuzz": os.environ.get("AUTH0_FORGEFUZZ_CALLBACK_URI", "https://forgefuzz.com/auth/auth0/callback"),
+    "local": os.environ.get("AUTH0_LOCAL_CALLBACK_URI", "http://localhost:3000/admin/zitadel-test"),
+}
+AUTH0_POST_LOGOUT_URIS = {
+    "probestack": os.environ.get("AUTH0_PROBESTACK_POST_LOGOUT_URI", "https://probestack.io"),
+    "forgecatalog": os.environ.get("AUTH0_FORGECATALOG_POST_LOGOUT_URI", "https://forgecatalog.com"),
+    "forgefuzz": os.environ.get("AUTH0_FORGEFUZZ_POST_LOGOUT_URI", "https://forgefuzz.com"),
+    "local": os.environ.get("AUTH0_LOCAL_POST_LOGOUT_URI", "http://localhost:3000/admin/zitadel-test"),
+}
+
+SUPPORTED_IDENTITY_PROVIDERS = {"auth0", "zitadel"}
+DEFAULT_IDENTITY_PROVIDER = os.environ.get(
+    "ACTIVE_IDENTITY_PROVIDER",
+    os.environ.get("IDENTITY_PROVIDER", "zitadel"),
+).strip().lower()
+if DEFAULT_IDENTITY_PROVIDER not in SUPPORTED_IDENTITY_PROVIDERS:
+    DEFAULT_IDENTITY_PROVIDER = "zitadel"
+IDENTITY_PROVIDER_SETTING_KEY = "active_identity_provider"
+
+# Zitadel Config
+ZITADEL_DOMAIN = os.environ.get('ZITADEL_DOMAIN', '')
+ZITADEL_CLIENT_ID = os.environ.get('ZITADEL_CLIENT_ID', '')
+ZITADEL_CLIENT_SECRET = os.environ.get('ZITADEL_CLIENT_SECRET', '')
+ZITADEL_CALLBACK_URI = os.environ.get('ZITADEL_CALLBACK_URI', 'https://probestack.io/auth/zitadel/callback')
+ZITADEL_API_TOKEN = os.environ.get('ZITADEL_API_TOKEN', '')
+ZITADEL_DEFAULT_ORG_ID = os.environ.get('ZITADEL_DEFAULT_ORG_ID', '')
+ZITADEL_PROJECT_ID = os.environ.get('ZITADEL_PROJECT_ID', '')
+ZITADEL_REDIRECT_URIS = {
+    "probestack": os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_CALLBACK_URI),
+    "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_CALLBACK_URI", "https://forgecatalog.com/auth/zitadel/callback"),
+    "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_CALLBACK_URI", "https://forgefuzz.com/auth/zitadel/callback"),
+    "local": os.environ.get("ZITADEL_LOCAL_CALLBACK_URI", "http://localhost:3000/admin/zitadel-test"),
+}
+ZITADEL_POST_LOGOUT_URIS = {
+    "probestack": os.environ.get("ZITADEL_PROBESTACK_POST_LOGOUT_URI", "https://probestack.io"),
+    "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_POST_LOGOUT_URI", "https://forgecatalog.com"),
+    "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_POST_LOGOUT_URI", "https://forgefuzz.com"),
+    "local": os.environ.get("ZITADEL_LOCAL_POST_LOGOUT_URI", "http://localhost:3000/admin/zitadel-test"),
+}
+
+# Onboarding MongoDB role lookup. Used when creating local users so existing
+# onboarding roles remain the source of truth when a matching developer exists.
+MONGODB_ROLE_LOOKUP_ENABLED = os.environ.get("MONGODB_ROLE_LOOKUP_ENABLED", "false").lower() in ["1", "true", "yes"]
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+MONGODB_DATABASE = os.environ.get("MONGODB_DATABASE", "onboard-prod")
+MONGODB_DEVELOPERS_COLLECTION = os.environ.get("MONGODB_DEVELOPERS_COLLECTION", "onboarding_developers")
+MONGODB_ROLE_LOOKUP_EMAIL_ONLY = os.environ.get("MONGODB_ROLE_LOOKUP_EMAIL_ONLY", "true").lower() in ["1", "true", "yes"]
+_mongodb_client = None
+ALLOW_CONTEXT_TOKEN_EMAIL_FALLBACK = os.environ.get("ALLOW_CONTEXT_TOKEN_EMAIL_FALLBACK", "false").lower() in ["1", "true", "yes"]
+_jwks_clients = {}
+
 from urllib.parse import quote_plus
 
 DB_USER = os.environ.get("DB_USER")
@@ -97,12 +153,16 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or SMTP_USERNAME
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "ProbeStack")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ["1", "true", "yes"]
+ZITADEL_PASSWORD_RESET_URL_TEMPLATE = os.environ.get(
+    "ZITADEL_PASSWORD_RESET_URL_TEMPLATE",
+    f"{APP_URL.rstrip('/')}/password-reset?userID={{.UserID}}&code={{.Code}}&orgID={{.OrgID}}",
+)
 
 DEFAULT_CORS_ORIGINS = [
     "https://probestack.io",
     "https://www.probestack.io",
     "https://community.probestack.io",
-    "http://community.probestack.io"
+    "http://community.probestack.io",
 ]
 CORS_ORIGINS = sorted({
     origin.strip().rstrip("/")
@@ -119,6 +179,7 @@ app = FastAPI()
 
 api_router = APIRouter(prefix="/admin-backend/api")
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -126,24 +187,24 @@ logger = logging.getLogger(__name__)
 
 class Auth0ManagementAPI:
     """Helper class for Auth0 Management API operations"""
-    if not all([
-        AUTH0_MGMT_CLIENT_ID,
-        AUTH0_MGMT_CLIENT_SECRET,
-        AUTH0_MGMT_DOMAIN,
-    ]):
-        raise RuntimeError("Auth0 Management API env vars missing")
-    
     def __init__(self):
         self.domain = AUTH0_MGMT_DOMAIN
         self.client_id = AUTH0_MGMT_CLIENT_ID
         self.client_secret = AUTH0_MGMT_CLIENT_SECRET
         self.connection = AUTH0_DB_CONNECTION_NAME
         self.connection_id = AUTH0_DB_CONNECTION_ID
+        self.enabled = bool(AUTH0_ENABLED and self.client_id and self.client_secret and self.domain)
         self._access_token = None
         self._token_expires_at = None
+
+    def _disabled_result(self, action: str) -> dict:
+        logger.info(f"Auth0 {action} skipped: Auth0 is disabled")
+        return {"success": False, "skipped": True, "error": "Auth0 is disabled"}
     
     async def _get_access_token(self) -> str:
         """Get or refresh Management API access token"""
+        if not self.enabled:
+            raise HTTPException(status_code=410, detail="Auth0 is disabled")
         if self._access_token and self._token_expires_at and datetime.now() < self._token_expires_at:
             return self._access_token
         
@@ -169,6 +230,8 @@ class Auth0ManagementAPI:
     
     async def create_user(self, email: str, name: str, user_metadata: dict = None) -> dict:
         """Create a new user in Auth0 with no password (user will set it later)"""
+        if not self.enabled:
+            return self._disabled_result("create user")
         token = await self._get_access_token()
         
         temp_password = secrets.token_urlsafe(32) + "Aa1!"
@@ -200,9 +263,120 @@ class Auth0ManagementAPI:
             else:
                 logger.error(f"Auth0 create user error: {response.text}")
                 return {"success": False, "error": response.text}
+
+    async def create_organization(self, name: str, metadata: dict = None) -> dict:
+        """Create an Auth0 organization and return its generated organization ID."""
+        if not self.enabled:
+            return self._disabled_result("create organization")
+        token = await self._get_access_token()
+
+        slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in (name or "").strip())
+        slug = "-".join(part for part in slug.split("-") if part)[:50] or f"org-{uuid.uuid4().hex[:8]}"
+        if len(slug) < 3:
+            slug = f"org-{slug}"[:50]
+        payload = {
+            "name": slug,
+            "display_name": name,
+            "metadata": {key: value for key, value in (metadata or {}).items() if value not in [None, ""]},
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/api/v2/organizations",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 201]:
+            data = response.json()
+            logger.info(f"Auth0 organization created: {name}")
+            return {"success": True, "auth0_org_id": data.get("id"), "data": data}
+        if response.status_code == 409:
+            logger.warning(f"Auth0 organization already exists: {name}")
+            return {"success": False, "exists": True, "error": response.text}
+
+        logger.error(f"Auth0 create organization error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def delete_organization(self, organization_id: str) -> dict:
+        """Delete an Auth0 organization by ID."""
+        if not self.enabled:
+            return self._disabled_result("delete organization")
+        if not organization_id:
+            return {"success": True, "skipped": True}
+        token = await self._get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"https://{self.domain}/api/v2/organizations/{organization_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 202, 204]:
+            logger.info(f"Auth0 organization deleted: {organization_id}")
+            return {"success": True}
+        if response.status_code == 404:
+            logger.info(f"Auth0 organization already missing: {organization_id}")
+            return {"success": True, "missing": True}
+
+        logger.error(f"Auth0 delete organization error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def add_connection_to_organization(self, organization_id: str) -> dict:
+        """Enable the configured database connection for an Auth0 organization."""
+        if not self.enabled:
+            return self._disabled_result("enable organization connection")
+        if not self.connection_id:
+            return {"success": False, "skipped": True, "error": "AUTH0_DB_CONNECTION_ID is not configured"}
+        token = await self._get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/api/v2/organizations/{organization_id}/enabled_connections",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "connection_id": self.connection_id,
+                    "assign_membership_on_login": False,
+                },
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 201]:
+            return {"success": True}
+        if response.status_code == 409 or "already" in response.text.lower():
+            return {"success": True, "exists": True}
+
+        logger.error(f"Auth0 enable organization connection error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def add_user_to_organization(self, organization_id: str, user_id: str) -> dict:
+        """Add an Auth0 user as a member of an Auth0 organization."""
+        if not self.enabled:
+            return self._disabled_result("add organization member")
+        token = await self._get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{self.domain}/api/v2/organizations/{organization_id}/members",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"members": [user_id]},
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 204]:
+            return {"success": True}
+        if response.status_code == 409 or "already" in response.text.lower():
+            return {"success": True, "exists": True}
+
+        logger.error(f"Auth0 add organization member error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
     
     async def get_user_by_email(self, email: str) -> dict:
         """Get user from Auth0 by email"""
+        if not self.enabled:
+            return self._disabled_result("get user")
         token = await self._get_access_token()
         
         async with httpx.AsyncClient() as client:
@@ -223,6 +397,8 @@ class Auth0ManagementAPI:
     
     async def update_user_password(self, user_id: str, password: str) -> dict:
         """Update user's password in Auth0"""
+        if not self.enabled:
+            return self._disabled_result("update password")
         token = await self._get_access_token()
         
         async with httpx.AsyncClient() as client:
@@ -241,6 +417,8 @@ class Auth0ManagementAPI:
     
     async def verify_user_email(self, user_id: str) -> dict:
         """Mark user's email as verified in Auth0"""
+        if not self.enabled:
+            return self._disabled_result("verify email")
         token = await self._get_access_token()
         
         async with httpx.AsyncClient() as client:
@@ -259,6 +437,8 @@ class Auth0ManagementAPI:
     
     async def send_verification_email(self, user_id: str) -> dict:
         """Send verification email to user"""
+        if not self.enabled:
+            return self._disabled_result("send verification email")
         token = await self._get_access_token()
         
         async with httpx.AsyncClient() as client:
@@ -277,6 +457,8 @@ class Auth0ManagementAPI:
     
     async def send_password_reset_email(self, email: str) -> dict:
         """Send password reset email to user via Auth0"""
+        if not self.enabled:
+            return self._disabled_result("send password reset email")
         # IMPORTANT: Must use the regular Auth0 application client_id (AUTH0_CLIENT_ID),
         # NOT the Management API client_id
         async with httpx.AsyncClient() as client:
@@ -301,6 +483,8 @@ class Auth0ManagementAPI:
         Authenticate a user against Auth0.
         Uses the Resource Owner Password Grant flow.
         """
+        if not self.enabled:
+            return self._disabled_result("authenticate user")
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"https://{self.domain}/oauth/token",
@@ -332,6 +516,375 @@ class Auth0ManagementAPI:
 # Initialize Auth0 Management API helper
 auth0_mgmt = Auth0ManagementAPI()
 
+class ZitadelManagementAPI:
+    """Helper class for Zitadel user-management operations."""
+
+    def __init__(self):
+        raw_domain = (ZITADEL_DOMAIN or "").strip().rstrip("/")
+        if raw_domain and not raw_domain.startswith(("http://", "https://")):
+            raw_domain = f"https://{raw_domain}"
+        self.base_url = raw_domain
+        self.client_id = ZITADEL_CLIENT_ID
+        self.client_secret = ZITADEL_CLIENT_SECRET
+        self.api_token = ZITADEL_API_TOKEN
+        self.default_org_id = ZITADEL_DEFAULT_ORG_ID
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url and self.api_token)
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _connect_headers(self) -> dict:
+        headers = self._headers()
+        headers["Connect-Protocol-Version"] = "1"
+        return headers
+
+    @staticmethod
+    def _name_parts(name: str) -> tuple[str, str]:
+        cleaned = (name or "").strip()
+        if not cleaned:
+            return "", ""
+        parts = cleaned.split()
+        if len(parts) == 1:
+            return parts[0], parts[0]
+        return parts[0], " ".join(parts[1:])
+
+    @staticmethod
+    def _metadata_entries(metadata: Optional[dict]) -> list[dict]:
+        entries = []
+        for key, value in (metadata or {}).items():
+            raw_value = value if isinstance(value, str) else json.dumps(value)
+            encoded = base64.b64encode(raw_value.encode("utf-8")).decode("ascii")
+            entries.append({"key": str(key), "value": encoded})
+        return entries
+
+    @staticmethod
+    def _extract_user_id(user_payload: dict) -> Optional[str]:
+        if not user_payload:
+            return None
+        return (
+            user_payload.get("userId")
+            or user_payload.get("id")
+            or user_payload.get("user", {}).get("userId")
+            or user_payload.get("human", {}).get("userId")
+        )
+
+    @staticmethod
+    def _extract_human(user_payload: dict) -> dict:
+        if not user_payload:
+            return {}
+        if user_payload.get("human"):
+            return user_payload["human"]
+        return user_payload.get("user", {}).get("human", {})
+
+    async def create_user(
+        self,
+        email: str,
+        name: str,
+        user_metadata: dict = None,
+        organization_id: Optional[str] = None,
+    ) -> dict:
+        """Create a human user in Zitadel and request email verification."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+
+        given_name, family_name = self._name_parts(name)
+        target_org_id = organization_id or self.default_org_id
+        payload = {
+            "username": email,
+            "human": {
+                "profile": {
+                    "givenName": given_name,
+                    "familyName": family_name,
+                    "displayName": name or email,
+                },
+                "email": {
+                    "email": email,
+                    "sendCode": {},
+                },
+                "metadata": self._metadata_entries(user_metadata),
+            },
+        }
+        if target_org_id:
+            payload["organizationId"] = target_org_id
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/users/new",
+                headers=self._headers(),
+                json=payload,
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 201]:
+            data = response.json()
+            logger.info(f"Zitadel user created: {email}")
+            return {
+                "success": True,
+                "zitadel_user_id": data.get("id") or data.get("userId"),
+                "verification_email_sent": True,
+                "data": data,
+            }
+
+        error_text = response.text
+        if response.status_code == 409 or "already" in error_text.lower():
+            logger.warning(f"Zitadel user already exists: {email}")
+            return {"success": False, "error": "User already exists in Zitadel", "exists": True}
+
+        logger.error(f"Zitadel create user error: {error_text}")
+        return {"success": False, "error": error_text}
+
+    async def create_organization(self, name: str, organization_id: Optional[str] = None) -> dict:
+        """Create a Zitadel organization and return its generated organization ID."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+
+        payload = {"name": name}
+        if organization_id:
+            payload["organizationId"] = organization_id
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/organizations",
+                headers=self._headers(),
+                json=payload,
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 201]:
+            data = response.json()
+            return {
+                "success": True,
+                "zitadel_org_id": data.get("organizationId") or data.get("orgId") or data.get("id"),
+                "data": data,
+            }
+
+        logger.error(f"Zitadel create organization error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def add_organization_domain(self, organization_id: str, domain: str) -> dict:
+        """Register an organization domain in Zitadel."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        cleaned_domain = (domain or "").strip().lower().lstrip("@")
+        if not cleaned_domain:
+            return {"success": False, "skipped": True, "error": "No organization domain provided"}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/organizations/{organization_id}/domains",
+                headers=self._headers(),
+                json={"domain": cleaned_domain},
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 201]:
+            return {"success": True, "domain": cleaned_domain}
+        if response.status_code == 409 or "already" in response.text.lower():
+            return {"success": True, "exists": True, "domain": cleaned_domain}
+
+        logger.warning(f"Zitadel add organization domain error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def assign_user_roles(
+        self,
+        user_id: str,
+        organization_id: str,
+        role_keys: list[str],
+        project_id: Optional[str] = None,
+    ) -> dict:
+        """Create a Zitadel role assignment for a user in the configured project."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        target_project_id = (project_id or ZITADEL_PROJECT_ID or "").strip()
+        cleaned_role_keys = [key for key in role_keys if key]
+        if not target_project_id:
+            return {"success": False, "skipped": True, "error": "ZITADEL_PROJECT_ID is not configured"}
+        if not user_id or not organization_id or not cleaned_role_keys:
+            return {"success": False, "skipped": True, "error": "user_id, organization_id, and role_keys are required"}
+
+        payload = {
+            "userId": user_id,
+            "projectId": target_project_id,
+            "organizationId": organization_id,
+            "roleKeys": cleaned_role_keys,
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/zitadel.authorization.v2.AuthorizationService/CreateAuthorization",
+                headers=self._connect_headers(),
+                json=payload,
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 201]:
+            data = response.json()
+            return {"success": True, "authorization_id": data.get("id"), "role_keys": cleaned_role_keys, "data": data}
+        if response.status_code == 409 or "already" in response.text.lower():
+            return {"success": True, "exists": True, "role_keys": cleaned_role_keys}
+
+        logger.warning(f"Zitadel role assignment error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code, "role_keys": cleaned_role_keys}
+
+    async def get_user_by_email(self, email: str, organization_id: Optional[str] = None) -> dict:
+        """Get a Zitadel user by exact email match."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+
+        queries = [{"emailQuery": {"emailAddress": email, "method": 1}}]
+        target_org_id = organization_id or self.default_org_id
+        if target_org_id:
+            queries.insert(0, {"organizationIdQuery": {"organizationId": target_org_id}})
+        payload = {
+            "query": {"offset": "0", "limit": 1, "asc": True},
+            "sortingColumn": "USER_FIELD_NAME_UNSPECIFIED",
+            "queries": queries,
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/users",
+                headers=self._headers(),
+                json=payload,
+                timeout=30.0,
+            )
+
+        if response.status_code == 200:
+            data = response.json()
+            users = data.get("result", [])
+            if users:
+                return {"success": True, "user": users[0]}
+            return {"success": False, "error": "User not found"}
+
+        logger.error(f"Zitadel get user error: {response.text}")
+        return {"success": False, "error": response.text}
+
+    async def get_user_by_id(self, user_id: str) -> dict:
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.base_url}/v2/users/{user_id}",
+                headers=self._headers(),
+                timeout=30.0,
+            )
+        if response.status_code == 200:
+            return {"success": True, "user": response.json().get("user", response.json())}
+        logger.error(f"Zitadel get user by ID error: {response.text}")
+        return {"success": False, "error": response.text}
+
+    async def update_user_password(self, user_id: str, password: str) -> dict:
+        """Set a user's password in Zitadel."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/users/{user_id}/password",
+                headers=self._headers(),
+                json={"password": password, "noChangeRequired": True},
+                timeout=30.0,
+            )
+        if response.status_code == 200:
+            logger.info(f"Zitadel password updated for user: {user_id}")
+            return {"success": True}
+        logger.error(f"Zitadel update password error: {response.text}")
+        return {"success": False, "error": response.text}
+
+    async def verify_user_email(self, user_id: str) -> dict:
+        """Mark a user's email as verified in Zitadel."""
+        user_result = await self.get_user_by_id(user_id)
+        if not user_result.get("success"):
+            return user_result
+        human = self._extract_human(user_result.get("user", {}))
+        email = human.get("email", {}).get("email")
+        if not email:
+            return {"success": False, "error": "Zitadel user email not found"}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{self.base_url}/v2/users/{user_id}",
+                headers=self._headers(),
+                json={"human": {"email": {"email": email, "isVerified": True}}},
+                timeout=30.0,
+            )
+        if response.status_code == 200:
+            logger.info(f"Zitadel email verified for user: {user_id}")
+            return {"success": True}
+        logger.error(f"Zitadel verify email error: {response.text}")
+        return {"success": False, "error": response.text}
+
+    async def send_verification_email(self, user_id: str) -> dict:
+        """Send or resend the Zitadel email verification code."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/users/{user_id}/email/send",
+                headers=self._headers(),
+                json={"sendCode": {}},
+                timeout=30.0,
+            )
+        if response.status_code == 200:
+            logger.info(f"Zitadel verification email sent to user: {user_id}")
+            return {"success": True}
+        logger.error(f"Zitadel send verification email error: {response.text}")
+        return {"success": False, "error": response.text}
+
+    async def send_password_reset_email(self, email: str) -> dict:
+        """Send a Zitadel password reset email."""
+        user_result = await self.get_user_by_email(email)
+        if not user_result.get("success"):
+            return user_result
+        user_id = self._extract_user_id(user_result.get("user", {}))
+        if not user_id:
+            return {"success": False, "error": "Zitadel user ID not found"}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/users/{user_id}/password_reset",
+                headers=self._headers(),
+                json={
+                    "sendLink": {
+                        "notificationType": "NOTIFICATION_TYPE_Email",
+                        "urlTemplate": ZITADEL_PASSWORD_RESET_URL_TEMPLATE,
+                    }
+                },
+                timeout=30.0,
+            )
+        if response.status_code == 200:
+            logger.info(f"Zitadel password reset email sent to: {email}")
+            return {"success": True}
+        logger.error(f"Zitadel send password reset email error: {response.text}")
+        return {"success": False, "error": response.text}
+
+    async def send_password_reset_email_by_user_id(self, user_id: str) -> dict:
+        """Send a Zitadel password reset email for a known user id."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/users/{user_id}/password_reset",
+                headers=self._headers(),
+                json={
+                    "sendLink": {
+                        "notificationType": "NOTIFICATION_TYPE_Email",
+                        "urlTemplate": ZITADEL_PASSWORD_RESET_URL_TEMPLATE,
+                    }
+                },
+                timeout=30.0,
+            )
+        if response.status_code == 200:
+            logger.info(f"Zitadel password reset email sent to user id: {user_id}")
+            return {"success": True}
+        logger.error(f"Zitadel send password reset email by ID error: {response.text}")
+        return {"success": False, "error": response.text}
+
+zitadel_mgmt = ZitadelManagementAPI()
+
 # ==================== DATABASE MODELS ====================
 
 class Base(DeclarativeBase):
@@ -349,6 +902,13 @@ class AdminModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)  # Who created this admin
+
+class SystemSettingModel(Base):
+    __tablename__ = "system_settings"
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    updated_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
 class OrganizationModel(Base):
     __tablename__ = "organizations"
@@ -371,6 +931,43 @@ class OrganizationModel(Base):
     external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True) 
     supported_domains: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     auth0_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    zitadel_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    organization_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    legal_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    industry: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    business_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    country: Mapped[Optional[str]] = mapped_column(String(2), nullable=True)
+    region: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    time_zone: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    headquarters: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    default_currency: Mapped[Optional[str]] = mapped_column(String(3), nullable=True)
+    billing_account: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    cost_center: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    tax_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    website: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    logo_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    primary_contact_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    executive_sponsor_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    technical_contact_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    security_contact_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    identity_provider: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    sso_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    scim_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mfa_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    default_api_gateway: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    default_ai_gateway: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    default_mcp_gateway: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    default_api_design_tool: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    default_api_testing_tool: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    api_agent_lifecycle_stage: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    default_api_inventory: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    cloud_provider: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    kubernetes_platform: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    default_environment_strategy: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    compliance_standards: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    encryption_standard: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    data_residency: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     gateway_region: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     gateway_organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     gateway_environment_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
@@ -389,6 +986,7 @@ class SubscriptionModel(Base):
     end_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     billing_cycle: Mapped[str] = mapped_column(String(50), default="monthly")
     amount: Mapped[float] = mapped_column(Float, nullable=False)
+    api_count: Mapped[Optional[int]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class SubscriptionToolModel(Base):
@@ -461,6 +1059,7 @@ class UserModel(Base):
     theme_preference: Mapped[str] = mapped_column(String(20), default="system")  # light, dark, system
     # Auth0 integration fields
     auth0_user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Auth0 user ID
+    zitadel_user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Zitadel user ID
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)  # Email verification status
     password_set: Mapped[bool] = mapped_column(Boolean, default=False)  # Has user set their password
     first_login_token: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -654,6 +1253,28 @@ class Auth0LoginRecordModel(Base):
     ip_address: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+class ZitadelLoginRecordModel(Base):
+    """Model for storing Zitadel login records"""
+    __tablename__ = "zitadel_login_records"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    organization_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    zitadel_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    zitadel_user_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    picture: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    access_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    refresh_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    id_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    token_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    expires_in: Mapped[Optional[int]] = mapped_column(nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    login_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ip_address: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
 class BusinessUnitModel(Base):
     """Business units owned by an approved organization."""
     __tablename__ = "business_units"
@@ -667,6 +1288,47 @@ class BusinessUnitModel(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    parent_business_unit_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    division: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    department: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    line_of_business: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    business_executive_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    business_owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    product_owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    technical_owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    enterprise_architect_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    platform_owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    security_owner_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    compliance_officer_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    support_team: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    operations_team: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    cost_center: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    chargeback_model: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    billing_account: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    monthly_budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    annual_budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ai_budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    api_budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    cloud_provider: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    region: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    kubernetes_cluster: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    namespace: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    api_gateway: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ai_gateway: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    logging_platform: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    monitoring_platform: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    secret_manager: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    approval_workflow: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    risk_classification: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    business_criticality: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    data_classification: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    regulatory_standards: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retention_policy: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    backup_policy: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    dr_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    sla_tier: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     application_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     application_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -698,8 +1360,147 @@ class ProjectModel(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    project_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    portfolio: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    project_manager_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    product_manager_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    scrum_master_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    technical_lead_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    security_lead_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    devops_lead_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    methodology: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    sprint_duration: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    repository: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    cicd_tool: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    issue_tracker: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    documentation_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    authentication_method: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    authorization_method: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    oauth_provider: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    mtls_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    jwt_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    api_key_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    secrets_vault: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    pci_applicable: Mapped[bool] = mapped_column(Boolean, default=False)
+    standard_rules: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    custom_rules: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    owasp_top10_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    linting_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(50), default="active")
     created_by: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("admins.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class ProjectEnvironmentModel(Base):
+    __tablename__ = "project_environments"
+    __table_args__ = (
+        UniqueConstraint("project_id", "environment_type", name="uq_project_environments_project_type"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    environment_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    endpoint_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class ApplicationModel(Base):
+    __tablename__ = "applications"
+    __table_args__ = (
+        UniqueConstraint("project_id", "application_name", name="uq_applications_project_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
+    application_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    business_capability: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    application_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    criticality: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    runtime: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    language: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    framework: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    version: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    container_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    kubernetes_namespace: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    cluster: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    api_count: Mapped[int] = mapped_column(default=0)
+    api_gateway: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    base_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    openapi_spec_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    asyncapi_spec_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    graphql_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    webhooks_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    llm_provider: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    default_model: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    embedding_model: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ai_gateway: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    vector_database: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    prompt_registry: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    mcp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mcp_server: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    mcp_resources: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    mcp_tools: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    mcp_prompts: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("admins.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+class ApplicationAgentModel(Base):
+    __tablename__ = "application_agents"
+    application_id: Mapped[str] = mapped_column(String(36), ForeignKey("applications.id", ondelete="CASCADE"), primary_key=True)
+    agent_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    planner: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    executor: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    memory: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    knowledge_base: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    multi_agent_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    workflow: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+class ApplicationMonitoringModel(Base):
+    __tablename__ = "application_monitoring"
+    application_id: Mapped[str] = mapped_column(String(36), ForeignKey("applications.id", ondelete="CASCADE"), primary_key=True)
+    logging: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    metrics: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    tracing: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    alerts: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    dashboards: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+class ApplicationSecurityModel(Base):
+    __tablename__ = "application_security"
+    application_id: Mapped[str] = mapped_column(String(36), ForeignKey("applications.id", ondelete="CASCADE"), primary_key=True)
+    oauth_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    jwt_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    api_key_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mtls_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    dlp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    waf_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    encryption_standard: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+class ApplicationBillingModel(Base):
+    __tablename__ = "application_billing"
+    application_id: Mapped[str] = mapped_column(String(36), ForeignKey("applications.id", ondelete="CASCADE"), primary_key=True)
+    cost_center: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    monthly_budget: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    token_budget: Mapped[Optional[int]] = mapped_column(nullable=True)
+    api_budget: Mapped[Optional[int]] = mapped_column(nullable=True)
+
+class QuotaModel(Base):
+    __tablename__ = "quotas"
+    __table_args__ = (
+        UniqueConstraint("entity_type", "entity_id", "quota_type", name="uq_quotas_entity_type"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    entity_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    quota_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    quota_limit: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    quota_used: Mapped[float] = mapped_column(Float, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -759,17 +1560,26 @@ class SubscriptionUpdateRequest(BaseModel):
     plan_selections: List[PlanSelectionItem]  # Plans with their tools
     billing_cycle: Optional[str] = "monthly"  # monthly or yearly
 
+class SubscriptionApiCountUpdate(BaseModel):
+    api_count: Optional[int] = None
+
+class SubscriptionBillingSettingsUpdate(BaseModel):
+    api_count: Optional[int] = None
+    amount: Optional[float] = None
+
 class OrganizationCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str
     email: str
-    domain: Optional[str] = None
+    domain: str
     requested_plans: Optional[List[Any]] = None
     requested_tools: Optional[List[str]] = None
     plans: Optional[List[Any]] = None
     contact_person: str
-    phone: Optional[str] = None
-    address: Optional[str] = None
-    description: Optional[str] = None
+    phone: str
+    address: str
+    description: str
     gateway_region: Optional[str] = None
     gateway_organization_name: Optional[str] = None
     gateway_environment_type: Optional[str] = None
@@ -777,24 +1587,30 @@ class OrganizationCreate(BaseModel):
 
 class OrganizationRequest(BaseModel):
     """Schema for external API requests to register an organization"""
+    model_config = ConfigDict(extra="allow")
+
     name: str
     email: str
-    domain: Optional[str] = None
+    domain: str
     plan_ids: Optional[List[str]] = None  # Legacy list of Plan IDs like ["plan_forgeq_enterprise"]
     selected_tools: Optional[List[str]] = None  # Legacy flat list of selected tool IDs/names
     plans: Optional[List[Any]] = None  # New product-plan payload from /public/plans
     requested_plans: Optional[List[Any]] = None  # Alternate product-plan payload key
     contact_person: str
-    contact_phone: Optional[str] = None
-    company_address: Optional[str] = None
+    contact_phone: str
+    company_address: str
     additional_notes: Optional[str] = None
-    description: Optional[str] = None
+    description: str
     gateway_region: Optional[str] = None
     gateway_organization_name: Optional[str] = None
     gateway_environment_type: Optional[str] = None
     gateway_environments: Optional[List[str]] = None
+    identity_provider: Optional[str] = None
+    skip_auth0: Optional[bool] = False
 
 class OrganizationUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: Optional[str] = None
     email: Optional[str] = None
     domain: Optional[str] = None
@@ -803,6 +1619,7 @@ class OrganizationUpdate(BaseModel):
     external_org_id: Optional[str] = None
     supported_domains: Optional[List[str]] = None
     auth0_org_id: Optional[str] = None  # Auth0 organization ID
+    zitadel_org_id: Optional[str] = None  # Zitadel organization ID
     gateway_region: Optional[str] = None
     gateway_organization_name: Optional[str] = None
     gateway_environment_type: Optional[str] = None
@@ -816,17 +1633,44 @@ class Auth0InitRequest(BaseModel):
     """Request to initiate Auth0 authentication"""
     email: str
     state: Optional[str] = None  # Optional state parameter for CSRF protection
+    product: Optional[str] = "probestack"
+    redirect_uri: Optional[str] = None
     
 class Auth0CallbackRequest(BaseModel):
     """Request to exchange Auth0 code for tokens"""
     code: str
     email: Optional[str] = None  # Original email for logging purposes
+    product: Optional[str] = "probestack"
+    redirect_uri: Optional[str] = None
+
+class ZitadelInitRequest(BaseModel):
+    """Request to initiate Zitadel authentication with one shared app."""
+    email: str
+    state: Optional[str] = None
+    product: Optional[str] = "probestack"
+    redirect_uri: Optional[str] = None
+
+class ZitadelCallbackRequest(BaseModel):
+    """Request to exchange Zitadel code for tokens."""
+    code: str
+    email: Optional[str] = None
+    product: Optional[str] = "probestack"
+    redirect_uri: Optional[str] = None
+
+class ZitadelRefreshTokenRequest(BaseModel):
+    """Request to refresh Zitadel user tokens."""
+    refresh_token: str
 
 class UserContextTokenRequest(BaseModel):
     """Request to issue a ProbeStack user-context token after probestack.io login."""
     email: Optional[str] = None
     auth0_user_id: Optional[str] = None
+    zitadel_user_id: Optional[str] = None
+    identity_provider: Optional[str] = None
     id_token: Optional[str] = None
+
+class IdentityProviderUpdate(BaseModel):
+    provider: str
 
 class PasswordResetRequest(BaseModel):
     """Request to reset password"""
@@ -919,8 +1763,12 @@ class UserRequestCreate(BaseModel):
     department: Optional[str] = None
     phone: Optional[str] = None
     notes: Optional[str] = None
+    identity_provider: Optional[str] = None
+    skip_auth0: Optional[bool] = False
 
 class BusinessUnitCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str
     code: Optional[str] = None
     description: Optional[str] = None
@@ -939,6 +1787,8 @@ class BusinessUnitCreate(BaseModel):
     status: Optional[str] = "active"
 
 class BusinessUnitUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: Optional[str] = None
     code: Optional[str] = None
     description: Optional[str] = None
@@ -957,6 +1807,8 @@ class BusinessUnitUpdate(BaseModel):
     status: Optional[str] = None
 
 class ProjectCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str
     business_unit_id: Optional[str] = None
     code: Optional[str] = None
@@ -964,6 +1816,8 @@ class ProjectCreate(BaseModel):
     status: Optional[str] = "active"
 
 class ProjectUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: Optional[str] = None
     business_unit_id: Optional[str] = None
     code: Optional[str] = None
@@ -975,11 +1829,25 @@ class ProjectTeamInviteCreate(BaseModel):
     project_role: Optional[str] = "member"
 
 class ExternalProjectCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str
     business_unit_id: str
     code: Optional[str] = None
     description: Optional[str] = None
     status: Optional[str] = "active"
+
+class ApplicationCreate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    project_id: str
+    application_name: str
+
+class ApplicationUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    project_id: Optional[str] = None
+    application_name: Optional[str] = None
 
 # ==================== HELPERS ====================
 
@@ -991,12 +1859,12 @@ async def sync_user_from_auth0(
     allow_status_activation: bool = True
 ) -> bool:
     """
-    Synchronize user state from Auth0 into local DB.
+    Synchronize user state from external identity providers into local DB.
 
     Rules:
-    - Auth0 is source of truth for email_verified
-    - If Auth0 has email_verified=True → DB is updated
-    - If Auth0 user exists → password_set=True
+    - Auth0/Zitadel are sources of truth for email_verified
+    - If either provider has email_verified=True → DB is updated
+    - If either provider user exists → password_set=True
     - Clears first_login_token when account becomes active
     - Safe to call multiple times (idempotent)
 
@@ -1005,38 +1873,49 @@ async def sync_user_from_auth0(
         False -> no changes
     """
 
-    # No Auth0 user → nothing to sync
-    if not user.auth0_user_id:
+    # No external identity user → nothing to sync
+    if not user.auth0_user_id and not user.zitadel_user_id:
         return False
 
-    try:
-        auth0_result = await auth0_mgmt.get_user_by_email(user.email)
-    except Exception as e:
-        logger.warning(f"Auth0 sync skipped for {user.email}: {e}")
-        return False
-
-    if not auth0_result.get("success"):
-        return False
-
-    auth0_user = auth0_result.get("user", {})
     updated = False
 
-    # ----------------------------
-    # Email verification sync
-    # ----------------------------
-    auth0_email_verified = auth0_user.get("email_verified")
+    if user.auth0_user_id:
+        try:
+            auth0_result = await auth0_mgmt.get_user_by_email(user.email)
+        except Exception as e:
+            logger.warning(f"Auth0 sync skipped for {user.email}: {e}")
+            auth0_result = {"success": False}
 
-    if auth0_email_verified and not user.email_verified:
-        user.email_verified = True
-        updated = True
+        if auth0_result.get("success"):
+            auth0_user = auth0_result.get("user", {})
+            auth0_email_verified = auth0_user.get("email_verified")
 
-    # ----------------------------
-    # Password existence sync
-    # ----------------------------
-    # If Auth0 user exists, password must exist
-    if allow_password_sync and not user.password_set:
-        user.password_set = True
-        updated = True
+            if auth0_email_verified and not user.email_verified:
+                user.email_verified = True
+                updated = True
+
+            if allow_password_sync and not user.password_set:
+                user.password_set = True
+                updated = True
+
+    if user.zitadel_user_id:
+        try:
+            zitadel_result = await zitadel_mgmt.get_user_by_id(user.zitadel_user_id)
+        except Exception as e:
+            logger.warning(f"Zitadel sync skipped for {user.email}: {e}")
+            zitadel_result = {"success": False}
+
+        if zitadel_result.get("success"):
+            human = zitadel_mgmt._extract_human(zitadel_result.get("user", {}))
+            zitadel_email_verified = human.get("email", {}).get("isVerified")
+
+            if zitadel_email_verified and not user.email_verified:
+                user.email_verified = True
+                updated = True
+
+            if allow_password_sync and not user.password_set:
+                user.password_set = True
+                updated = True
 
     # ----------------------------
     # Status activation
@@ -1078,6 +1957,183 @@ def model_to_dict(model, json_fields=None):
             value = value.isoformat()
         result[column.name] = value
     return result
+
+ORGANIZATION_ONBOARDING_FIELDS = [
+    "organization_code", "legal_name", "industry", "business_type", "country", "region",
+    "time_zone", "headquarters", "default_currency", "billing_account", "cost_center",
+    "tax_id", "website", "logo_url", "primary_contact_id", "executive_sponsor_id",
+    "technical_contact_id", "security_contact_id", "identity_provider", "sso_enabled",
+    "scim_enabled", "mfa_required", "default_api_gateway", "default_ai_gateway",
+    "default_mcp_gateway", "default_api_design_tool", "default_api_testing_tool",
+    "api_agent_lifecycle_stage", "default_api_inventory", "cloud_provider",
+    "kubernetes_platform", "default_environment_strategy", "compliance_standards",
+    "encryption_standard", "data_residency",
+]
+
+BUSINESS_UNIT_ONBOARDING_FIELDS = [
+    "display_name", "parent_business_unit_id", "division", "department", "line_of_business",
+    "business_executive_id", "business_owner_id", "product_owner_id", "technical_owner_id",
+    "enterprise_architect_id", "platform_owner_id", "security_owner_id", "compliance_officer_id",
+    "support_team", "operations_team", "cost_center", "budget", "chargeback_model",
+    "billing_account", "monthly_budget", "annual_budget", "ai_budget", "api_budget",
+    "cloud_provider", "region", "kubernetes_cluster", "namespace", "api_gateway",
+    "ai_gateway", "logging_platform", "monitoring_platform", "secret_manager",
+    "approval_workflow", "risk_classification", "business_criticality", "data_classification",
+    "regulatory_standards", "retention_policy", "backup_policy", "dr_enabled", "sla_tier",
+]
+BUSINESS_UNIT_QUOTA_FIELDS = {
+    "api_calls_quota": "api_calls",
+    "ai_tokens_quota": "ai_tokens",
+    "storage_quota": "storage",
+    "compute_hours_quota": "compute_hours",
+    "agent_runtime_quota": "agent_runtime",
+    "mcp_connections_quota": "mcp_connections",
+}
+
+PROJECT_ONBOARDING_FIELDS = [
+    "project_type", "portfolio", "project_manager_id", "product_manager_id", "scrum_master_id",
+    "technical_lead_id", "security_lead_id", "devops_lead_id", "methodology", "sprint_duration",
+    "repository", "cicd_tool", "issue_tracker", "documentation_url", "authentication_method",
+    "authorization_method", "oauth_provider", "mtls_enabled", "jwt_enabled", "api_key_enabled",
+    "secrets_vault", "pci_applicable", "standard_rules", "custom_rules", "owasp_top10_enabled",
+    "linting_enabled",
+]
+PROJECT_ENVIRONMENT_TYPES = ["Dev", "QA", "UAT", "Performance", "Stage", "Production"]
+
+APPLICATION_FIELDS = [
+    "application_name", "display_name", "description", "business_capability", "domain",
+    "application_type", "criticality", "runtime", "language", "framework", "version",
+    "container_image", "kubernetes_namespace", "cluster", "api_count", "api_gateway",
+    "base_url", "openapi_spec_url", "asyncapi_spec_url", "graphql_enabled",
+    "webhooks_enabled", "llm_provider", "default_model", "embedding_model", "ai_gateway",
+    "vector_database", "prompt_registry", "mcp_enabled", "mcp_server", "mcp_resources",
+    "mcp_tools", "mcp_prompts",
+]
+
+APPLICATION_AGENT_FIELDS = [
+    "agent_enabled", "planner", "executor", "memory", "knowledge_base", "multi_agent_enabled", "workflow",
+]
+APPLICATION_MONITORING_FIELDS = ["logging", "metrics", "tracing", "alerts", "dashboards"]
+APPLICATION_SECURITY_FIELDS = [
+    "oauth_enabled", "jwt_enabled", "api_key_enabled", "mtls_enabled", "dlp_enabled",
+    "waf_enabled", "encryption_standard",
+]
+APPLICATION_BILLING_FIELDS = ["cost_center", "monthly_budget", "token_budget", "api_budget"]
+
+TEXT_LIST_FIELDS = {"compliance_standards", "regulatory_standards", "mcp_resources", "mcp_tools", "mcp_prompts"}
+BOOL_FIELDS = {
+    "sso_enabled", "scim_enabled", "mfa_required", "dr_enabled", "mtls_enabled", "jwt_enabled",
+    "api_key_enabled", "pci_applicable", "owasp_top10_enabled", "linting_enabled",
+    "graphql_enabled", "webhooks_enabled", "mcp_enabled", "agent_enabled", "multi_agent_enabled",
+    "oauth_enabled", "dlp_enabled", "waf_enabled",
+}
+NUMBER_FIELDS = {
+    "budget", "monthly_budget", "annual_budget", "ai_budget", "api_budget", "api_count", "token_budget",
+    *BUSINESS_UNIT_QUOTA_FIELDS.keys(),
+}
+PROJECT_STATUS_VALUES = {"active", "inactive", "pending", "on_hold", "completed", "archived"}
+
+def payload_dict(data: BaseModel, *, exclude_unset: bool = False) -> dict:
+    payload = data.model_dump(exclude_unset=exclude_unset)
+    payload.update(getattr(data, "model_extra", None) or {})
+    return payload
+
+def normalize_onboarding_value(key: str, value: Any) -> Any:
+    if key in TEXT_LIST_FIELDS and isinstance(value, list):
+        return json.dumps(value)
+    if key in BOOL_FIELDS:
+        return bool(value)
+    if key in NUMBER_FIELDS and value in ["", None]:
+        return None
+    if key in NUMBER_FIELDS:
+        try:
+            return int(value) if key in {"api_count", "token_budget", "api_budget"} else float(value)
+        except (TypeError, ValueError):
+            return value
+    if isinstance(value, str):
+        return value.strip() or None
+    return value
+
+def apply_onboarding_fields(model: Any, payload: dict, allowed_fields: list[str]):
+    for key in allowed_fields:
+        if key in payload:
+            setattr(model, key, normalize_onboarding_value(key, payload.get(key)))
+
+def validate_required_organization_create_fields(payload: dict):
+    required_fields = {
+        "name": "Organization name",
+        "email": "Email",
+        "domain": "Domain",
+        "contact_person": "Contact person",
+        "description": "Description",
+    }
+    missing = [
+        label
+        for key, label in required_fields.items()
+        if not str(payload.get(key) or "").strip()
+    ]
+    if not str(payload.get("phone") or payload.get("contact_phone") or "").strip():
+        missing.append("Contact phone")
+    if not str(payload.get("address") or payload.get("company_address") or "").strip():
+        missing.append("Company address")
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Required fields missing: {', '.join(missing)}")
+
+def add_identity_aliases(data: dict, entity: str) -> dict:
+    if entity == "organization":
+        data["organization_id"] = data.get("id")
+        data["organization_name"] = data.get("name")
+    elif entity == "business_unit":
+        data["business_unit_id"] = data.get("id")
+        data["business_unit_name"] = data.get("name")
+        data["business_unit_code"] = data.get("code")
+    elif entity == "project":
+        data["project_id"] = data.get("id")
+        data["project_name"] = data.get("name")
+        data["project_code"] = data.get("code")
+    elif entity == "application":
+        data["application_id"] = data.get("id")
+    return data
+
+async def project_to_dict(db: AsyncSession, project: ProjectModel) -> dict:
+    data = add_identity_aliases(model_to_dict(project), "project")
+    env_result = await db.execute(
+        select(ProjectEnvironmentModel)
+        .where(ProjectEnvironmentModel.project_id == project.id)
+        .order_by(ProjectEnvironmentModel.environment_type.asc())
+    )
+    environments = {}
+    for env in env_result.scalars().all():
+        key = env.environment_type.lower().replace(" ", "_")
+        environments[key] = {
+            "environment_type": env.environment_type,
+            "endpoint_url": env.endpoint_url,
+            "is_enabled": env.is_enabled,
+        }
+        data[f"{key}_endpoint_url"] = env.endpoint_url
+        data[f"{key}_enabled"] = env.is_enabled
+    data["environments"] = environments
+    return data
+
+async def business_unit_to_dict(db: AsyncSession, business_unit: BusinessUnitModel) -> dict:
+    data = add_identity_aliases(model_to_dict(business_unit, ["tags", "regulatory_standards"]), "business_unit")
+    result = await db.execute(
+        select(QuotaModel).where(
+            QuotaModel.entity_type == "business_unit",
+            QuotaModel.entity_id == business_unit.id,
+        )
+    )
+    quota_key_by_type = {quota_type: field_key for field_key, quota_type in BUSINESS_UNIT_QUOTA_FIELDS.items()}
+    data["quotas"] = {}
+    for quota in result.scalars().all():
+        field_key = quota_key_by_type.get(quota.quota_type)
+        if field_key:
+            data[field_key] = quota.quota_limit
+        data["quotas"][quota.quota_type] = {
+            "limit": quota.quota_limit,
+            "used": quota.quota_used,
+        }
+    return data
 
 async def get_organization_name(db: AsyncSession, organization_id: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
     if not organization_id:
@@ -1289,8 +2345,21 @@ STANDARD_ROLE_DEFINITIONS = [
 STANDARD_ROLE_NAMES = [role["name"] for role in STANDARD_ROLE_DEFINITIONS]
 STANDARD_ROLE_NAME_LOOKUP = {role["name"].lower(): role for role in STANDARD_ROLE_DEFINITIONS}
 
+def normalize_token_value(value: Optional[str], fallback: str = "member") -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in (value or "").strip())
+    normalized = "_".join(part for part in normalized.split("_") if part)
+    return normalized or fallback
+
+STANDARD_ROLE_SLUG_LOOKUP = {
+    normalize_token_value(role["name"], "role"): role
+    for role in STANDARD_ROLE_DEFINITIONS
+}
+
 def standard_role_slug(name: str) -> str:
     return normalize_token_value(name, "role")
+
+def zitadel_role_key_for_role(role_name: Optional[str]) -> str:
+    return standard_role_slug(map_to_standard_role_name(role_name, "API/Agent Consumer"))
 
 def standard_role_id(role_name: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"probestack-role:global:{standard_role_slug(role_name)}"))
@@ -1307,13 +2376,40 @@ def map_to_standard_role_name(role_name: Optional[str], fallback: str = "Read-On
     normalized = role_name.strip().lower()
     if normalized in STANDARD_ROLE_NAME_LOOKUP:
         return STANDARD_ROLE_NAME_LOOKUP[normalized]["name"]
+    normalized_slug = normalize_token_value(role_name, "role")
+    if normalized_slug in STANDARD_ROLE_SLUG_LOOKUP:
+        return STANDARD_ROLE_SLUG_LOOKUP[normalized_slug]["name"]
     legacy_mapping = {
         "admin": "Org Admin / Owner",
         "org admin": "Org Admin / Owner",
         "org_admin": "Org Admin / Owner",
+        "orgadmin": "Org Admin / Owner",
+        "organization admin": "Org Admin / Owner",
+        "organization_admin": "Org Admin / Owner",
         "owner": "Org Admin / Owner",
+        "bu admin": "Business Unit Admin",
+        "bu_admin": "Business Unit Admin",
+        "business unit admin": "Business Unit Admin",
+        "business_unit_admin": "Business Unit Admin",
+        "project admin": "Project Admin",
+        "project_admin": "Project Admin",
         "developer": "Designer",
         "designer": "Designer",
+        "api provider": "Designer",
+        "api_provider": "Designer",
+        "provider": "Designer",
+        "lifecycle owner": "Platform/Lifecycle Owner",
+        "platform owner": "Platform/Lifecycle Owner",
+        "qa": "QA / Test Engineer",
+        "test engineer": "QA / Test Engineer",
+        "qa engineer": "QA / Test Engineer",
+        "platform engineer": "Platform Engineer",
+        "devops": "DevOps / Release Engineer",
+        "release engineer": "DevOps / Release Engineer",
+        "security engineer": "Security Engineer / AppSec",
+        "appsec": "Security Engineer / AppSec",
+        "gateway admin": "Org Admin / Owner",
+        "gateway_admin": "Org Admin / Owner",
         "viewer": "Read-Only / Auditor",
         "read only": "Read-Only / Auditor",
         "read-only": "Read-Only / Auditor",
@@ -1321,8 +2417,143 @@ def map_to_standard_role_name(role_name: Optional[str], fallback: str = "Read-On
         "user": "API/Agent Consumer",
         "member": "API/Agent Consumer",
         "individual user": "API/Agent Consumer",
+        "api consumer": "API/Agent Consumer",
+        "api_consumer": "API/Agent Consumer",
+        "consumer": "API/Agent Consumer",
+        "ai engineer": "Designer",
+        "ai_engineer": "Designer",
     }
     return legacy_mapping.get(normalized, fallback)
+
+def onboarding_org_identifier_candidates(org: Optional[OrganizationModel]) -> List[str]:
+    if not org:
+        return []
+    raw_values = [
+        getattr(org, "id", None),
+        getattr(org, "external_org_id", None),
+        getattr(org, "auth0_org_id", None),
+        getattr(org, "zitadel_org_id", None),
+        getattr(org, "organization_code", None),
+        getattr(org, "name", None),
+    ]
+    candidates = []
+    seen = set()
+    for value in raw_values:
+        normalized = str(value).strip() if value is not None else ""
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(normalized)
+    return candidates
+
+def infer_onboarding_role_from_flags(developer: dict) -> Optional[str]:
+    if developer.get("gatewayAdmin"):
+        return "gateway admin"
+    if developer.get("apiProvider"):
+        return "api provider"
+    if developer.get("aiEngineer"):
+        return "ai engineer"
+    if developer.get("apiConsumer"):
+        return "api consumer"
+    return None
+
+def get_mongodb_client():
+    global _mongodb_client
+    if _mongodb_client is not None:
+        return _mongodb_client
+    if not MONGODB_ROLE_LOOKUP_ENABLED or not MONGODB_URI:
+        return None
+    try:
+        from motor.motor_asyncio import AsyncIOMotorClient
+    except Exception as exc:
+        logger.warning("MongoDB role lookup disabled because motor is unavailable: %s", exc)
+        return None
+    _mongodb_client = AsyncIOMotorClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    return _mongodb_client
+
+async def find_onboarding_developer_role(email: str, org: Optional[OrganizationModel]) -> Optional[dict]:
+    client = get_mongodb_client()
+    if not client or not email:
+        return None
+
+    normalized_email = email.strip().lower()
+    collection = client[MONGODB_DATABASE][MONGODB_DEVELOPERS_COLLECTION]
+    email_filter = {"email": {"$in": list({email.strip(), normalized_email})}}
+    org_candidates = onboarding_org_identifier_candidates(org)
+    queries = []
+    if org_candidates:
+        queries.append({"$and": [email_filter, {"organizationId": {"$in": org_candidates}}]})
+    if MONGODB_ROLE_LOOKUP_EMAIL_ONLY:
+        queries.append(email_filter)
+
+    for query in queries:
+        try:
+            developer = await collection.find_one(query, sort=[("updatedAt", -1), ("createdAt", -1)])
+        except Exception as exc:
+            logger.warning("MongoDB onboarding role lookup failed for %s: %s", normalized_email, exc)
+            return None
+        if developer:
+            raw_role = developer.get("role") or infer_onboarding_role_from_flags(developer)
+            if raw_role:
+                standard_role = map_to_standard_role_name(raw_role, "API/Agent Consumer")
+                return {
+                    "source": "mongodb",
+                    "developer_id": str(developer.get("_id") or developer.get("id") or ""),
+                    "organization_id": developer.get("organizationId"),
+                    "raw_role": raw_role,
+                    "standard_role": standard_role,
+                }
+    return None
+
+async def resolve_new_user_role(
+    db: AsyncSession,
+    org: Optional[OrganizationModel],
+    email: str,
+    requested_role: Optional[RoleModel] = None,
+    fallback_role_name: str = "API/Agent Consumer",
+) -> tuple[RoleModel, Optional[dict]]:
+    lookup = await find_onboarding_developer_role(email, org)
+    if lookup:
+        role = await get_standard_role(db, org.id if org else "unknown", lookup["standard_role"])
+        return role, lookup
+    if requested_role:
+        return requested_role, None
+    role = await get_standard_role(db, org.id if org else "unknown", fallback_role_name)
+    return role, None
+
+async def get_user_organization(db: AsyncSession, user: Optional[UserModel]) -> Optional[OrganizationModel]:
+    if not user or not user.organization_id or user.organization_id == "no_organization":
+        return None
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == user.organization_id))
+    return result.scalar_one_or_none()
+
+async def sync_user_role_from_mongodb(
+    db: AsyncSession,
+    user: Optional[UserModel],
+    org: Optional[OrganizationModel] = None,
+) -> Optional[dict]:
+    """Refresh a local user's role from the onboarding MongoDB developer record."""
+    if not user or not user.email:
+        return None
+
+    org = org or await get_user_organization(db, user)
+    lookup = await find_onboarding_developer_role(user.email, org)
+    if not lookup:
+        return None
+
+    role = await get_standard_role(db, org.id if org else (user.organization_id or "unknown"), lookup["standard_role"])
+    changed = user.role_id != role.id or user.role_name != role.name
+    if changed:
+        user.role_id = role.id
+        user.role_name = role.name
+        await db.commit()
+        await db.refresh(user)
+
+    return {
+        **lookup,
+        "role_id": role.id,
+        "role_name": role.name,
+        "changed": changed,
+    }
 
 async def ensure_standard_roles_for_organization(db: AsyncSession, organization_id: Optional[str] = None) -> List[RoleModel]:
     roles = []
@@ -1552,7 +2783,7 @@ def normalize_tool_values(values: Any) -> List[str]:
     return tools
 
 def normalize_organization_plan_selections(data: Any) -> List[PlanSelectionItem]:
-    raw_plans = data.plans or data.requested_plans or []
+    raw_plans = getattr(data, "plans", None) or getattr(data, "requested_plans", None) or []
     selections_by_plan = {}
 
     for raw_plan in raw_plans:
@@ -1580,8 +2811,9 @@ def normalize_organization_plan_selections(data: Any) -> List[PlanSelectionItem]
             if tool not in selections_by_plan[plan_id]:
                 selections_by_plan[plan_id].append(tool)
 
-    if not selections_by_plan and data.plan_ids:
-        for plan_id in data.plan_ids:
+    plan_ids = getattr(data, "plan_ids", None) or []
+    if not selections_by_plan and plan_ids:
+        for plan_id in plan_ids:
             selections_by_plan.setdefault(plan_id, [])
 
     return [
@@ -1636,6 +2868,13 @@ async def get_subscription_tools(db: AsyncSession, subscription: SubscriptionMod
         elif row.tool_key:
             tool_names.append(row.tool_key)
     return tool_names
+
+def valid_subscription_query():
+    return (
+        select(SubscriptionModel)
+        .join(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(PlanModel.is_active == True, PlanModel.product_id.is_not(None))
+    )
 
 def is_real_organization(org: Optional[OrganizationModel]) -> bool:
     return bool(org and org.id != "no_organization" and org.name != "Individual Users")
@@ -1700,6 +2939,91 @@ async def calculate_plan_total(db: AsyncSession, plan: PlanModel, tools: List[st
                 detail=f"Tool '{tool}' is not available for plan '{plan.id}'"
             )
     return float(getattr(plan, "cost", None) or plan.price_monthly or 0)
+
+def get_plan_tier(plan: Optional[PlanModel]) -> str:
+    if not plan:
+        return "unknown"
+    plan_text = f"{plan.id or ''} {plan.name or ''}".lower().replace("_", " ")
+    if "starter" in plan_text:
+        return "starter"
+    if "enterprise - plus" in plan_text or "enterprise plus" in plan_text or "enterprise plus" in plan_text.replace("-", " "):
+        return "enterprise_plus"
+    if "enterprise" in plan_text:
+        return "enterprise"
+    return "unknown"
+
+def plan_unit_price(plan: PlanModel, billing_cycle: str = "monthly") -> float:
+    if billing_cycle == "yearly":
+        return float(plan.price_yearly or plan.cost or plan.price_monthly or 0)
+    return float(plan.price_monthly or plan.cost or 0)
+
+def is_per_user_plan(plan: Optional[PlanModel]) -> bool:
+    if not plan:
+        return False
+    billing_text = f"{plan.billing_period or ''} {plan.price_label or ''}".lower()
+    return "user" in billing_text or "seat" in billing_text
+
+async def get_billable_user_count(db: AsyncSession, organization_id: str) -> int:
+    result = await db.execute(
+        select(func.count())
+        .select_from(UserModel)
+        .where(UserModel.organization_id == organization_id)
+        .where(UserModel.status == "active")
+    )
+    return int(result.scalar() or 0)
+
+async def calculate_subscription_invoice_amount(
+    db: AsyncSession,
+    subscription: SubscriptionModel,
+    plan: Optional[PlanModel] = None,
+) -> float:
+    if plan is None:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == subscription.plan_id))
+        plan = plan_result.scalar_one_or_none()
+
+    tier = get_plan_tier(plan)
+    if tier == "starter":
+        return 0.0
+    if tier == "enterprise_plus":
+        return float(subscription.amount or 0)
+    if tier == "enterprise" and plan:
+        if is_per_user_plan(plan):
+            user_count = 1 if subscription.organization_id == "no_organization" else await get_billable_user_count(db, subscription.organization_id)
+            return float(user_count * plan_unit_price(plan, subscription.billing_cycle))
+        return float(subscription.amount or plan_unit_price(plan, subscription.billing_cycle))
+    return float(subscription.amount or 0)
+
+def add_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+def get_subscription_billing_period(subscription: SubscriptionModel, now: datetime) -> tuple[Optional[datetime], Optional[datetime]]:
+    start = subscription.start_date
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if start > now:
+        return None, None
+
+    months_per_period = 12 if subscription.billing_cycle == "yearly" else 1
+    months_elapsed = (now.year - start.year) * 12 + (now.month - start.month)
+    period_index = max(0, months_elapsed // months_per_period)
+    cycle_start = add_months(start, period_index * months_per_period)
+    if cycle_start > now and period_index > 0:
+        period_index -= 1
+        cycle_start = add_months(start, period_index * months_per_period)
+    cycle_end = add_months(cycle_start, months_per_period)
+
+    end = subscription.end_date
+    if end and end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if end and cycle_start >= end:
+        return None, None
+    return cycle_start, cycle_end
 
 async def sync_organization_requested_from_active_subscriptions(db: AsyncSession, organization_id: str):
     org = await get_organization_by_id(db, organization_id)
@@ -1949,9 +3273,12 @@ async def admin_to_dict(db: AsyncSession, admin: AdminModel) -> dict:
     return data
 
 async def user_to_dict(db: AsyncSession, user: UserModel) -> dict:
+    mongodb_role_lookup = await sync_user_role_from_mongodb(db, user)
     data = model_to_dict(user)
     data["organization_name"] = await get_organization_name(db, user.organization_id, user.organization_name)
     data["role_name"] = await get_role_name(db, user.role_id, user.role_name)
+    if mongodb_role_lookup:
+        data["mongodb_role_lookup"] = mongodb_role_lookup
     return data
 
 async def user_access_summary_to_dict(
@@ -1961,12 +3288,115 @@ async def user_access_summary_to_dict(
     business_units: Optional[List[dict]] = None,
 ) -> dict:
     """Return the compact organization/BU/team role summary for one user."""
+    mongodb_role_lookup = await sync_user_role_from_mongodb(db, user)
+    if mongodb_role_lookup:
+        role = None
     return {
         "user_name": user.name,
         "user_email": user.email,
         "org_role": role.name if role else await get_role_name(db, user.role_id, user.role_name),
         "business_units": business_units or [],
+        "mongodb_role_lookup": mongodb_role_lookup,
     }
+
+async def public_user_detail_to_dict(
+    db: AsyncSession,
+    user: UserModel,
+    role: Optional[RoleModel] = None,
+    business_units: Optional[List[dict]] = None,
+) -> dict:
+    """Public product-integration user shape without one-time login tokens."""
+    role_name = role.name if role else await get_role_name(db, user.role_id, user.role_name)
+    role_permissions = parse_json_list(role.permissions) if role and role.permissions else []
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "organization_id": user.organization_id,
+        "organization_name": await get_organization_name(db, user.organization_id, user.organization_name),
+        "role_id": user.role_id,
+        "role_name": role_name,
+        "org_role": role_name,
+        "role": normalize_token_value(role_name, "user"),
+        "role_permissions": role_permissions,
+        "status": user.status,
+        "email_verified": bool(user.email_verified),
+        "password_set": bool(user.password_set),
+        "auth0_user_id": user.auth0_user_id,
+        "zitadel_user_id": user.zitadel_user_id,
+        "assigned_project_ids": parse_json_list(getattr(user, "assigned_project_ids", None)),
+        "assigned_apm_numbers": parse_json_list(getattr(user, "assigned_apm_numbers", None)),
+        "theme_preference": getattr(user, "theme_preference", "system"),
+        "last_login": user.last_login.isoformat() if user.last_login else None,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "business_units": business_units or [],
+    }
+
+async def get_public_organization_users(db: AsyncSession, organization_id: str) -> List[dict]:
+    user_result = await db.execute(
+        select(UserModel, RoleModel)
+        .outerjoin(RoleModel, UserModel.role_id == RoleModel.id)
+        .where(UserModel.organization_id == organization_id)
+        .order_by(UserModel.created_at.desc())
+    )
+    user_rows = user_result.all()
+    users_by_id = {}
+    users_by_email = {}
+    user_ids = []
+    user_emails = []
+    for user, role in user_rows:
+        entry = {
+            "user": user,
+            "role": role,
+            "business_units_by_id": {},
+        }
+        users_by_id[user.id] = entry
+        users_by_email[user.email.lower()] = entry
+        user_ids.append(user.id)
+        user_emails.append(user.email)
+
+    if user_rows:
+        member_result = await db.execute(
+            select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
+            .join(ProjectModel, ProjectTeamMemberModel.project_id == ProjectModel.id)
+            .outerjoin(BusinessUnitModel, ProjectModel.business_unit_id == BusinessUnitModel.id)
+            .where(
+                ProjectTeamMemberModel.organization_id == organization_id,
+                ProjectModel.organization_id == organization_id,
+                (
+                    ProjectTeamMemberModel.user_id.in_(user_ids)
+                    | ProjectTeamMemberModel.email.in_(user_emails)
+                ),
+            )
+            .order_by(BusinessUnitModel.name.asc(), ProjectModel.name.asc())
+        )
+        for member, project, business_unit in member_result.all():
+            entry = users_by_id.get(member.user_id) or users_by_email.get((member.email or "").lower())
+            if not entry or not business_unit:
+                continue
+            bu_entry = entry["business_units_by_id"].setdefault(
+                business_unit.id,
+                {
+                    "bu_name": business_unit.name,
+                    "bu_role": "member",
+                    "projects": [],
+                },
+            )
+            if not any(item["project_name"] == project.name for item in bu_entry["projects"]):
+                bu_entry["projects"].append({
+                    "project_name": project.name,
+                    "project_role": member.project_role,
+                })
+
+    return [
+        await public_user_detail_to_dict(
+            db,
+            entry["user"],
+            entry["role"],
+            list(entry["business_units_by_id"].values()),
+        )
+        for entry in users_by_id.values()
+    ]
 
 async def subscription_to_dict(db: AsyncSession, subscription: SubscriptionModel) -> dict:
     data = model_to_dict(subscription, ["tools"])
@@ -1975,6 +3405,11 @@ async def subscription_to_dict(db: AsyncSession, subscription: SubscriptionModel
     plan = plan_result.scalar_one_or_none()
     product = await get_plan_product(db, plan) if plan else None
     data["plan_name"] = plan.name if plan else await get_plan_name(db, subscription.plan_id, subscription.plan_name)
+    data["plan_tier"] = get_plan_tier(plan)
+    data["billable_users"] = 1 if subscription.organization_id == "no_organization" else await get_billable_user_count(db, subscription.organization_id)
+    data["is_per_user"] = is_per_user_plan(plan)
+    data["billing_unit_price"] = plan_unit_price(plan, subscription.billing_cycle) if plan else float(subscription.amount or 0)
+    data["billing_amount"] = await calculate_subscription_invoice_amount(db, subscription, plan)
     if product:
         data["product_id"] = product.id
         data["product_key"] = product.key
@@ -1985,6 +3420,52 @@ async def subscription_to_dict(db: AsyncSession, subscription: SubscriptionModel
         data["product_name"] = None
     data["tools"] = await get_subscription_tools(db, subscription)
     return data
+
+async def get_organization_api_capacity(db: AsyncSession, organization_id: str) -> Optional[int]:
+    result = await db.execute(
+        select(SubscriptionModel.api_count).where(
+            SubscriptionModel.organization_id == organization_id,
+            SubscriptionModel.status == "active",
+            SubscriptionModel.api_count.is_not(None),
+        )
+    )
+    api_counts = [count for count in result.scalars().all() if count is not None]
+    return sum(api_counts) if api_counts else None
+
+async def get_organization_api_usage(
+    db: AsyncSession,
+    organization_id: str,
+    *,
+    exclude_application_id: Optional[str] = None,
+) -> int:
+    query = select(func.coalesce(func.sum(ApplicationModel.api_count), 0)).where(
+        ApplicationModel.organization_id == organization_id
+    )
+    if exclude_application_id:
+        query = query.where(ApplicationModel.id != exclude_application_id)
+    return int(await db.scalar(query) or 0)
+
+async def ensure_organization_api_capacity(
+    db: AsyncSession,
+    organization_id: str,
+    requested_api_count: int,
+    *,
+    exclude_application_id: Optional[str] = None,
+):
+    capacity = await get_organization_api_capacity(db, organization_id)
+    if capacity is None:
+        return
+    used = await get_organization_api_usage(
+        db,
+        organization_id,
+        exclude_application_id=exclude_application_id,
+    )
+    requested_total = used + max(requested_api_count or 0, 0)
+    if requested_total > capacity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"API count limit exceeded. Subscribed capacity is {capacity}, current usage is {used}, requested total is {requested_total}.",
+        )
 
 async def get_active_subscriptions_for_identity(
     db: AsyncSession,
@@ -2058,19 +3539,9 @@ async def build_subscription_context(db: AsyncSession, subscriptions: List[Subsc
 
 def context_project_payload(project: ProjectModel, role: str, member: Optional[ProjectTeamMemberModel] = None) -> dict:
     payload = {
-        "id": project.id,
-        "name": project.name,
-        "code": project.code,
-        "description": project.description,
-        "status": project.status,
-        "business_unit_id": project.business_unit_id,
-        "role": role,
+        "project_name": project.name,
         "project_role": role,
     }
-    if member:
-        payload["membership_id"] = member.id
-        payload["membership_status"] = member.status
-        payload["accepted_at"] = member.accepted_at.isoformat() if member.accepted_at else None
     return payload
 
 async def build_business_unit_context(
@@ -2100,10 +3571,11 @@ async def build_business_unit_context(
             .order_by(BusinessUnitModel.name.asc())
         )
         for business_unit in bu_result.scalars().all():
-            bu_data = model_to_dict(business_unit, ["tags"])
-            bu_data["role"] = "admin"
-            bu_data["business_unit_role"] = "admin"
-            bu_data["projects"] = []
+            bu_data = {
+                "bu_name": business_unit.name,
+                "bu_role": "admin",
+                "projects": [],
+            }
             business_units_by_id[business_unit.id] = bu_data
 
         project_result = await db.execute(
@@ -2139,7 +3611,6 @@ async def build_business_unit_context(
         .where(
             ProjectTeamMemberModel.organization_id == organization_id,
             ((ProjectTeamMemberModel.user_id == user.id) | (ProjectTeamMemberModel.email == user.email)),
-            ProjectTeamMemberModel.status == "active",
         )
         .order_by(BusinessUnitModel.name.asc(), ProjectModel.name.asc())
     )
@@ -2150,10 +3621,11 @@ async def build_business_unit_context(
 
         if business_unit:
             if business_unit.id not in business_units_by_id:
-                bu_data = model_to_dict(business_unit, ["tags"])
-                bu_data["role"] = "member"
-                bu_data["business_unit_role"] = "member"
-                bu_data["projects"] = []
+                bu_data = {
+                    "bu_name": business_unit.name,
+                    "bu_role": "member",
+                    "projects": [],
+                }
                 business_units_by_id[business_unit.id] = bu_data
             business_units_by_id[business_unit.id]["projects"].append(project_data)
         else:
@@ -2165,13 +3637,22 @@ async def build_business_unit_context(
         "projects_without_business_unit": projects_without_business_unit,
     }
 
-async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_id: Optional[str] = None) -> dict:
+async def build_user_context(
+    db: AsyncSession,
+    email: Optional[str],
+    auth0_user_id: Optional[str] = None,
+    zitadel_user_id: Optional[str] = None,
+) -> dict:
     normalized_email = email.lower().strip() if email else None
     user = None
     admin = None
 
     if auth0_user_id:
         result = await db.execute(select(UserModel).where(UserModel.auth0_user_id == auth0_user_id))
+        user = result.scalar_one_or_none()
+
+    if not user and zitadel_user_id:
+        result = await db.execute(select(UserModel).where(UserModel.zitadel_user_id == zitadel_user_id))
         user = result.scalar_one_or_none()
 
     if not user and normalized_email:
@@ -2191,6 +3672,8 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
     if organization_id and organization_id != "no_organization":
         org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == organization_id))
         organization = org_result.scalar_one_or_none()
+
+    mongodb_role_lookup = await sync_user_role_from_mongodb(db, user, organization) if user else None
 
     role = None
     role_permissions = []
@@ -2221,6 +3704,8 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
         user.last_login = now
         if auth0_user_id and not user.auth0_user_id:
             user.auth0_user_id = auth0_user_id
+        if zitadel_user_id and not user.zitadel_user_id:
+            user.zitadel_user_id = zitadel_user_id
         await db.flush()
 
     is_org_admin = bool(admin and admin.role == "org_admin")
@@ -2237,6 +3722,7 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
             "theme_preference": getattr(user or admin, "theme_preference", "system"),
             "email_verified": user.email_verified if user else True,
             "auth0_user_id": user.auth0_user_id if user else auth0_user_id,
+            "zitadel_user_id": user.zitadel_user_id if user else zitadel_user_id,
             "created_at": (user.created_at if user else admin.created_at).isoformat() if (user or admin) else None,
         },
         "organization": {
@@ -2244,6 +3730,7 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
             "name": organization.name if organization else await get_organization_name(db, organization_id, None),
             "external_org_id": organization.external_org_id if organization else None,
             "auth0_org_id": organization.auth0_org_id if organization else None,
+            "zitadel_org_id": organization.zitadel_org_id if organization else None,
             "status": organization.status if organization else None,
             "supported_domains": parse_json_list(organization.supported_domains) if organization and organization.supported_domains else [],
         } if organization_id else None,
@@ -2252,6 +3739,7 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
             "name": role.name if role else (admin.role if admin else None),
             "permissions": role_permissions,
         },
+        "org_role_name": role.name if role else (admin.role if admin else None),
         "admin": {
             "id": admin.id,
             "role": admin.role,
@@ -2262,6 +3750,7 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
         "is_org_admin": is_org_admin,
         "is_super_admin": is_super_admin,
         "permissions": permissions,
+        "mongodb_role_lookup": mongodb_role_lookup,
         "business_units": business_unit_context["business_units"],
         "projects": business_unit_context["projects"],
         "projects_without_business_unit": business_unit_context["projects_without_business_unit"],
@@ -2269,11 +3758,6 @@ async def build_user_context(db: AsyncSession, email: Optional[str], auth0_user_
         "plans": subscription_context["plans"],
         "tools": subscription_context["tools"],
     }
-
-def normalize_token_value(value: Optional[str], fallback: str = "member") -> str:
-    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in (value or "").strip())
-    normalized = "_".join(part for part in normalized.split("_") if part)
-    return normalized or fallback
 
 def normalize_scoped_role(role: Optional[str], scope: str, is_admin_scope: bool = False) -> str:
     role_key = normalize_token_value(role, "member")
@@ -2294,31 +3778,31 @@ def build_role_assignments_claim(user_context: dict) -> dict:
     role_assignments = {
         "organization": {
             "name": organization.get("name"),
-            "key": organization.get("external_org_id") or organization.get("auth0_org_id") or organization.get("id"),
+            "key": organization.get("external_org_id") or organization.get("auth0_org_id") or organization.get("zitadel_org_id") or organization.get("id"),
             "role": normalize_scoped_role(organization_role, "org", is_org_admin),
         },
         "business_units": [],
     }
 
     for business_unit in user_context.get("business_units") or []:
-        bu_is_admin = is_org_admin or business_unit.get("role") == "admin" or business_unit.get("business_unit_role") == "admin"
+        bu_role = business_unit.get("bu_role") or business_unit.get("business_unit_role") or business_unit.get("role")
+        bu_is_admin = is_org_admin or bu_role == "admin"
         bu_claim = {
-            "name": business_unit.get("name"),
-            "code": business_unit.get("code"),
+            "name": business_unit.get("bu_name") or business_unit.get("name"),
             "role": normalize_scoped_role(
-                business_unit.get("business_unit_role") or business_unit.get("role"),
+                bu_role,
                 "bu",
                 bu_is_admin,
             ),
             "projects": [],
         }
         for project in business_unit.get("projects") or []:
-            project_is_admin = is_org_admin or project.get("role") == "admin" or project.get("project_role") == "admin"
+            project_role = project.get("project_role") or project.get("role")
+            project_is_admin = is_org_admin or project_role == "admin"
             bu_claim["projects"].append({
-                "name": project.get("name"),
-                "code": project.get("code"),
+                "name": project.get("project_name") or project.get("name"),
                 "role": normalize_scoped_role(
-                    project.get("project_role") or project.get("role"),
+                    project_role,
                     "project",
                     project_is_admin,
                 ),
@@ -2329,11 +3813,9 @@ def build_role_assignments_claim(user_context: dict) -> dict:
         project_is_admin = is_org_admin or project.get("role") == "admin" or project.get("project_role") == "admin"
         role_assignments["business_units"].append({
             "name": None,
-            "code": None,
             "role": "member",
             "projects": [{
-                "name": project.get("name"),
-                "code": project.get("code"),
+                "name": project.get("project_name") or project.get("name"),
                 "role": normalize_scoped_role(
                     project.get("project_role") or project.get("role"),
                     "project",
@@ -2365,6 +3847,17 @@ def build_entitlements_claim(user_context: dict) -> dict:
 
 def build_user_context_token_claims(user_context: dict, issued_at: int, expires_at: int) -> dict:
     user = user_context["user"]
+    organization = user_context.get("organization") or {}
+    admin = user_context.get("admin") or {}
+    org_role = user_context.get("org_role") or {}
+
+    if user_context.get("is_super_admin"):
+        token_role = "super_admin"
+    elif user_context.get("is_org_admin"):
+        token_role = "org_admin"
+    else:
+        token_role = normalize_token_value(org_role.get("name"), "user")
+
     return {
         "iss": PROBESTACK_TOKEN_ISSUER,
         "aud": PROBESTACK_TOKEN_AUDIENCE,
@@ -2372,6 +3865,13 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "email": user["email"],
         "name": user.get("name") or user["email"],
         "type": "user",
+        "role": token_role,
+        "organization_id": organization.get("id"),
+        "organization_name": organization.get("name"),
+        "admin_id": admin.get("id"),
+        "is_admin": bool(user_context.get("is_admin")),
+        "is_org_admin": bool(user_context.get("is_org_admin")),
+        "is_super_admin": bool(user_context.get("is_super_admin")),
         "role_assignments": build_role_assignments_claim(user_context),
         "entitlements": build_entitlements_claim(user_context),
         "token_type": "probestack_user_context",
@@ -2408,7 +3908,10 @@ async def user_request_to_dict(db: AsyncSession, request: UserRequestModel) -> d
     return data
 
 async def organization_to_dict(db: AsyncSession, org: OrganizationModel) -> dict:
-    data = model_to_dict(org, ["requested_tools", "supported_domains", "gateway_environments"])
+    data = add_identity_aliases(
+        model_to_dict(org, ["requested_tools", "supported_domains", "gateway_environments", "compliance_standards"]),
+        "organization",
+    )
     requested_details = await get_organization_requested_plan_details(db, org)
     if requested_details:
         data["requested_plan"] = json.dumps([detail["plan_id"] for detail in requested_details])
@@ -2417,7 +3920,86 @@ async def organization_to_dict(db: AsyncSession, org: OrganizationModel) -> dict
         for detail in requested_details:
             data["requested_tools"].extend(detail.get("tools", []))
         data["requested_plan_details"] = requested_details
+
+    active_subs_result = await db.execute(
+        select(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == org.id)
+        .where(SubscriptionModel.status == "active")
+        .order_by(SubscriptionModel.created_at.desc())
+    )
+    active_subscriptions = active_subs_result.scalars().all()
+    active_plan_details = []
+    for subscription in active_subscriptions:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == subscription.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        product = await get_plan_product(db, plan) if plan else None
+        active_plan_details.append({
+            "subscription_id": subscription.id,
+            "plan_id": subscription.plan_id,
+            "plan_name": plan.name if plan else subscription.plan_name,
+            "product_id": product.id if product else (plan.product_id if plan else None),
+            "product_key": product.key if product else (plan.tool if plan else None),
+            "product_name": product.name if product else None,
+            "amount": subscription.amount,
+            "status": subscription.status,
+        })
+    data["active_plan_details"] = active_plan_details
+    data["active_plans"] = [detail["plan_id"] for detail in active_plan_details if detail.get("plan_id")]
+    if active_plan_details:
+        data["plan_display"] = ", ".join(
+            [
+                f"{detail.get('product_name') or detail.get('product_key') or 'Product'} - {detail.get('plan_name') or detail.get('plan_id')}"
+                for detail in active_plan_details
+            ]
+        )
+    elif requested_details:
+        data["plan_display"] = ", ".join(
+            [
+                f"{detail.get('product_name') or 'Product'} - {detail.get('plan_name') or detail.get('plan_id')}"
+                for detail in requested_details
+            ]
+        )
+    else:
+        data["plan_display"] = "No active plan"
     return data
+
+async def public_organization_to_dict(db: AsyncSession, org: OrganizationModel) -> dict:
+    data = await organization_to_dict(db, org)
+    return {
+        "id": data.get("id"),
+        "name": data.get("name"),
+        "external_org_id": data.get("external_org_id"),
+        "domain": data.get("domain"),
+        "status": data.get("status"),
+        "organization_code": data.get("organization_code"),
+        "industry": data.get("industry"),
+        "country": data.get("country"),
+        "region": data.get("region"),
+        "website": data.get("website"),
+        "logo_url": data.get("logo_url"),
+        "plan_display": data.get("plan_display"),
+        "active_plan_details": [
+            {
+                "subscription_id": detail.get("subscription_id"),
+                "plan_id": detail.get("plan_id"),
+                "plan_name": detail.get("plan_name"),
+                "product_id": detail.get("product_id"),
+                "product_key": detail.get("product_key"),
+                "product_name": detail.get("product_name"),
+                "status": detail.get("status"),
+            }
+            for detail in data.get("active_plan_details") or []
+        ],
+        "requested_plan_details": [
+            {
+                "plan_id": detail.get("plan_id"),
+                "plan_name": detail.get("plan_name"),
+                "product_id": detail.get("product_id"),
+                "product_name": detail.get("product_name"),
+            }
+            for detail in data.get("requested_plan_details") or []
+        ],
+    }
 
 async def upgrade_request_to_dict(db: AsyncSession, request: PlanUpgradeRequestModel) -> dict:
     data = model_to_dict(request, ["requested_tools"])
@@ -2447,12 +4029,97 @@ def create_token(admin_id: str, email: str, role: str, organization_id: Optional
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_aud": False},
+        )
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+def optional_verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security)):
+    if not credentials:
+        return None
+    return verify_token(credentials)
+
+def normalized_issuer_url(value: str) -> str:
+    issuer = (value or "").strip().rstrip("/")
+    if issuer and not issuer.startswith(("http://", "https://")):
+        issuer = f"https://{issuer}"
+    return issuer
+
+def expected_provider_issuer(provider: str) -> str:
+    if provider == "auth0":
+        return normalized_issuer_url(AUTH0_DOMAIN)
+    if provider == "zitadel":
+        return normalized_issuer_url(ZITADEL_DOMAIN)
+    return ""
+
+def expected_provider_audience(provider: str) -> str:
+    if provider == "auth0":
+        return AUTH0_CLIENT_ID
+    if provider == "zitadel":
+        return ZITADEL_CLIENT_ID
+    return ""
+
+def infer_identity_provider_from_issuer(issuer: str, requested_provider: Optional[str] = None) -> str:
+    provider = normalize_identity_provider(requested_provider) if requested_provider else ""
+    normalized_issuer = normalized_issuer_url(issuer).lower()
+    if provider in SUPPORTED_IDENTITY_PROVIDERS:
+        return provider
+    if "zitadel" in normalized_issuer:
+        return "zitadel"
+    return "auth0"
+
+def get_jwks_client(issuer: str):
+    normalized_issuer = normalized_issuer_url(issuer)
+    if not normalized_issuer:
+        raise HTTPException(status_code=401, detail="id_token issuer is missing")
+    jwks_url = f"{normalized_issuer}/.well-known/jwks.json"
+    if jwks_url not in _jwks_clients:
+        _jwks_clients[jwks_url] = jwt.PyJWKClient(jwks_url)
+    return _jwks_clients[jwks_url]
+
+def verify_provider_id_token(id_token: str, requested_provider: Optional[str] = None) -> tuple[dict, str]:
+    try:
+        unverified = jwt.decode(id_token, options={"verify_signature": False})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id_token")
+
+    issuer_claim = (unverified.get("iss") or "").strip()
+    issuer = normalized_issuer_url(issuer_claim)
+    provider = infer_identity_provider_from_issuer(issuer, requested_provider)
+    expected_issuer = expected_provider_issuer(provider)
+    audience = expected_provider_audience(provider)
+
+    if expected_issuer and issuer != expected_issuer:
+        raise HTTPException(status_code=401, detail=f"id_token issuer does not match configured {provider} issuer")
+    if not audience:
+        raise HTTPException(status_code=500, detail=f"{provider} client ID is not configured")
+
+    try:
+        signing_key = get_jwks_client(issuer).get_signing_key_from_jwt(id_token).key
+        decoded = jwt.decode(
+            id_token,
+            signing_key,
+            algorithms=["RS256", "ES256"],
+            audience=audience,
+            issuer=issuer_claim or issuer,
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="id_token expired")
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid id_token: {str(exc)}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Unable to verify id_token: {str(exc)}")
+
+    return decoded, provider
 
 def require_super_admin(payload: dict = Depends(verify_token)):
     """Dependency to require super_admin role"""
@@ -2466,9 +4133,159 @@ def require_any_admin(payload: dict = Depends(verify_token)):
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload
 
+async def get_subscription_access_scope(db: AsyncSession, payload: dict) -> dict:
+    """Resolve what subscriptions this token is allowed to read."""
+    if payload.get("role") == "super_admin" and payload.get("token_type") != "probestack_user_context":
+        return {"scope": "all"}
+
+    if payload.get("role") == "org_admin" and payload.get("organization_id"):
+        return {"scope": "organization", "organization_id": payload.get("organization_id")}
+
+    subject = payload.get("sub")
+    email = (payload.get("email") or "").strip().lower()
+
+    user = None
+    if subject:
+        result = await db.execute(select(UserModel).where(UserModel.id == subject))
+        user = result.scalar_one_or_none()
+    if not user and email:
+        result = await db.execute(select(UserModel).where(UserModel.email == email))
+        user = result.scalar_one_or_none()
+
+    if user:
+        await sync_user_role_from_mongodb(db, user)
+        if user.organization_id == "no_organization":
+            return {"scope": "individual", "email": user.email}
+        return {"scope": "organization", "organization_id": user.organization_id}
+
+    admin = None
+    if subject:
+        result = await db.execute(select(AdminModel).where(AdminModel.id == subject))
+        admin = result.scalar_one_or_none()
+    if not admin and email:
+        result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+        admin = result.scalar_one_or_none()
+
+    if admin and admin.role == "super_admin":
+        return {"scope": "all"}
+    if admin and admin.organization_id:
+        return {"scope": "organization", "organization_id": admin.organization_id}
+
+    raise HTTPException(status_code=403, detail="No subscription access for this token")
+
+async def get_authenticated_data_scope(db: AsyncSession, payload: dict) -> dict:
+    """Resolve the organization/email scope for a verified admin or product user token."""
+    if payload.get("role") == "super_admin" and payload.get("token_type") != "probestack_user_context":
+        return {"scope": "all"}
+
+    if payload.get("role") == "org_admin" and payload.get("organization_id"):
+        return {"scope": "organization", "organization_id": payload.get("organization_id")}
+
+    subject = payload.get("sub")
+    email = (payload.get("email") or "").strip().lower()
+
+    user = None
+    if subject:
+        result = await db.execute(select(UserModel).where(UserModel.id == subject))
+        user = result.scalar_one_or_none()
+    if not user and email:
+        result = await db.execute(select(UserModel).where(UserModel.email == email))
+        user = result.scalar_one_or_none()
+    if user:
+        await sync_user_role_from_mongodb(db, user)
+        if user.organization_id == "no_organization":
+            return {"scope": "individual", "email": user.email}
+        return {"scope": "organization", "organization_id": user.organization_id}
+
+    admin = None
+    if subject:
+        result = await db.execute(select(AdminModel).where(AdminModel.id == subject))
+        admin = result.scalar_one_or_none()
+    if not admin and email:
+        result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+        admin = result.scalar_one_or_none()
+    if admin and admin.role == "super_admin":
+        return {"scope": "all"}
+    if admin and admin.organization_id:
+        return {"scope": "organization", "organization_id": admin.organization_id}
+
+    raise HTTPException(status_code=403, detail="No data access for this token")
+
+def has_data_scope_access(access_scope: dict, *, email: Optional[str], organization_id: Optional[str]) -> bool:
+    if access_scope["scope"] == "all":
+        return True
+    if access_scope["scope"] == "organization":
+        return bool(organization_id and organization_id == access_scope.get("organization_id"))
+    if access_scope["scope"] == "individual":
+        return bool(email and email.strip().lower() == access_scope.get("email"))
+    return False
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+def normalize_identity_provider(provider: Optional[str]) -> str:
+    normalized = (provider or DEFAULT_IDENTITY_PROVIDER).strip().lower()
+    if normalized in {"auth0", "auth-0"}:
+        return "auth0"
+    if normalized in {"zitadel", "zitadel_only", "zitadel-only"}:
+        return "zitadel"
+    raise HTTPException(status_code=400, detail="Identity provider must be auth0 or zitadel")
+
+async def get_active_identity_provider(db: AsyncSession) -> str:
+    result = await db.execute(
+        select(SystemSettingModel).where(SystemSettingModel.key == IDENTITY_PROVIDER_SETTING_KEY)
+    )
+    setting = result.scalar_one_or_none()
+    if not setting:
+        return DEFAULT_IDENTITY_PROVIDER
+    return normalize_identity_provider(setting.value)
+
+def identity_provider_config(provider: str) -> dict:
+    provider = normalize_identity_provider(provider)
+    if provider == "auth0":
+        return {
+            "provider": "auth0",
+            "configured": auth0_mgmt.enabled,
+            "domain": AUTH0_DOMAIN,
+            "management_domain": AUTH0_MGMT_DOMAIN,
+            "organization_mode": "organizations",
+        }
+    return {
+        "provider": "zitadel",
+        "configured": zitadel_mgmt.enabled,
+        "domain": zitadel_mgmt.base_url,
+        "organization_mode": "organizations",
+    }
+
+def require_identity_provider_configured(provider: str):
+    config = identity_provider_config(provider)
+    if not config["configured"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{provider.upper()} is selected but not configured",
+        )
+
+async def set_active_identity_provider(db: AsyncSession, provider: str, updated_by: Optional[str] = None) -> SystemSettingModel:
+    provider = normalize_identity_provider(provider)
+    require_identity_provider_configured(provider)
+    result = await db.execute(
+        select(SystemSettingModel).where(SystemSettingModel.key == IDENTITY_PROVIDER_SETTING_KEY)
+    )
+    setting = result.scalar_one_or_none()
+    if not setting:
+        setting = SystemSettingModel(
+            key=IDENTITY_PROVIDER_SETTING_KEY,
+            value=provider,
+            updated_by=updated_by,
+        )
+        db.add(setting)
+    else:
+        setting.value = provider
+        setting.updated_by = updated_by
+        setting.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    return setting
 
 async def get_approved_org_for_admin(payload: dict, db: AsyncSession) -> OrganizationModel:
     """Return the approved organization for the current org admin."""
@@ -2566,7 +4383,12 @@ def get_org_allowed_domains(org: OrganizationModel) -> List[str]:
         domains.append(domain if domain.startswith("@") else f"@{domain}")
     return sorted(set(domains))
 
+def is_individual_users_org(org: Optional[OrganizationModel]) -> bool:
+    return bool(org and (org.id == "no_organization" or org.name == "Individual Users"))
+
 def assert_email_allowed_for_org(email: str, org: OrganizationModel):
+    if is_individual_users_org(org):
+        return
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail=f"Invalid email address: {email}")
     email_domain = "@" + email.split("@", 1)[1].lower()
@@ -2578,6 +4400,134 @@ def assert_email_allowed_for_org(email: str, org: OrganizationModel):
             status_code=400,
             detail=f"Email {email} is not allowed. Allowed domains: {', '.join(allowed_domains)}"
         )
+
+async def find_real_org_by_email_domain(db: AsyncSession, email: str) -> Optional[OrganizationModel]:
+    if not email or "@" not in email:
+        return None
+    email_domain = "@" + email.split("@", 1)[1].lower()
+    result = await db.execute(
+        select(OrganizationModel).where(
+            OrganizationModel.status == "approved",
+            OrganizationModel.id != "no_organization",
+            OrganizationModel.name != "Individual Users",
+        )
+    )
+    for org in result.scalars().all():
+        if email_domain in get_org_allowed_domains(org):
+            return org
+    return None
+
+async def get_or_create_individual_users_org(db: AsyncSession) -> OrganizationModel:
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == "no_organization"))
+    org = result.scalar_one_or_none()
+    if org:
+        return org
+    org = OrganizationModel(
+        id="no_organization",
+        name="Individual Users",
+        email="individual@probestack.io",
+        domain=None,
+        status="approved",
+        requested_plan="plan_forgeq_starter",
+        requested_tools=json.dumps([]),
+        contact_person="System",
+        approved_at=datetime.now(timezone.utc),
+    )
+    db.add(org)
+    await db.flush()
+    return org
+
+async def get_default_individual_plan(db: AsyncSession) -> PlanModel:
+    preferred_ids = [
+        os.environ.get("DEFAULT_INDIVIDUAL_PLAN_ID"),
+        "plan_forgeq_starter",
+        "plan_agentic_ai_starter",
+    ]
+    for plan_id in [pid for pid in preferred_ids if pid]:
+        result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
+        plan = result.scalar_one_or_none()
+        if plan:
+            return plan
+    result = await db.execute(
+        select(PlanModel)
+        .where(PlanModel.is_active == True)
+        .where(PlanModel.name.ilike("%starter%"))
+        .order_by(PlanModel.cost.asc(), PlanModel.created_at.asc())
+    )
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=400, detail="No active starter plan is configured for individual users")
+    return plan
+
+async def create_individual_request_for_unknown_domain(
+    db: AsyncSession,
+    *,
+    email: str,
+    name: str,
+    job_title: Optional[str] = None,
+    phone: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> IndividualUserRequestModel:
+    await get_or_create_individual_users_org(db)
+    plan = await get_default_individual_plan(db)
+    existing = await db.execute(
+        select(IndividualUserRequestModel).where(
+            IndividualUserRequestModel.email == email,
+            IndividualUserRequestModel.status == "pending",
+        )
+    )
+    existing_request = existing.scalar_one_or_none()
+    if existing_request:
+        return existing_request
+
+    request = IndividualUserRequestModel(
+        email=email,
+        name=name or derive_name_from_email(email),
+        requested_tools=json.dumps([]),
+        requested_plan=json.dumps([plan.id]),
+        purpose=notes or "Unknown organization domain; routed to Individual Users.",
+        company_name=email.split("@", 1)[1] if "@" in email else None,
+        job_title=job_title,
+        phone=phone,
+    )
+    db.add(request)
+    db.add(NotificationModel(
+        title="New Individual User Request",
+        message=f"{request.name} ({email}) was routed to Individual Users for {plan.name}.",
+        type="info",
+        link=f"/individual-requests/{request.id}",
+    ))
+    await db.flush()
+    return request
+
+async def create_individual_user_subscription(
+    db: AsyncSession,
+    *,
+    user: UserModel,
+    plan: PlanModel,
+    requested_tools: Optional[List[str]] = None,
+    source_request: Optional[IndividualUserRequestModel] = None,
+) -> SubscriptionModel:
+    tools = requested_tools or []
+    subscription = SubscriptionModel(
+        organization_id="no_organization",
+        organization_name=f"Individual: {user.name}",
+        plan_id=plan.id,
+        plan_name=plan.name,
+        tools=json.dumps(tools),
+        status="active",
+        start_date=datetime.now(timezone.utc),
+        end_date=datetime.now(timezone.utc) + timedelta(days=30),
+        billing_cycle="monthly",
+        amount=plan.price_monthly,
+    )
+    db.add(subscription)
+    await db.flush()
+    await set_subscription_tools(db, subscription.id, plan.id, tools)
+
+    if source_request:
+        source_request.assigned_subscription_id = subscription.id
+    return subscription
 
 async def get_project_for_org(db: AsyncSession, project_id: str, organization_id: str) -> ProjectModel:
     result = await db.execute(
@@ -2615,7 +4565,7 @@ async def create_business_unit_for_org(
 
     if not name:
         raise HTTPException(status_code=400, detail="Business unit name is required")
-    if status not in ["active", "inactive", "archived"]:
+    if status not in PROJECT_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     if data.sync_status and data.sync_status not in ["synced", "pending", "failed"]:
         raise HTTPException(status_code=400, detail="Invalid sync status")
@@ -2643,8 +4593,10 @@ async def create_business_unit_for_org(
         status=status,
         created_by=created_by
     )
+    apply_onboarding_fields(business_unit, payload_dict(data), BUSINESS_UNIT_ONBOARDING_FIELDS)
     db.add(business_unit)
     await db.flush()
+    await upsert_business_unit_quotas(db, business_unit.id, payload_dict(data))
     return business_unit
 
 async def create_project_for_org(
@@ -2659,7 +4611,7 @@ async def create_project_for_org(
 
     if not name:
         raise HTTPException(status_code=400, detail="Team name is required")
-    if status not in ["active", "inactive", "archived"]:
+    if status not in PROJECT_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
 
     bu_result = await db.execute(
@@ -2682,9 +4634,118 @@ async def create_project_for_org(
         status=status,
         created_by=created_by
     )
+    apply_onboarding_fields(project, payload_dict(data), PROJECT_ONBOARDING_FIELDS)
     db.add(project)
     await db.flush()
+    await upsert_project_environments(db, project.id, payload_dict(data))
     return project
+
+async def upsert_project_environments(db: AsyncSession, project_id: str, payload: dict):
+    for env_type in PROJECT_ENVIRONMENT_TYPES:
+        key = env_type.lower().replace(" ", "_")
+        endpoint_key = f"{key}_endpoint_url"
+        enabled_key = f"{key}_enabled"
+        if endpoint_key not in payload and enabled_key not in payload:
+            continue
+        result = await db.execute(
+            select(ProjectEnvironmentModel).where(
+                ProjectEnvironmentModel.project_id == project_id,
+                ProjectEnvironmentModel.environment_type == env_type,
+            )
+        )
+        env = result.scalar_one_or_none()
+        if not env:
+            env = ProjectEnvironmentModel(project_id=project_id, environment_type=env_type)
+            db.add(env)
+        if endpoint_key in payload:
+            env.endpoint_url = normalize_onboarding_value(endpoint_key, payload.get(endpoint_key))
+        if enabled_key in payload:
+            env.is_enabled = bool(payload.get(enabled_key))
+        env.updated_at = datetime.now(timezone.utc)
+
+async def upsert_business_unit_quotas(db: AsyncSession, business_unit_id: str, payload: dict):
+    for field_key, quota_type in BUSINESS_UNIT_QUOTA_FIELDS.items():
+        if field_key not in payload:
+            continue
+        quota_limit = normalize_onboarding_value(field_key, payload.get(field_key))
+        result = await db.execute(
+            select(QuotaModel).where(
+                QuotaModel.entity_type == "business_unit",
+                QuotaModel.entity_id == business_unit_id,
+                QuotaModel.quota_type == quota_type,
+            )
+        )
+        quota = result.scalar_one_or_none()
+        if not quota:
+            quota = QuotaModel(
+                entity_type="business_unit",
+                entity_id=business_unit_id,
+                quota_type=quota_type,
+                quota_used=0,
+            )
+            db.add(quota)
+        quota.quota_limit = quota_limit
+        quota.updated_at = datetime.now(timezone.utc)
+
+async def get_application_for_org(db: AsyncSession, application_id: str, organization_id: str) -> ApplicationModel:
+    result = await db.execute(
+        select(ApplicationModel).where(
+            ApplicationModel.id == application_id,
+            ApplicationModel.organization_id == organization_id,
+        )
+    )
+    application = result.scalar_one_or_none()
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return application
+
+async def application_to_dict(db: AsyncSession, application: ApplicationModel) -> dict:
+    data = add_identity_aliases(
+        model_to_dict(application, ["mcp_resources", "mcp_tools", "mcp_prompts"]),
+        "application",
+    )
+    for key, model_cls, json_fields in [
+        ("agent", ApplicationAgentModel, []),
+        ("monitoring", ApplicationMonitoringModel, []),
+        ("security", ApplicationSecurityModel, []),
+        ("billing", ApplicationBillingModel, []),
+    ]:
+        related = await db.get(model_cls, application.id)
+        data[key] = model_to_dict(related, json_fields) if related else {}
+    return data
+
+async def assert_application_unique(
+    db: AsyncSession,
+    project_id: str,
+    application_name: Optional[str],
+    exclude_id: Optional[str] = None,
+):
+    if not application_name:
+        return
+    query = select(ApplicationModel).where(
+        ApplicationModel.project_id == project_id,
+        ApplicationModel.application_name == application_name,
+    )
+    if exclude_id:
+        query = query.where(ApplicationModel.id != exclude_id)
+    if (await db.execute(query)).scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Application name already exists in this project")
+
+async def upsert_application_sections(db: AsyncSession, application_id: str, payload: dict):
+    section_specs = [
+        (ApplicationAgentModel, APPLICATION_AGENT_FIELDS),
+        (ApplicationMonitoringModel, APPLICATION_MONITORING_FIELDS),
+        (ApplicationSecurityModel, APPLICATION_SECURITY_FIELDS),
+        (ApplicationBillingModel, APPLICATION_BILLING_FIELDS),
+    ]
+    for model_cls, fields in section_specs:
+        if not any(field in payload for field in fields):
+            continue
+        row = await db.get(model_cls, application_id)
+        if not row:
+            row = model_cls(application_id=application_id)
+            db.add(row)
+        apply_onboarding_fields(row, payload, fields)
 
 async def resolve_organization_user_label(
     db: AsyncSession,
@@ -2711,8 +4772,248 @@ async def resolve_organization_user_label(
 async def get_or_create_default_org_role(db: AsyncSession, org: OrganizationModel) -> RoleModel:
     return await get_standard_role(db, org.id, "API/Agent Consumer")
 
+def supported_domains_from_domain(domain: Optional[str]) -> Optional[str]:
+    cleaned_domain = (domain or "").strip().lower().lstrip("@")
+    if not cleaned_domain:
+        return None
+    return json.dumps([f"@{cleaned_domain}"])
+
+async def provision_organization_in_zitadel(org: OrganizationModel) -> dict:
+    """Create the matching Zitadel organization and persist its ID on the local organization row."""
+    if not zitadel_mgmt.enabled:
+        logger.info(f"Zitadel organization provisioning skipped for {org.name}: not configured")
+        return {"success": False, "skipped": True}
+    if org.zitadel_org_id:
+        return {"success": True, "exists": True, "zitadel_org_id": org.zitadel_org_id}
+
+    zitadel_result = await zitadel_mgmt.create_organization(org.name)
+    if not zitadel_result.get("success"):
+        return zitadel_result
+
+    org.zitadel_org_id = zitadel_result.get("zitadel_org_id")
+    if not org.zitadel_org_id:
+        return {"success": False, "error": "Zitadel organization response did not include an organization ID"}
+
+    if org.domain:
+        domain_result = await zitadel_mgmt.add_organization_domain(org.zitadel_org_id, org.domain)
+        zitadel_result["domain"] = domain_result
+        if not org.supported_domains:
+            org.supported_domains = supported_domains_from_domain(org.domain)
+
+    logger.info(f"Zitadel organization created for {org.name}: {org.zitadel_org_id}")
+    return zitadel_result
+
+async def provision_organization_in_auth0(org: OrganizationModel) -> dict:
+    """Create the matching Auth0 organization and persist its ID on the local organization row."""
+    if not auth0_mgmt.enabled:
+        logger.info(f"Auth0 organization provisioning skipped for {org.name}: not configured")
+        return {"success": False, "skipped": True, "error": "Auth0 is disabled"}
+    if org.auth0_org_id:
+        return {"success": True, "exists": True, "auth0_org_id": org.auth0_org_id}
+
+    auth0_result = await auth0_mgmt.create_organization(
+        org.name,
+        {
+            "probestack_org_id": org.id,
+            "domain": org.domain or "",
+            "external_org_id": org.external_org_id or "",
+        },
+    )
+    if not auth0_result.get("success"):
+        return auth0_result
+
+    org.auth0_org_id = auth0_result.get("auth0_org_id")
+    if not org.auth0_org_id:
+        return {"success": False, "error": "Auth0 organization response did not include an organization ID"}
+
+    connection_result = await auth0_mgmt.add_connection_to_organization(org.auth0_org_id)
+    auth0_result["connection"] = connection_result
+    if not connection_result.get("success") and not connection_result.get("skipped"):
+        return {
+            **auth0_result,
+            "success": False,
+            "error": connection_result.get("error") or "Failed to enable Auth0 organization connection",
+        }
+
+    if org.domain and not org.supported_domains:
+        org.supported_domains = supported_domains_from_domain(org.domain)
+
+    logger.info(f"Auth0 organization created for {org.name}: {org.auth0_org_id}")
+    return auth0_result
+
+async def provision_organization_for_active_provider(
+    db: AsyncSession,
+    org: OrganizationModel,
+    provider: Optional[str] = None,
+) -> dict:
+    active_provider = normalize_identity_provider(provider or await get_active_identity_provider(db))
+    require_identity_provider_configured(active_provider)
+    if active_provider == "auth0":
+        result = await provision_organization_in_auth0(org)
+    else:
+        result = await provision_organization_in_zitadel(org)
+    result["identity_provider"] = active_provider
+    return result
+
+def should_skip_auth0(active_provider: Optional[str] = None, skip_auth0: bool = False) -> bool:
+    provider = normalize_identity_provider(active_provider)
+    return (not auth0_mgmt.enabled) or skip_auth0 or provider != "auth0"
+
+async def provision_user_in_zitadel(
+    user: UserModel,
+    email: str,
+    name: str,
+    user_metadata: Optional[dict] = None,
+    zitadel_org_id: Optional[str] = None,
+    role_name: Optional[str] = None,
+) -> dict:
+    """Create or link the matching Zitadel user without blocking local DB creation."""
+    if not zitadel_mgmt.enabled:
+        logger.info(f"Zitadel provisioning skipped for {email}: not configured")
+        return {"success": False, "skipped": True}
+
+    zitadel_result = await zitadel_mgmt.create_user(
+        email=email,
+        name=name,
+        user_metadata=user_metadata or {},
+        organization_id=zitadel_org_id,
+    )
+    if zitadel_result.get("success"):
+        user.zitadel_user_id = zitadel_result.get("zitadel_user_id")
+        logger.info(f"Zitadel user created for {email}: {user.zitadel_user_id}")
+        if user.zitadel_user_id and not zitadel_result.get("verification_email_sent"):
+            await zitadel_mgmt.send_verification_email(user.zitadel_user_id)
+    elif zitadel_result.get("exists"):
+        existing_user = await zitadel_mgmt.get_user_by_email(email, zitadel_org_id)
+        if existing_user.get("success"):
+            user.zitadel_user_id = zitadel_mgmt._extract_user_id(existing_user.get("user", {}))
+            logger.info(f"Zitadel user already exists for {email}: {user.zitadel_user_id}")
+            if user.zitadel_user_id:
+                await zitadel_mgmt.send_password_reset_email_by_user_id(user.zitadel_user_id)
+                zitadel_result = {
+                    **zitadel_result,
+                    "success": True,
+                    "zitadel_user_id": user.zitadel_user_id,
+                    "user": existing_user.get("user"),
+                }
+    else:
+        logger.warning(f"Failed to create Zitadel user for {email}: {zitadel_result.get('error')}")
+
+    if user.zitadel_user_id and zitadel_org_id and role_name:
+        role_assignment = await zitadel_mgmt.assign_user_roles(
+            user.zitadel_user_id,
+            zitadel_org_id,
+            [zitadel_role_key_for_role(role_name)],
+        )
+        zitadel_result["role_assignment"] = role_assignment
+        if not role_assignment.get("success") and not role_assignment.get("skipped"):
+            logger.warning(
+                f"Failed to assign Zitadel role for {email}: {role_assignment.get('error')}"
+            )
+    return zitadel_result
+
+async def provision_user_in_auth0(
+    user: UserModel,
+    email: str,
+    name: str,
+    user_metadata: Optional[dict] = None,
+    auth0_org_id: Optional[str] = None,
+    role_name: Optional[str] = None,
+) -> dict:
+    """Create or link the matching Auth0 user and add it to the Auth0 organization."""
+    if not auth0_mgmt.enabled:
+        logger.info(f"Auth0 provisioning skipped for {email}: not configured")
+        return {"success": False, "skipped": True, "error": "Auth0 is disabled"}
+
+    auth0_result = await auth0_mgmt.create_user(
+        email=email,
+        name=name,
+        user_metadata=user_metadata or {},
+    )
+    if auth0_result.get("success"):
+        user.auth0_user_id = auth0_result.get("auth0_user_id")
+        logger.info(f"Auth0 user created for {email}: {user.auth0_user_id}")
+        if user.auth0_user_id:
+            await auth0_mgmt.send_verification_email(user.auth0_user_id)
+    elif auth0_result.get("exists"):
+        existing_user = await auth0_mgmt.get_user_by_email(email)
+        if existing_user.get("success"):
+            user.auth0_user_id = existing_user["user"].get("user_id")
+            logger.info(f"Auth0 user already exists for {email}: {user.auth0_user_id}")
+            if user.auth0_user_id:
+                await auth0_mgmt.send_verification_email(user.auth0_user_id)
+                auth0_result = {
+                    **auth0_result,
+                    "success": True,
+                    "auth0_user_id": user.auth0_user_id,
+                    "user": existing_user.get("user"),
+                }
+    else:
+        logger.warning(f"Failed to create Auth0 user for {email}: {auth0_result.get('error')}")
+
+    if user.auth0_user_id and auth0_org_id:
+        membership_result = await auth0_mgmt.add_user_to_organization(auth0_org_id, user.auth0_user_id)
+        auth0_result["organization_membership"] = membership_result
+        if not membership_result.get("success"):
+            logger.warning(
+                f"Failed to add Auth0 organization member for {email}: {membership_result.get('error')}"
+            )
+            return {
+                **auth0_result,
+                "success": False,
+                "error": membership_result.get("error") or "Failed to add user to Auth0 organization",
+            }
+
+    return auth0_result
+
+async def provision_user_for_active_provider(
+    db: AsyncSession,
+    user: UserModel,
+    email: str,
+    name: str,
+    user_metadata: Optional[dict] = None,
+    org: Optional[OrganizationModel] = None,
+    role_name: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> dict:
+    active_provider = normalize_identity_provider(provider or await get_active_identity_provider(db))
+    require_identity_provider_configured(active_provider)
+    if active_provider == "auth0":
+        result = await provision_user_in_auth0(
+            user,
+            email,
+            name,
+            user_metadata,
+            org.auth0_org_id if org else None,
+            role_name,
+        )
+        if not user.auth0_user_id:
+            result = {
+                **result,
+                "success": False,
+                "error": result.get("error") or "Auth0 user ID was not stored",
+            }
+    else:
+        result = await provision_user_in_zitadel(
+            user,
+            email,
+            name,
+            user_metadata,
+            org.zitadel_org_id if org else None,
+            role_name,
+        )
+        if not user.zitadel_user_id:
+            result = {
+                **result,
+                "success": False,
+                "error": result.get("error") or "Zitadel user ID was not stored",
+            }
+    result["identity_provider"] = active_provider
+    return result
+
 async def create_invited_org_user(db: AsyncSession, org: OrganizationModel, email: str) -> UserModel:
     role = await get_or_create_default_org_role(db, org)
+    role, onboarding_role_lookup = await resolve_new_user_role(db, org, email, role)
     user = UserModel(
         email=email,
         name=derive_name_from_email(email),
@@ -2728,25 +5029,30 @@ async def create_invited_org_user(db: AsyncSession, org: OrganizationModel, emai
     db.add(user)
     await db.flush()
 
-    auth0_result = await auth0_mgmt.create_user(
-        email=email,
-        name=user.name,
-        user_metadata={
+    active_provider = await get_active_identity_provider(db)
+    if active_provider == "auth0" and not org.auth0_org_id and org.status == "approved":
+        org_result = await provision_organization_in_auth0(org)
+        if not org_result.get("success"):
+            logger.warning(f"Failed to provision Auth0 organization for {org.name}: {org_result.get('error')}")
+    elif active_provider == "zitadel" and not org.zitadel_org_id and org.status == "approved":
+        org_result = await provision_organization_in_zitadel(org)
+        if not org_result.get("success"):
+            logger.warning(f"Failed to provision Zitadel organization for {org.name}: {org_result.get('error')}")
+
+    await provision_user_for_active_provider(
+        db,
+        user,
+        email,
+        user.name,
+        {
             "probestack_user_id": user.id,
             "organization_id": org.id,
-            "organization_name": org.name
-        }
+            "organization_name": org.name,
+        },
+        org,
+        role.name,
+        active_provider,
     )
-    if auth0_result.get("success"):
-        user.auth0_user_id = auth0_result.get("auth0_user_id")
-        await auth0_mgmt.send_verification_email(user.auth0_user_id)
-    elif auth0_result.get("exists"):
-        existing_user = await auth0_mgmt.get_user_by_email(email)
-        if existing_user.get("success"):
-            user.auth0_user_id = existing_user["user"]["user_id"]
-            await auth0_mgmt.send_verification_email(user.auth0_user_id)
-    else:
-        logger.warning(f"Failed to create Auth0 user for {email}: {auth0_result.get('error')}")
 
     return user
 
@@ -3215,6 +5521,8 @@ async def verify_user_email(email: str, token: str, db: AsyncSession = Depends(g
     # Also verify in Auth0 if we have the user ID
     if user.auth0_user_id:
         await auth0_mgmt.verify_user_email(user.auth0_user_id)
+    if user.zitadel_user_id:
+        await zitadel_mgmt.verify_user_email(user.zitadel_user_id)
     
     await db.commit()
     
@@ -3247,13 +5555,20 @@ async def set_user_password(email: str, token: str, password: str, db: AsyncSess
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
     
-    # Update password in Auth0
-    if user.auth0_user_id:
+    # Update password in Auth0 only when Auth0 is enabled.
+    if auth0_mgmt.enabled and user.auth0_user_id:
         auth0_result = await auth0_mgmt.update_user_password(user.auth0_user_id, password)
         if not auth0_result.get("success"):
             raise HTTPException(
                 status_code=500, 
                 detail=f"Failed to set password in Auth0: {auth0_result.get('error')}"
+            )
+    if user.zitadel_user_id:
+        zitadel_result = await zitadel_mgmt.update_user_password(user.zitadel_user_id, password)
+        if not zitadel_result.get("success"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to set password in Zitadel: {zitadel_result.get('error')}"
             )
     
     # Mark password as set and email as verified
@@ -3355,26 +5670,43 @@ async def public_user_forgot_password(email: str, db: AsyncSession = Depends(get
         logger.info(f"Password reset blocked for unverified user: {email}")
         return success_message
 
-    # Ensure Auth0 user exists
-    if not user.auth0_user_id:
+    # Ensure Auth0 user exists only when Auth0 is enabled.
+    if auth0_mgmt.enabled and not user.auth0_user_id:
         auth0_user = await auth0_mgmt.get_user_by_email(email)
         if auth0_user.get("success"):
             user.auth0_user_id = auth0_user["user"]["user_id"]
             await db.commit()
         else:
             logger.warning(f"No Auth0 account found for {email}")
-            return success_message
+            if not user.zitadel_user_id:
+                return success_message
 
-    # Trigger Auth0 password reset email
-    reset_result = await auth0_mgmt.send_password_reset_email(email)
+    # Trigger Auth0 password reset email only when Auth0 is enabled.
+    if auth0_mgmt.enabled and user.auth0_user_id:
+        reset_result = await auth0_mgmt.send_password_reset_email(email)
+        if reset_result.get("success"):
+            logger.info(f"Password reset email sent to: {email}")
+        else:
+            logger.error(
+                f"Failed to send password reset email to {email}: "
+                f"{reset_result.get('error')}"
+            )
 
-    if reset_result.get("success"):
-        logger.info(f"Password reset email sent to: {email}")
-    else:
-        logger.error(
-            f"Failed to send password reset email to {email}: "
-            f"{reset_result.get('error')}"
-        )
+    if not user.zitadel_user_id:
+        zitadel_user = await zitadel_mgmt.get_user_by_email(email)
+        if zitadel_user.get("success"):
+            user.zitadel_user_id = zitadel_mgmt._extract_user_id(zitadel_user["user"])
+            await db.commit()
+
+    if user.zitadel_user_id:
+        zitadel_reset_result = await zitadel_mgmt.send_password_reset_email(email)
+        if zitadel_reset_result.get("success"):
+            logger.info(f"Zitadel password reset email sent to: {email}")
+        else:
+            logger.error(
+                f"Failed to send Zitadel password reset email to {email}: "
+                f"{zitadel_reset_result.get('error')}"
+            )
 
     return success_message
 
@@ -3525,6 +5857,35 @@ async def get_my_organization(payload: dict = Depends(require_any_admin), db: As
     
     return await organization_to_dict(db, org)
 
+@api_router.put("/my-organization", tags=["Org Admin"])
+async def update_my_organization(
+    data: OrganizationUpdate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update onboarding fields for the current organization."""
+    org = await get_approved_org_for_admin(payload, db)
+    update_data = {k: v for k, v in payload_dict(data, exclude_unset=True).items() if v is not None}
+    if "supported_domains" in update_data and isinstance(update_data["supported_domains"], list):
+        update_data["supported_domains"] = json.dumps(update_data["supported_domains"])
+    if "gateway_environments" in update_data and isinstance(update_data["gateway_environments"], list):
+        update_data["gateway_environments"] = json.dumps(update_data["gateway_environments"])
+    if "name" in update_data:
+        update_data["name"] = update_data["name"].strip()
+        if not update_data["name"]:
+            raise HTTPException(status_code=400, detail="Organization name is required")
+    if "domain" in update_data:
+        update_data["domain"] = update_data["domain"].strip() if update_data["domain"] else None
+        if update_data["domain"] and not org.supported_domains:
+            org.supported_domains = supported_domains_from_domain(update_data["domain"])
+
+    for key, value in update_data.items():
+        if hasattr(org, key):
+            setattr(org, key, normalize_onboarding_value(key, value))
+    org.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"message": "Organization updated successfully", "organization": await organization_to_dict(db, org)}
+
 @api_router.get("/my-organization/subscription", tags=["Org Admin"])
 async def get_my_subscription(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
     """Get current organization's subscription (org admin only)"""
@@ -3536,7 +5897,7 @@ async def get_my_subscription(payload: dict = Depends(require_any_admin), db: As
         raise HTTPException(status_code=404, detail="No organization linked to this account")
     
     result = await db.execute(
-        select(SubscriptionModel)
+        valid_subscription_query()
         .where(SubscriptionModel.organization_id == org_id)
         .order_by(SubscriptionModel.created_at.desc())
     )
@@ -3595,7 +5956,7 @@ async def get_my_business_units(
         .order_by(BusinessUnitModel.name.asc())
     )
     business_units = result.scalars().all()
-    response = [model_to_dict(bu, ["tags"]) for bu in business_units]
+    response = [await business_unit_to_dict(db, bu) for bu in business_units]
 
     if include_projects and business_units:
         bu_ids = [bu.id for bu in business_units]
@@ -3606,7 +5967,7 @@ async def get_my_business_units(
         )
         projects_by_bu = {}
         for project in projects_result.scalars().all():
-            projects_by_bu.setdefault(project.business_unit_id, []).append(model_to_dict(project))
+            projects_by_bu.setdefault(project.business_unit_id, []).append(await project_to_dict(db, project))
 
         for bu_data in response:
             bu_data["projects"] = projects_by_bu.get(bu_data["id"], [])
@@ -3624,7 +5985,10 @@ async def create_my_business_unit(
     business_unit = await create_business_unit_for_org(db, org, data, created_by=payload.get("sub"))
     await db.commit()
 
-    return {"message": "Business unit created successfully", "business_unit": model_to_dict(business_unit, ["tags"])}
+    return {
+        "message": "Business unit created successfully",
+        "business_unit": await business_unit_to_dict(db, business_unit),
+    }
 
 @api_router.get("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
 async def get_my_business_unit(
@@ -3650,8 +6014,8 @@ async def get_my_business_unit(
         .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
         .order_by(ProjectModel.name.asc())
     )
-    response = model_to_dict(business_unit, ["tags"])
-    response["projects"] = [model_to_dict(project) for project in projects_result.scalars().all()]
+    response = await business_unit_to_dict(db, business_unit)
+    response["projects"] = [await project_to_dict(db, project) for project in projects_result.scalars().all()]
     return response
 
 @api_router.put("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
@@ -3674,7 +6038,7 @@ async def update_my_business_unit(
     if not business_unit:
         raise HTTPException(status_code=404, detail="Business unit not found")
 
-    update_data = data.model_dump(exclude_unset=True)
+    update_data = payload_dict(data, exclude_unset=True)
     if "name" in update_data:
         update_data["name"] = update_data["name"].strip()
         if not update_data["name"]:
@@ -3707,11 +6071,16 @@ async def update_my_business_unit(
     )
 
     for key, value in update_data.items():
-        setattr(business_unit, key, value)
+        if hasattr(business_unit, key):
+            setattr(business_unit, key, normalize_onboarding_value(key, value))
+    await upsert_business_unit_quotas(db, business_unit.id, update_data)
     business_unit.updated_at = datetime.now(timezone.utc)
     await db.commit()
 
-    return {"message": "Business unit updated successfully", "business_unit": model_to_dict(business_unit, ["tags"])}
+    return {
+        "message": "Business unit updated successfully",
+        "business_unit": await business_unit_to_dict(db, business_unit),
+    }
 
 @api_router.get("/my-organization/business-units/{business_unit_id}/projects", tags=["Org Admin - Projects"])
 async def get_my_business_unit_projects(
@@ -3736,7 +6105,7 @@ async def get_my_business_unit_projects(
         .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
         .order_by(ProjectModel.name.asc())
     )
-    return [model_to_dict(project) for project in result.scalars().all()]
+    return [await project_to_dict(db, project) for project in result.scalars().all()]
 
 @api_router.get("/my-organization/projects", tags=["Org Admin - Projects"])
 async def get_my_projects(
@@ -3752,7 +6121,7 @@ async def get_my_projects(
         query = query.where(ProjectModel.business_unit_id == business_unit_id)
 
     result = await db.execute(query.order_by(ProjectModel.name.asc()))
-    return [model_to_dict(project) for project in result.scalars().all()]
+    return [await project_to_dict(db, project) for project in result.scalars().all()]
 
 @api_router.post("/my-organization/projects", tags=["Org Admin - Projects"])
 async def create_my_project(
@@ -3767,12 +6136,12 @@ async def create_my_project(
     project = await create_project_for_org(
         db,
         org,
-        ExternalProjectCreate(**data.model_dump()),
+        ExternalProjectCreate(**payload_dict(data)),
         created_by=payload.get("sub")
     )
     await db.commit()
 
-    return {"message": "Project created successfully", "project": model_to_dict(project)}
+    return {"message": "Project created successfully", "project": await project_to_dict(db, project)}
 
 @api_router.get("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
 async def get_my_project(
@@ -3793,7 +6162,7 @@ async def get_my_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    response = model_to_dict(project)
+    response = await project_to_dict(db, project)
     if project.business_unit_id:
         bu_result = await db.execute(
             select(BusinessUnitModel).where(
@@ -3802,7 +6171,7 @@ async def get_my_project(
             )
         )
         business_unit = bu_result.scalar_one_or_none()
-        response["business_unit"] = model_to_dict(business_unit) if business_unit else None
+        response["business_unit"] = await business_unit_to_dict(db, business_unit) if business_unit else None
     else:
         response["business_unit"] = None
 
@@ -3828,14 +6197,14 @@ async def update_my_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    update_data = data.model_dump(exclude_unset=True)
+    update_data = payload_dict(data, exclude_unset=True)
     if "name" in update_data:
         update_data["name"] = update_data["name"].strip()
         if not update_data["name"]:
             raise HTTPException(status_code=400, detail="Project name is required")
     if "code" in update_data:
         update_data["code"] = update_data["code"].strip() if update_data["code"] else None
-    if "status" in update_data and update_data["status"] not in ["active", "inactive", "archived"]:
+    if "status" in update_data and update_data["status"] not in PROJECT_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="Invalid status")
     if update_data.get("business_unit_id"):
         bu_result = await db.execute(
@@ -3856,11 +6225,102 @@ async def update_my_project(
     )
 
     for key, value in update_data.items():
-        setattr(project, key, value)
+        if hasattr(project, key):
+            setattr(project, key, normalize_onboarding_value(key, value))
+    await upsert_project_environments(db, project.id, update_data)
     project.updated_at = datetime.now(timezone.utc)
     await db.commit()
 
-    return {"message": "Project updated successfully", "project": model_to_dict(project)}
+    return {"message": "Project updated successfully", "project": await project_to_dict(db, project)}
+
+@api_router.get("/my-organization/applications", tags=["Org Admin - Applications"])
+async def get_my_applications(
+    project_id: Optional[str] = None,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get applications for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+    query = select(ApplicationModel).where(ApplicationModel.organization_id == org.id)
+    if project_id:
+        query = query.where(ApplicationModel.project_id == project_id)
+    result = await db.execute(query.order_by(ApplicationModel.application_name.asc()))
+    return [await application_to_dict(db, application) for application in result.scalars().all()]
+
+@api_router.post("/my-organization/applications", tags=["Org Admin - Applications"])
+async def create_my_application(
+    data: ApplicationCreate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Onboard an application under a project."""
+    org = await get_approved_org_for_admin(payload, db)
+    request_payload = payload_dict(data)
+    project = await get_project_for_org(db, data.project_id, org.id)
+    application_name = data.application_name.strip()
+    if not application_name:
+        raise HTTPException(status_code=400, detail="Application name is required")
+    await assert_application_unique(db, project.id, application_name)
+
+    application = ApplicationModel(
+        project_id=project.id,
+        organization_id=org.id,
+        application_name=application_name,
+        created_by=payload.get("sub"),
+    )
+    apply_onboarding_fields(application, request_payload, APPLICATION_FIELDS)
+    application.api_count = max(application.api_count or 0, 0)
+    await ensure_organization_api_capacity(db, org.id, application.api_count)
+    db.add(application)
+    await db.flush()
+    await upsert_application_sections(db, application.id, request_payload)
+    await db.commit()
+    return {"message": "Application created successfully", "application": await application_to_dict(db, application)}
+
+@api_router.get("/my-organization/applications/{application_id}", tags=["Org Admin - Applications"])
+async def get_my_application(
+    application_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get one application for the current approved organization."""
+    org = await get_approved_org_for_admin(payload, db)
+    application = await get_application_for_org(db, application_id, org.id)
+    return await application_to_dict(db, application)
+
+@api_router.put("/my-organization/applications/{application_id}", tags=["Org Admin - Applications"])
+async def update_my_application(
+    application_id: str,
+    data: ApplicationUpdate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update an application and its workbook-mapped sub-sections."""
+    org = await get_approved_org_for_admin(payload, db)
+    request_payload = payload_dict(data, exclude_unset=True)
+    application = await get_application_for_org(db, application_id, org.id)
+    if "project_id" in request_payload and request_payload["project_id"]:
+        project = await get_project_for_org(db, request_payload["project_id"], org.id)
+        application.project_id = project.id
+    if "application_name" in request_payload:
+        application_name = (request_payload["application_name"] or "").strip()
+        if not application_name:
+            raise HTTPException(status_code=400, detail="Application name is required")
+        await assert_application_unique(db, application.project_id, application_name, exclude_id=application.id)
+        application.application_name = application_name
+    apply_onboarding_fields(application, request_payload, APPLICATION_FIELDS)
+    if application.api_count is not None:
+        application.api_count = max(application.api_count, 0)
+    await ensure_organization_api_capacity(
+        db,
+        org.id,
+        application.api_count or 0,
+        exclude_application_id=application.id,
+    )
+    await upsert_application_sections(db, application.id, request_payload)
+    application.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"message": "Application updated successfully", "application": await application_to_dict(db, application)}
 
 @api_router.get("/my-organization/projects/{project_id}/team", tags=["Org Admin - Project Members"])
 async def get_my_project_team(
@@ -4082,9 +6542,11 @@ async def remove_user_from_my_organization(user_id: str, payload: dict = Depends
 async def approve_user_request_org_admin(
     request_id: str,
     role_id: str,
-    project_id: str,
+    project_id: Optional[str] = None,
     business_unit_id: Optional[str] = None,
     project_role: str = "member",
+    identity_provider: Optional[str] = None,
+    skip_auth0: bool = False,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -4105,6 +6567,11 @@ async def approve_user_request_org_admin(
         raise HTTPException(status_code=404, detail="User request not found in your organization")
     if req.status != "pending":
         raise HTTPException(status_code=400, detail="Request is not pending")
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    request_org = org_result.scalar_one_or_none()
+    if not request_org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    assert_email_allowed_for_org(req.email, request_org)
     
     await ensure_standard_roles_for_organization(db, org_id)
     # Validate role exists in the global standard role catalog.
@@ -4118,10 +6585,16 @@ async def approve_user_request_org_admin(
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Standard role not found")
+    selected_role_id = role.id
+    role, onboarding_role_lookup = await resolve_new_user_role(db, request_org, req.email, role)
+    role_id = role.id
     project_role = (project_role or "member").strip().lower()
     if project_role not in ["manager", "member", "viewer"]:
         raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
-    business_unit, project = await validate_user_request_team_assignment(db, org_id, project_id, business_unit_id)
+    business_unit = None
+    project = None
+    if project_id:
+        business_unit, project = await validate_user_request_team_assignment(db, org_id, project_id, business_unit_id)
     # Check if user with this email already exists
     existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
     if existing_user.scalar_one_or_none():
@@ -4132,10 +6605,10 @@ async def approve_user_request_org_admin(
     req.status = "approved"
     req.approved_at = now
     req.updated_at = now
-    req.approved_role_id = role_id
-    req.approved_business_unit_id = business_unit.id
-    req.approved_project_id = project.id
-    req.approved_project_role = project_role
+    req.approved_role_id = role.id
+    req.approved_business_unit_id = business_unit.id if business_unit else None
+    req.approved_project_id = project.id if project else None
+    req.approved_project_role = project_role if project else None
     
     # Create user with verification fields
     user = UserModel(
@@ -4143,7 +6616,7 @@ async def approve_user_request_org_admin(
         name=req.name,
         organization_id=org_id,
         organization_name=req.organization_name,
-        role_id=role_id,
+        role_id=role.id,
         role_name=role.name,
         status="pending_verification",
         email_verified=False,
@@ -4152,32 +6625,46 @@ async def approve_user_request_org_admin(
     )
     db.add(user)
     await db.flush()
-    team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
+    team_member = None
+    if project:
+        team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
     
-    # Create user in Auth0
-    auth0_result = await auth0_mgmt.create_user(
-        email=req.email,
-        name=req.name,
-        user_metadata={
+    provision_org = request_org
+    active_provider = normalize_identity_provider(identity_provider or await get_active_identity_provider(db))
+    if skip_auth0 and active_provider == "auth0":
+        active_provider = "zitadel"
+    if provision_org and provision_org.status == "approved":
+        needs_provider_org = (
+            (active_provider == "auth0" and not provision_org.auth0_org_id)
+            or (active_provider == "zitadel" and not provision_org.zitadel_org_id)
+        )
+        org_provision_result = {"success": True, "skipped": True}
+        if needs_provider_org:
+            org_provision_result = await provision_organization_for_active_provider(db, provision_org, active_provider)
+        if not org_provision_result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to create organization in {active_provider.upper()}: {org_provision_result.get('error') or 'unknown error'}"
+            )
+    provider_user_result = await provision_user_for_active_provider(
+        db,
+        user,
+        req.email,
+        req.name,
+        {
             "probestack_user_id": user.id,
             "organization_id": org_id,
-            "organization_name": req.organization_name
-        }
+            "organization_name": req.organization_name,
+        },
+        provision_org,
+        role.name,
+        active_provider,
     )
-    
-    if auth0_result.get("success"):
-        user.auth0_user_id = auth0_result.get("auth0_user_id")
-        logger.info(f"Auth0 user created for {req.email}: {user.auth0_user_id}")
-        # Send verification email via Auth0
-        await auth0_mgmt.send_verification_email(user.auth0_user_id)
-    elif auth0_result.get("exists"):
-        existing_user = await auth0_mgmt.get_user_by_email(req.email)
-        if existing_user.get("success"):
-            user.auth0_user_id = existing_user["user"]["user_id"]
-            # Send verification email for existing Auth0 user
-            await auth0_mgmt.send_verification_email(user.auth0_user_id)
-    else:
-        logger.warning(f"Failed to create Auth0 user for {req.email}: {auth0_result.get('error')}")
+    if not provider_user_result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to create user in {active_provider.upper()}: {provider_user_result.get('error') or 'unknown error'}"
+        )
     
     await db.commit()
     
@@ -4193,11 +6680,19 @@ async def approve_user_request_org_admin(
             "email": user.email,
             "role": role.name,
             "auth0_user_id": user.auth0_user_id,
+            "zitadel_user_id": user.zitadel_user_id,
             "status": user.status
         },
-        "business_unit": model_to_dict(business_unit, ["tags"]),
-        "team": model_to_dict(project),
-        "team_member": await project_team_member_to_dict(db, team_member),
+        "identity_provider": active_provider,
+        "auth0_skipped": should_skip_auth0(active_provider, skip_auth0),
+        "selected_role_id": selected_role_id,
+        "assigned_role_id": role.id,
+        "assigned_role_name": role.name,
+        "role_source": "mongodb" if onboarding_role_lookup else "admin_selection",
+        "mongodb_role_lookup": onboarding_role_lookup,
+        "business_unit": model_to_dict(business_unit, ["tags"]) if business_unit else None,
+        "team": model_to_dict(project) if project else None,
+        "team_member": await project_team_member_to_dict(db, team_member) if team_member else None,
         "setup_url": setup_url,
         "next_steps": "User will receive an email to verify their email address and set their password."
     }
@@ -4872,28 +7367,23 @@ async def get_dashboard_stats(payload: dict = Depends(require_super_admin), db: 
             "revenue": float(month_revenue)
         })
     
-    # Calculate tool distribution from active subscriptions
-    # Count how many subscriptions include each tool
-    result = await db.execute(select(SubscriptionModel).where(SubscriptionModel.status == "active"))
-    active_subscriptions = result.scalars().all()
-    
-    api_count = 0
-    ai_count = 0
-    mig_count = 0
-    
-    for sub in active_subscriptions:
-        tools = await get_subscription_tools(db, sub)
-        if "api_platform" in tools:
-            api_count += 1
-        if "ai_agentic" in tools:
-            ai_count += 1
-        if "migration_tool" in tools:
-            mig_count += 1
-    
+    # Calculate product distribution from active subscriptions in the current catalog.
+    distribution_result = await db.execute(
+        select(ProductModel.name, func.count(SubscriptionModel.id))
+        .select_from(SubscriptionModel)
+        .join(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .join(ProductModel, PlanModel.product_id == ProductModel.id)
+        .where(
+            SubscriptionModel.status == "active",
+            PlanModel.is_active == True,
+            ProductModel.is_active == True,
+        )
+        .group_by(ProductModel.id, ProductModel.name, ProductModel.display_order)
+        .order_by(ProductModel.display_order, ProductModel.name)
+    )
     sub_distribution = [
-        {"name": "API Platform", "value": api_count},
-        {"name": "AI Agentic", "value": ai_count},
-        {"name": "Migration Tool", "value": mig_count},
+        {"name": product_name, "value": count}
+        for product_name, count in distribution_result.all()
     ]
     
     return {
@@ -4936,14 +7426,14 @@ async def get_organization_details(org_id: str, payload: dict = Depends(require_
         .where(BusinessUnitModel.organization_id == org_id)
         .order_by(BusinessUnitModel.name.asc())
     )
-    business_units = [model_to_dict(bu, ["tags"]) for bu in bu_result.scalars().all()]
+    business_units = [await business_unit_to_dict(db, bu) for bu in bu_result.scalars().all()]
 
     project_result = await db.execute(
         select(ProjectModel)
         .where(ProjectModel.organization_id == org_id)
         .order_by(ProjectModel.name.asc())
     )
-    teams = [model_to_dict(project) for project in project_result.scalars().all()]
+    teams = [await project_to_dict(db, project) for project in project_result.scalars().all()]
 
     member_result = await db.execute(
         select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
@@ -4959,8 +7449,82 @@ async def get_organization_details(org_id: str, payload: dict = Depends(require_
         member_data["business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
         team_members.append(member_data)
 
+    user_result = await db.execute(
+        select(UserModel, RoleModel)
+        .outerjoin(RoleModel, UserModel.role_id == RoleModel.id)
+        .where(UserModel.organization_id == organization_id)
+        .order_by(UserModel.created_at.desc())
+    )
+    user_rows = user_result.all()
+    users_by_id = {}
+    users_by_email = {}
+    user_ids = []
+    user_emails = []
+    for user, role in user_rows:
+        entry = {
+            "user": user,
+            "role": role,
+            "business_units_by_id": {},
+        }
+        users_by_id[user.id] = entry
+        users_by_email[user.email.lower()] = entry
+        user_ids.append(user.id)
+        user_emails.append(user.email)
+
+    if user_rows:
+        user_member_result = await db.execute(
+            select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
+            .join(ProjectModel, ProjectTeamMemberModel.project_id == ProjectModel.id)
+            .outerjoin(BusinessUnitModel, ProjectModel.business_unit_id == BusinessUnitModel.id)
+            .where(
+                ProjectTeamMemberModel.organization_id == organization_id,
+                ProjectModel.organization_id == organization_id,
+                ProjectTeamMemberModel.status == "active",
+                (
+                    ProjectTeamMemberModel.user_id.in_(user_ids)
+                    | ProjectTeamMemberModel.email.in_(user_emails)
+                ),
+            )
+            .order_by(BusinessUnitModel.name.asc(), ProjectModel.name.asc())
+        )
+        for member, project, business_unit in user_member_result.all():
+            entry = users_by_id.get(member.user_id) or users_by_email.get((member.email or "").lower())
+            if not entry or not business_unit:
+                continue
+            bu_entry = entry["business_units_by_id"].setdefault(
+                business_unit.id,
+                {
+                    "id": business_unit.id,
+                    "name": business_unit.name,
+                    "code": business_unit.code,
+                    "role": "member",
+                    "projects": [],
+                },
+            )
+            if not any(item["id"] == project.id for item in bu_entry["projects"]):
+                bu_entry["projects"].append({
+                    "id": project.id,
+                    "name": project.name,
+                    "code": project.code,
+                    "role": member.project_role,
+                    "team_member_id": member.id,
+                    "status": member.status,
+                })
+
+    users = [
+        await public_user_detail_to_dict(
+            db,
+            entry["user"],
+            entry["role"],
+            list(entry["business_units_by_id"].values()),
+        )
+        for entry in users_by_id.values()
+    ]
+
     return {
         "organization": await organization_to_dict(db, org),
+        "user_count": len(users),
+        "users": users,
         "business_units": business_units,
         "teams": teams,
         "team_members": team_members
@@ -4984,7 +7548,7 @@ async def get_organization_business_units(
         .order_by(BusinessUnitModel.name.asc())
     )
     business_units = result.scalars().all()
-    response = [model_to_dict(bu, ["tags"]) for bu in business_units]
+    response = [await business_unit_to_dict(db, bu) for bu in business_units]
 
     if include_teams and business_units:
         bu_ids = [bu.id for bu in business_units]
@@ -4995,7 +7559,7 @@ async def get_organization_business_units(
         )
         projects_by_bu = {}
         for project in projects_result.scalars().all():
-            projects_by_bu.setdefault(project.business_unit_id, []).append(model_to_dict(project))
+            projects_by_bu.setdefault(project.business_unit_id, []).append(await project_to_dict(db, project))
         for bu_data in response:
             bu_data["teams"] = projects_by_bu.get(bu_data["id"], [])
             bu_data["projects"] = bu_data["teams"]
@@ -5027,7 +7591,7 @@ async def get_organization_teams(
         query = query.where(ProjectModel.business_unit_id == business_unit_id)
 
     result = await db.execute(query.order_by(ProjectModel.name.asc()))
-    return [model_to_dict(project) for project in result.scalars().all()]
+    return [add_identity_aliases(model_to_dict(project), "project") for project in result.scalars().all()]
 
 @api_router.get("/organizations/{org_id}/users-with-roles")
 async def get_organization_users_with_roles(
@@ -5127,13 +7691,14 @@ async def get_organization(org_id: str, payload: dict = Depends(require_super_ad
 
 @api_router.post("/organizations")
 async def create_organization(data: OrganizationCreate, db: AsyncSession = Depends(get_db)):
+    validate_required_organization_create_fields(payload_dict(data))
     plan_selections = normalize_organization_plan_selections(data)
-    if not plan_selections:
-        raise HTTPException(status_code=400, detail="At least one requested plan is required")
 
     plan_ids = [selection.plan_id for selection in plan_selections]
-    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
-    plans = {plan.id: plan for plan in plans_result.scalars().all()}
+    plans = {}
+    if plan_ids:
+        plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+        plans = {plan.id: plan for plan in plans_result.scalars().all()}
     invalid_plans = [plan_id for plan_id in plan_ids if plan_id not in plans]
     if invalid_plans:
         raise HTTPException(status_code=400, detail=f"Invalid requested plans: {invalid_plans}")
@@ -5162,25 +7727,30 @@ async def create_organization(data: OrganizationCreate, db: AsyncSession = Depen
         requested_plan=json.dumps(plan_ids), requested_tools=json.dumps(selected_tools),
         contact_person=data.contact_person, phone=data.phone, address=data.address,
         description=data.description,
+        supported_domains=supported_domains_from_domain(data.domain),
         gateway_region=data.gateway_region,
         gateway_organization_name=data.gateway_organization_name,
         gateway_environment_type=data.gateway_environment_type,
         gateway_environments=json.dumps(data.gateway_environments) if data.gateway_environments else None
     )
+    apply_onboarding_fields(org, payload_dict(data), ORGANIZATION_ONBOARDING_FIELDS)
+    if org.organization_code and not org.external_org_id:
+        org.external_org_id = org.organization_code
     db.add(org)
     await db.flush()
     await ensure_standard_roles_for_organization(db, org.id)
-    await create_organization_subscription_request_from_selections(
-        db,
-        org.id,
-        plan_selections,
-        status=org.status
-    )
+    if plan_selections:
+        await create_organization_subscription_request_from_selections(
+            db,
+            org.id,
+            plan_selections,
+            status=org.status
+        )
     
     plan_names = [plans[plan_id].name for plan_id in plan_ids]
     notif = NotificationModel(
         title="New Organization Request",
-        message=f"{data.name} has requested to join with {', '.join(plan_names)} plan(s)",
+        message=f"{data.name} has requested to join" + (f" with {', '.join(plan_names)} plan(s)" if plan_names else ""),
         type="info", link=f"/organizations/{org.id}"
     )
     db.add(notif)
@@ -5233,13 +7803,23 @@ async def identify_organization(data: IdentifyOrgRequest, db: AsyncSession = Dep
             except json.JSONDecodeError:
                 continue
 
-    # No matching organization found
+    individual_org = await get_or_create_individual_users_org(db)
+    await db.commit()
+
+    # No matching organization found; unknown domains can continue as Individual Users.
     return {
         "found": False,
         "email": data.email,
         "domain": email_domain,
-        "organization": None,
-        "message": "No organization found for this email domain"
+        "domain_known": False,
+        "individual_user_allowed": True,
+        "subscription_model": "per_user",
+        "organization": {
+            "external_org_id": individual_org.external_org_id,
+            "name": individual_org.name,
+            "id": individual_org.id,
+        },
+        "message": "No organization found for this email domain. User can be added under Individual Users."
     }
 
 @api_router.post("/public/login/initiate", tags=["Public API - Login"])
@@ -5320,6 +7900,8 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
 
         if user.auth0_user_id:
             await auth0_mgmt.send_verification_email(user.auth0_user_id)
+        if user.zitadel_user_id:
+            await zitadel_mgmt.send_verification_email(user.zitadel_user_id)
 
         await db.commit()
 
@@ -5360,11 +7942,29 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
             continue
 
     if not matched_org:
+        individual_request = await create_individual_request_for_unknown_domain(
+            db,
+            email=email,
+            name=derive_name_from_email(email),
+            notes="Created from login initiation for unknown organization domain.",
+        )
+        await db.commit()
         return {
-            "success": False,
-            "next_step": "request_access",
-            "message": f"No account found for {email}. Please submit an individual user request.",
-            "action_url": "/individual-user-request"
+            "success": True,
+            "next_step": "pending_individual_approval",
+            "message": f"No organization domain matched {email_domain}. Request routed to Individual Users for approval.",
+            "request_id": individual_request.id,
+            "organization": {
+                "id": "no_organization",
+                "name": "Individual Users",
+            },
+            "subscription_model": "per_user",
+            "user": {
+                "email": email,
+                "name": individual_request.name,
+                "organization_id": "no_organization",
+                "organization_name": "Individual Users",
+            },
         }
 
     # ------------------------------------------------------------------
@@ -5424,7 +8024,53 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
     }
 
 
-# ==================== PUBLIC API - Auth0 Authentication ====================
+# ==================== IDENTITY PROVIDER SETTINGS ====================
+
+@api_router.get("/identity-provider", tags=["Admin - Identity Provider"])
+async def get_identity_provider_setting(
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the active identity provider setting (Super Admin only)."""
+    active_provider = await get_active_identity_provider(db)
+    return {
+        "active_provider": active_provider,
+        "providers": [
+            identity_provider_config("zitadel"),
+            identity_provider_config("auth0"),
+        ],
+    }
+
+@api_router.put("/identity-provider", tags=["Admin - Identity Provider"])
+async def update_identity_provider_setting(
+    data: IdentityProviderUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Switch the active identity provider for onboarding and generic auth APIs."""
+    setting = await set_active_identity_provider(db, data.provider, payload.get("sub"))
+    await db.commit()
+    active_provider = normalize_identity_provider(setting.value)
+    return {
+        "message": f"Identity provider switched to {active_provider}",
+        "active_provider": active_provider,
+        "providers": [
+            identity_provider_config("zitadel"),
+            identity_provider_config("auth0"),
+        ],
+        "updated_at": setting.updated_at.isoformat() if setting.updated_at else None,
+    }
+
+@api_router.get("/public/identity-provider", tags=["Public API"])
+async def get_public_identity_provider(db: AsyncSession = Depends(get_db)):
+    """Return the active identity provider for external applications."""
+    active_provider = await get_active_identity_provider(db)
+    return {
+        "active_provider": active_provider,
+        "configured": identity_provider_config(active_provider)["configured"],
+    }
+
+# ==================== PUBLIC API - Authentication ====================
 
 @api_router.get("/public/auth0-config", tags=["Public API"])
 async def get_auth0_config():
@@ -5433,6 +8079,7 @@ async def get_auth0_config():
     Does not expose secrets.
     """
     return {
+        "enabled": auth0_mgmt.enabled,
         "domain": AUTH0_MGMT_DOMAIN,
         "db_connection_name": AUTH0_DB_CONNECTION_NAME,
         "db_connection_id": AUTH0_DB_CONNECTION_ID[:10] + "..." if AUTH0_DB_CONNECTION_ID else None,
@@ -5441,10 +8088,57 @@ async def get_auth0_config():
                        "prod" if "prod" in AUTH0_DB_CONNECTION_NAME.lower() else "unknown"
     }
 
-@api_router.post("/public/auth/init", tags=["Public API - Auth0"])
+def resolve_auth0_redirect_uri(product: Optional[str] = None, redirect_uri: Optional[str] = None) -> tuple[str, str]:
+    product_key = (product or "probestack").strip().lower()
+    if product_key in {"localhost", "dev"}:
+        product_key = "local"
+    if product_key not in AUTH0_REDIRECT_URIS:
+        raise HTTPException(status_code=400, detail=f"Unsupported Auth0 product: {product or product_key}")
+
+    if redirect_uri:
+        selected_redirect_uri = redirect_uri.strip()
+        matching_products = [
+            key for key, allowed_redirect_uri in AUTH0_REDIRECT_URIS.items()
+            if allowed_redirect_uri == selected_redirect_uri
+        ]
+        if not matching_products:
+            raise HTTPException(status_code=400, detail="redirect_uri is not registered for Auth0 login")
+        if selected_redirect_uri != AUTH0_REDIRECT_URIS[product_key]:
+            raise HTTPException(status_code=400, detail="redirect_uri does not match the selected Auth0 product")
+    else:
+        selected_redirect_uri = AUTH0_REDIRECT_URIS[product_key]
+
+    return product_key, selected_redirect_uri
+
+def resolve_auth0_post_logout_uri(
+    product: Optional[str] = None,
+    post_logout_redirect_uri: Optional[str] = None,
+) -> tuple[str, str]:
+    product_key = (product or "probestack").strip().lower()
+    if product_key in {"localhost", "dev"}:
+        product_key = "local"
+    if product_key not in AUTH0_POST_LOGOUT_URIS:
+        raise HTTPException(status_code=400, detail=f"Unsupported Auth0 product: {product or product_key}")
+
+    if post_logout_redirect_uri:
+        selected_post_logout_uri = post_logout_redirect_uri.strip()
+        matching_products = [
+            key for key, allowed_uri in AUTH0_POST_LOGOUT_URIS.items()
+            if allowed_uri == selected_post_logout_uri
+        ]
+        if not matching_products:
+            raise HTTPException(status_code=400, detail="post_logout_redirect_uri is not registered for Auth0 logout")
+        if selected_post_logout_uri != AUTH0_POST_LOGOUT_URIS[product_key]:
+            raise HTTPException(status_code=400, detail="post_logout_redirect_uri does not match the selected Auth0 product")
+    else:
+        selected_post_logout_uri = AUTH0_POST_LOGOUT_URIS[product_key]
+
+    return product_key, selected_post_logout_uri
+
+@api_router.post("/public/auth/init", tags=["Public API - Identity"])
 async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db)):
     """
-    Step 1: Initialize Auth0 authentication flow.
+    Step 1: Initialize the active identity-provider authentication flow.
     
     - Takes user email
     - Identifies organization from email domain
@@ -5452,8 +8146,16 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
     
     The frontend should redirect the user to the returned authorize_url.
     """
+    active_provider = await get_active_identity_provider(db)
+    if active_provider == "zitadel":
+        return await zitadel_init(
+            ZitadelInitRequest(email=data.email, state=data.state, product=data.product, redirect_uri=data.redirect_uri),
+            db,
+        )
+    require_identity_provider_configured("auth0")
     if not data.email or "@" not in data.email:
         raise HTTPException(status_code=400, detail="Invalid email format")
+    product_key, redirect_uri = resolve_auth0_redirect_uri(data.product, data.redirect_uri)
 
     # Extract domain from email
     email_domain = "@" + data.email.split("@")[1].lower()
@@ -5495,7 +8197,7 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
         "client_id": AUTH0_CLIENT_ID,
         "response_type": "code",
         "scope": "openid profile email",
-        "redirect_uri": AUTH0_CALLBACK_URI,
+        "redirect_uri": redirect_uri,
         "organization": found_org.auth0_org_id,  # Auth0 org_id like org_SVFows90OrYpzdIs
     }
 
@@ -5507,6 +8209,7 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
 
     return {
         "success": True,
+        "identity_provider": "auth0",
         "authorize_url": authorize_url,
         "organization": {
             "id": found_org.id,
@@ -5515,13 +8218,15 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
             "auth0_org_id": found_org.auth0_org_id
         },
         "email": data.email,
-        "domain": email_domain
+        "domain": email_domain,
+        "product": product_key,
+        "redirect_uri": redirect_uri,
     }
 
-@api_router.post("/public/auth/callback", tags=["Public API - Auth0"])
+@api_router.post("/public/auth/callback", tags=["Public API - Identity"])
 async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(get_db)):
     """
-    Step 2: Exchange Auth0 authorization code for tokens.
+    Step 2: Exchange the active identity-provider authorization code for tokens.
     
     - Takes the code from Auth0 callback
     - Exchanges code for access_token, id_token
@@ -5529,8 +8234,16 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
     - Saves login record to database
     - Returns tokens to the frontend
     """
+    active_provider = await get_active_identity_provider(db)
+    if active_provider == "zitadel":
+        return await zitadel_callback(
+            ZitadelCallbackRequest(code=data.code, email=data.email, product=data.product, redirect_uri=data.redirect_uri),
+            db,
+        )
+    require_identity_provider_configured("auth0")
     if not data.code:
         raise HTTPException(status_code=400, detail="Authorization code is required")
+    product_key, redirect_uri = resolve_auth0_redirect_uri(data.product, data.redirect_uri)
 
     # Exchange code for tokens
     token_url = f"https://{AUTH0_DOMAIN}/oauth/token"
@@ -5539,7 +8252,7 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
         "client_id": AUTH0_CLIENT_ID,
         "client_secret": AUTH0_CLIENT_SECRET,
         "code": data.code,
-        "redirect_uri": AUTH0_CALLBACK_URI
+        "redirect_uri": redirect_uri
     }
 
     async with httpx.AsyncClient() as client:
@@ -5694,6 +8407,8 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
             if primary_role:
                 existing_user.role_id = primary_role["id"]
                 existing_user.role_name = primary_role["name"]
+            if auth0_user_id and not existing_user.auth0_user_id:
+                existing_user.auth0_user_id = auth0_user_id
             existing_user.last_login = datetime.now(timezone.utc)
             synced_user = existing_user
         else:
@@ -5701,6 +8416,9 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
             if not primary_role:
                 default_role = await get_standard_role(db, org.id, "API/Agent Consumer")
                 primary_role = {"id": default_role.id, "name": default_role.name}
+            requested_role = await get_standard_role(db, org.id, primary_role["name"])
+            resolved_role, onboarding_role_lookup = await resolve_new_user_role(db, org, email, requested_role)
+            primary_role = {"id": resolved_role.id, "name": resolved_role.name}
 
             new_user = UserModel(
                 email=email,
@@ -5710,7 +8428,10 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
                 role_id=primary_role["id"],
                 role_name=primary_role["name"],
                 status="active",
-                last_login=datetime.now(timezone.utc)
+                last_login=datetime.now(timezone.utc),
+                auth0_user_id=auth0_user_id,
+                email_verified=bool(user_info.get("email_verified")),
+                password_set=True,
             )
             db.add(new_user)
             synced_user = new_user
@@ -5718,12 +8439,15 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
 
     return {
         "success": True,
+        "identity_provider": "auth0",
         "access_token": tokens.get("access_token"),
         "id_token": id_token,
         "token_type": tokens.get("token_type"),
         "expires_in": expires_in,
         "scope": tokens.get("scope"),
         "user": user_info,
+        "product": product_key,
+        "redirect_uri": redirect_uri,
         "organization": {
             "id": org.id if org else None,
             "name": org.name if org else None,
@@ -5773,6 +8497,579 @@ async def get_auth0_logins(
         for r in records
     ]
 
+@api_router.get("/public/zitadel-config", tags=["Public API"])
+async def get_zitadel_config():
+    """
+    Get current Zitadel environment configuration (for debugging).
+    Does not expose secrets.
+    """
+    return {
+        "domain": zitadel_mgmt.base_url,
+        "default_org_id": ZITADEL_DEFAULT_ORG_ID[:10] + "..." if ZITADEL_DEFAULT_ORG_ID else None,
+        "project_id": ZITADEL_PROJECT_ID[:10] + "..." if ZITADEL_PROJECT_ID else None,
+        "redirect_uris": ZITADEL_REDIRECT_URIS,
+        "post_logout_uris": ZITADEL_POST_LOGOUT_URIS,
+        "configured": zitadel_mgmt.enabled,
+    }
+
+def resolve_zitadel_redirect_uri(product: Optional[str] = None, redirect_uri: Optional[str] = None) -> tuple[str, str]:
+    requested_product = (product or "probestack").strip().lower().replace("-", "")
+    product_key = {
+        "probe": "probestack",
+        "probestack": "probestack",
+        "localhost": "local",
+        "local": "local",
+        "dev": "local",
+        "catalog": "forgecatalog",
+        "forgecatalog": "forgecatalog",
+        "fuzz": "forgefuzz",
+        "forgefuzz": "forgefuzz",
+    }.get(requested_product, requested_product)
+
+    if product_key not in ZITADEL_REDIRECT_URIS:
+        raise HTTPException(status_code=400, detail=f"Unsupported Zitadel product: {product or product_key}")
+
+    if redirect_uri:
+        selected_redirect_uri = redirect_uri.strip()
+        matching_products = [
+            key for key, allowed_redirect_uri in ZITADEL_REDIRECT_URIS.items()
+            if allowed_redirect_uri == selected_redirect_uri
+        ]
+        if not matching_products:
+            raise HTTPException(status_code=400, detail="redirect_uri is not registered for Zitadel login")
+        if selected_redirect_uri != ZITADEL_REDIRECT_URIS[product_key]:
+            raise HTTPException(status_code=400, detail="redirect_uri does not match the selected Zitadel product")
+    else:
+        selected_redirect_uri = ZITADEL_REDIRECT_URIS[product_key]
+
+    return product_key, selected_redirect_uri
+
+def resolve_zitadel_post_logout_uri(
+    product: Optional[str] = None,
+    post_logout_redirect_uri: Optional[str] = None
+) -> tuple[str, str]:
+    requested_product = (product or "probestack").strip().lower().replace("-", "")
+    product_key = {
+        "probe": "probestack",
+        "probestack": "probestack",
+        "localhost": "local",
+        "local": "local",
+        "dev": "local",
+        "catalog": "forgecatalog",
+        "forgecatalog": "forgecatalog",
+        "fuzz": "forgefuzz",
+        "forgefuzz": "forgefuzz",
+    }.get(requested_product, requested_product)
+
+    if product_key not in ZITADEL_POST_LOGOUT_URIS:
+        raise HTTPException(status_code=400, detail=f"Unsupported Zitadel product: {product or product_key}")
+
+    if post_logout_redirect_uri:
+        selected_post_logout_uri = post_logout_redirect_uri.strip()
+        matching_products = [
+            key for key, allowed_post_logout_uri in ZITADEL_POST_LOGOUT_URIS.items()
+            if allowed_post_logout_uri == selected_post_logout_uri
+        ]
+        if not matching_products:
+            raise HTTPException(status_code=400, detail="post_logout_redirect_uri is not registered for Zitadel logout")
+        if selected_post_logout_uri != ZITADEL_POST_LOGOUT_URIS[product_key]:
+            raise HTTPException(status_code=400, detail="post_logout_redirect_uri does not match the selected Zitadel product")
+    else:
+        selected_post_logout_uri = ZITADEL_POST_LOGOUT_URIS[product_key]
+
+    return product_key, selected_post_logout_uri
+
+@api_router.post("/public/zitadel/auth/init", tags=["Public API - Zitadel"])
+async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Step 1: Initialize Zitadel authentication flow.
+    """
+    if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
+        raise HTTPException(status_code=500, detail="Zitadel login is not configured")
+    if not data.email or "@" not in data.email:
+        raise HTTPException(status_code=400, detail="Invalid email format")
+    product_key, redirect_uri = resolve_zitadel_redirect_uri(data.product, data.redirect_uri)
+
+    email = data.email.lower().strip()
+    email_domain = "@" + email.split("@")[1]
+
+    result = await db.execute(
+        select(OrganizationModel).where(
+            OrganizationModel.status == "approved",
+            OrganizationModel.supported_domains.isnot(None)
+        )
+    )
+    organizations = result.scalars().all()
+
+    found_org = None
+    for org in organizations:
+        if org.supported_domains:
+            try:
+                supported = json.loads(org.supported_domains)
+                if any(d.lower() == email_domain for d in supported):
+                    found_org = org
+                    break
+            except json.JSONDecodeError:
+                continue
+
+    if not found_org:
+        raise HTTPException(status_code=404, detail=f"No organization found for email domain {email_domain}")
+
+    selected_zitadel_org_id = found_org.zitadel_org_id or ZITADEL_DEFAULT_ORG_ID
+    if not selected_zitadel_org_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Organization {found_org.name} does not have Zitadel organization configured"
+        )
+
+    scope = " ".join([
+        "openid",
+        "profile",
+        "email",
+        "offline_access",
+        "urn:zitadel:iam:user:resourceowner",
+        f"urn:zitadel:iam:org:id:{selected_zitadel_org_id}",
+    ])
+    zitadel_params = {
+        "client_id": ZITADEL_CLIENT_ID,
+        "response_type": "code",
+        "scope": scope,
+        "redirect_uri": redirect_uri,
+        "login_hint": email,
+    }
+    if data.state:
+        zitadel_params["state"] = data.state
+
+    authorize_url = f"{zitadel_mgmt.base_url}/oauth/v2/authorize?{urlencode(zitadel_params)}"
+
+    return {
+        "success": True,
+        "identity_provider": "zitadel",
+        "authorize_url": authorize_url,
+        "organization": {
+            "id": found_org.id,
+            "name": found_org.name,
+            "external_org_id": found_org.external_org_id,
+            "zitadel_org_id": selected_zitadel_org_id,
+        },
+        "email": email,
+        "domain": email_domain,
+        "product": product_key,
+        "redirect_uri": redirect_uri,
+    }
+
+def extract_zitadel_roles(decoded_token: dict) -> list[str]:
+    role_claims = [
+        decoded_token.get("urn:zitadel:iam:org:project:roles"),
+        decoded_token.get("urn:zitadel:iam:org:projects:roles"),
+        decoded_token.get("roles"),
+    ]
+    roles = []
+    for claim in role_claims:
+        if isinstance(claim, list):
+            for item in claim:
+                if isinstance(item, str):
+                    roles.append(item)
+                elif isinstance(item, dict):
+                    roles.extend([key for key in item.keys() if key])
+        elif isinstance(claim, dict):
+            roles.extend([key for key in claim.keys() if key])
+    return list(dict.fromkeys(roles))
+
+@api_router.post("/public/zitadel/auth/callback", tags=["Public API - Zitadel"])
+async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Step 2: Exchange Zitadel authorization code for tokens and sync user locally.
+    """
+    if not data.code:
+        raise HTTPException(status_code=400, detail="Authorization code is required")
+    if not ZITADEL_CLIENT_ID or not ZITADEL_CLIENT_SECRET or not zitadel_mgmt.base_url:
+        raise HTTPException(status_code=500, detail="Zitadel login is not configured")
+    product_key, redirect_uri = resolve_zitadel_redirect_uri(data.product, data.redirect_uri)
+
+    token_payload = {
+        "grant_type": "authorization_code",
+        "client_id": ZITADEL_CLIENT_ID,
+        "client_secret": ZITADEL_CLIENT_SECRET,
+        "code": data.code,
+        "redirect_uri": redirect_uri,
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{zitadel_mgmt.base_url}/oauth/v2/token",
+                data=token_payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30.0,
+            )
+            if response.status_code != 200:
+                error_detail = response.text
+                try:
+                    error_json = response.json()
+                    error_detail = error_json.get("error_description", error_json.get("error", response.text))
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Zitadel token exchange failed: {error_detail}"
+                )
+            tokens = response.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to connect to Zitadel: {str(e)}")
+
+    id_token = tokens.get("id_token")
+    user_info = {}
+    decoded = {}
+    zitadel_org_id = None
+    zitadel_user_id = None
+    zitadel_roles = []
+
+    if id_token:
+        try:
+            decoded = jwt.decode(id_token, options={"verify_signature": False})
+            user_info = {
+                "email": decoded.get("email"),
+                "name": decoded.get("name") or decoded.get("preferred_username"),
+                "nickname": decoded.get("preferred_username"),
+                "picture": decoded.get("picture"),
+                "email_verified": decoded.get("email_verified"),
+            }
+            zitadel_org_id = (
+                decoded.get("urn:zitadel:iam:user:resourceowner:id")
+                or decoded.get("org_id")
+            )
+            zitadel_user_id = decoded.get("sub")
+            zitadel_roles = extract_zitadel_roles(decoded)
+        except Exception as e:
+            logging.warning(f"Failed to decode Zitadel id_token: {e}")
+
+    access_token = tokens.get("access_token")
+    if access_token and (not user_info.get("email") or not user_info.get("name")):
+        try:
+            async with httpx.AsyncClient() as client:
+                userinfo_response = await client.get(
+                    f"{zitadel_mgmt.base_url}/oidc/v1/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=30.0,
+                )
+            if userinfo_response.status_code == 200:
+                userinfo = userinfo_response.json()
+                user_info = {
+                    "email": user_info.get("email") or userinfo.get("email"),
+                    "name": user_info.get("name") or userinfo.get("name") or userinfo.get("preferred_username"),
+                    "nickname": user_info.get("nickname") or userinfo.get("preferred_username"),
+                    "picture": user_info.get("picture") or userinfo.get("picture"),
+                    "email_verified": (
+                        user_info.get("email_verified")
+                        if user_info.get("email_verified") is not None
+                        else userinfo.get("email_verified")
+                    ),
+                }
+                zitadel_org_id = (
+                    zitadel_org_id
+                    or userinfo.get("urn:zitadel:iam:user:resourceowner:id")
+                    or userinfo.get("org_id")
+                )
+                zitadel_user_id = zitadel_user_id or userinfo.get("sub")
+                zitadel_roles = list(dict.fromkeys(zitadel_roles + extract_zitadel_roles(userinfo)))
+            else:
+                logger.warning(f"Zitadel userinfo lookup failed: {userinfo_response.text}")
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to connect to Zitadel userinfo endpoint: {e}")
+
+    email = user_info.get("email") or data.email
+    org = None
+
+    if zitadel_org_id:
+        result = await db.execute(
+            select(OrganizationModel).where(OrganizationModel.zitadel_org_id == zitadel_org_id)
+        )
+        org = result.scalar_one_or_none()
+
+    if not org and email and "@" in email:
+        email_domain = "@" + email.split("@")[1].lower()
+        result = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.status == "approved",
+                OrganizationModel.supported_domains.isnot(None)
+            )
+        )
+        organizations = result.scalars().all()
+
+        for o in organizations:
+            if o.supported_domains:
+                try:
+                    supported = json.loads(o.supported_domains)
+                    if any(d.lower() == email_domain for d in supported):
+                        org = o
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+    expires_in = tokens.get("expires_in", 86400)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
+    login_record = ZitadelLoginRecordModel(
+        email=email or "unknown",
+        organization_id=org.id if org else "unknown",
+        organization_name=org.name if org else "Unknown",
+        external_org_id=org.external_org_id if org else zitadel_org_id,
+        zitadel_org_id=zitadel_org_id,
+        zitadel_user_id=zitadel_user_id,
+        name=user_info.get("name"),
+        picture=user_info.get("picture"),
+        access_token=tokens.get("access_token"),
+        refresh_token=tokens.get("refresh_token"),
+        id_token=id_token,
+        token_type=tokens.get("token_type"),
+        expires_in=expires_in,
+        expires_at=expires_at,
+    )
+    db.add(login_record)
+
+    synced_user = None
+    synced_roles = []
+
+    if org and email:
+        result = await db.execute(
+            select(UserModel).where(
+                UserModel.email == email,
+                UserModel.organization_id == org.id,
+            )
+        )
+        existing_user = result.scalar_one_or_none()
+
+        await ensure_standard_roles_for_organization(db, org.id)
+        for role_name in zitadel_roles:
+            standard_name = map_to_standard_role_name(role_name, "API/Agent Consumer")
+            role = await get_standard_role(db, org.id, standard_name)
+            role_payload = {"id": role.id, "name": role.name}
+            if role_payload not in synced_roles:
+                synced_roles.append(role_payload)
+
+        primary_role = synced_roles[0] if synced_roles else None
+        if existing_user:
+            existing_user.name = user_info.get("name") or existing_user.name
+            if primary_role:
+                existing_user.role_id = primary_role["id"]
+                existing_user.role_name = primary_role["name"]
+            if zitadel_user_id and not existing_user.zitadel_user_id:
+                existing_user.zitadel_user_id = zitadel_user_id
+            existing_user.last_login = datetime.now(timezone.utc)
+            synced_user = existing_user
+        else:
+            if not primary_role:
+                default_role = await get_standard_role(db, org.id, "API/Agent Consumer")
+                primary_role = {"id": default_role.id, "name": default_role.name}
+            requested_role = await get_standard_role(db, org.id, primary_role["name"])
+            resolved_role, onboarding_role_lookup = await resolve_new_user_role(db, org, email, requested_role)
+            primary_role = {"id": resolved_role.id, "name": resolved_role.name}
+            new_user = UserModel(
+                email=email,
+                name=user_info.get("name") or user_info.get("nickname") or email.split("@")[0],
+                organization_id=org.id,
+                organization_name=org.name,
+                role_id=primary_role["id"],
+                role_name=primary_role["name"],
+                status="active",
+                last_login=datetime.now(timezone.utc),
+                zitadel_user_id=zitadel_user_id,
+                email_verified=bool(user_info.get("email_verified")),
+                password_set=True,
+            )
+            db.add(new_user)
+            synced_user = new_user
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "identity_provider": "zitadel",
+        "access_token": tokens.get("access_token"),
+        "refresh_token": tokens.get("refresh_token"),
+        "id_token": id_token,
+        "token_type": tokens.get("token_type"),
+        "expires_in": expires_in,
+        "scope": tokens.get("scope"),
+        "user": user_info,
+        "product": product_key,
+        "redirect_uri": redirect_uri,
+        "organization": {
+            "id": org.id if org else None,
+            "name": org.name if org else None,
+            "external_org_id": org.external_org_id if org else zitadel_org_id,
+        },
+        "login_record_id": login_record.id,
+        "synced_user": {
+            "id": synced_user.id if synced_user else None,
+            "email": synced_user.email if synced_user else None,
+            "name": synced_user.name if synced_user else None,
+            "role": synced_user.role_name if synced_user else None,
+        } if synced_user else None,
+        "synced_roles": synced_roles,
+        "zitadel_roles": zitadel_roles,
+    }
+
+@api_router.post("/public/zitadel/auth/refresh", tags=["Public API - Zitadel"])
+async def zitadel_refresh_token(data: ZitadelRefreshTokenRequest):
+    """
+    Exchange a Zitadel refresh token for a new access token.
+    """
+    if not data.refresh_token:
+        raise HTTPException(status_code=400, detail="refresh_token is required")
+    if not ZITADEL_CLIENT_ID or not ZITADEL_CLIENT_SECRET or not zitadel_mgmt.base_url:
+        raise HTTPException(status_code=500, detail="Zitadel refresh is not configured")
+
+    token_payload = {
+        "grant_type": "refresh_token",
+        "client_id": ZITADEL_CLIENT_ID,
+        "client_secret": ZITADEL_CLIENT_SECRET,
+        "refresh_token": data.refresh_token,
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{zitadel_mgmt.base_url}/oauth/v2/token",
+                data=token_payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30.0,
+            )
+            if response.status_code != 200:
+                error_detail = response.text
+                try:
+                    error_json = response.json()
+                    error_detail = error_json.get("error_description", error_json.get("error", response.text))
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Zitadel refresh token exchange failed: {error_detail}"
+                )
+            tokens = response.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to connect to Zitadel: {str(e)}")
+
+    return {
+        "success": True,
+        "identity_provider": "zitadel",
+        "access_token": tokens.get("access_token"),
+        "refresh_token": tokens.get("refresh_token"),
+        "id_token": tokens.get("id_token"),
+        "token_type": tokens.get("token_type"),
+        "expires_in": tokens.get("expires_in"),
+        "scope": tokens.get("scope"),
+    }
+
+@api_router.get("/public/zitadel/auth/logout-url", tags=["Public API - Zitadel"])
+async def zitadel_logout_url(
+    product: Optional[str] = "probestack",
+    post_logout_redirect_uri: Optional[str] = None,
+    id_token_hint: Optional[str] = None,
+    state: Optional[str] = None,
+    logout_hint: Optional[str] = None,
+):
+    """
+    Build a Zitadel RP-initiated logout URL for the selected product.
+    """
+    if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
+        raise HTTPException(status_code=500, detail="Zitadel logout is not configured")
+
+    product_key, selected_post_logout_uri = resolve_zitadel_post_logout_uri(product, post_logout_redirect_uri)
+    logout_params = {
+        "client_id": ZITADEL_CLIENT_ID,
+        "post_logout_redirect_uri": selected_post_logout_uri,
+    }
+    if id_token_hint:
+        logout_params["id_token_hint"] = id_token_hint
+    if state:
+        logout_params["state"] = state
+    if logout_hint:
+        logout_params["logout_hint"] = logout_hint
+
+    return {
+        "success": True,
+        "identity_provider": "zitadel",
+        "logout_url": f"{zitadel_mgmt.base_url}/oidc/v1/end_session?{urlencode(logout_params)}",
+        "product": product_key,
+        "post_logout_redirect_uri": selected_post_logout_uri,
+    }
+
+@api_router.post("/public/auth/refresh", tags=["Public API - Identity"])
+async def refresh_active_identity_provider_token(
+    data: ZitadelRefreshTokenRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Refresh tokens through the active identity provider when supported."""
+    active_provider = await get_active_identity_provider(db)
+    if active_provider == "zitadel":
+        return await zitadel_refresh_token(data)
+    raise HTTPException(status_code=400, detail="Auth0 refresh is not implemented for the generic identity endpoint")
+
+@api_router.get("/public/auth/logout-url", tags=["Public API - Identity"])
+async def active_identity_provider_logout_url(
+    product: Optional[str] = "probestack",
+    post_logout_redirect_uri: Optional[str] = None,
+    id_token_hint: Optional[str] = None,
+    state: Optional[str] = None,
+    logout_hint: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Build a logout URL for the active identity provider."""
+    active_provider = await get_active_identity_provider(db)
+    if active_provider == "zitadel":
+        return await zitadel_logout_url(product, post_logout_redirect_uri, id_token_hint, state, logout_hint)
+
+    require_identity_provider_configured("auth0")
+    product_key, return_to = resolve_auth0_post_logout_uri(product, post_logout_redirect_uri)
+    logout_params = {
+        "client_id": AUTH0_CLIENT_ID,
+        "returnTo": return_to,
+    }
+    if state:
+        logout_params["state"] = state
+    return {
+        "success": True,
+        "identity_provider": "auth0",
+        "logout_url": f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}",
+        "product": product_key,
+        "post_logout_redirect_uri": return_to,
+    }
+
+@api_router.get("/zitadel-logins", tags=["Admin - Zitadel"])
+async def get_zitadel_logins(
+    organization_id: Optional[str] = None,
+    limit: int = 100,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get Zitadel login records (Super Admin only)"""
+    query = select(ZitadelLoginRecordModel).order_by(ZitadelLoginRecordModel.login_at.desc())
+
+    if organization_id:
+        query = query.where(ZitadelLoginRecordModel.organization_id == organization_id)
+
+    query = query.limit(limit)
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    return [
+        {
+            "id": r.id,
+            "email": r.email,
+            "organization_id": r.organization_id,
+            "organization_name": r.organization_name,
+            "external_org_id": r.external_org_id,
+            "zitadel_org_id": r.zitadel_org_id,
+            "zitadel_user_id": r.zitadel_user_id,
+            "name": r.name,
+            "login_at": r.login_at.isoformat() if r.login_at else None,
+            "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+        }
+        for r in records
+    ]
+
 # ==================== INDIVIDUAL USER REQUESTS ====================
 
 @api_router.post("/individual-user-requests", tags=["Public API"])
@@ -5784,7 +9081,7 @@ async def create_individual_user_request(data: IndividualUserRequestCreate, db: 
     **Request Body:**
     - `email`: User email (required)
     - `name`: User full name (required)
-    - `requested_plans`: List of Plan IDs (required) - e.g., ['plan_api_enterprise', 'plan_ai_enterprise']
+    - `requested_plans`: List of Plan IDs (required) - e.g., ['plan_forgeq_enterprise', 'plan_agentic_ai_enterprise_plus']
     - `selected_tools`: List of tool names from the plans (required)
     - `purpose`: Why they need access (optional)
     - `company_name`: Company name if any (optional)
@@ -5978,11 +9275,7 @@ async def approve_individual_user_request(
     payload: dict = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Approve an individual user request.
-    Creates user with "No Organization" and assigns subscription.
-    Also creates user in Auth0.
-    """
+    """Approve an individual user request with the active identity provider."""
     result = await db.execute(
         select(IndividualUserRequestModel).where(IndividualUserRequestModel.id == request_id)
     )
@@ -6013,28 +9306,10 @@ async def approve_individual_user_request(
     if not plan:
         raise HTTPException(status_code=400, detail=f"Requested plan '{primary_plan_id}' no longer exists")
     
-    # Create a "No Organization" entry if it doesn't exist
-    result = await db.execute(
-        select(OrganizationModel).where(OrganizationModel.id == "no_organization")
-    )
-    no_org = result.scalar_one_or_none()
-    
-    if not no_org:
-        no_org = OrganizationModel(
-            id="no_organization",
-            name="Individual Users",
-            email="individual@probestack.io",
-            domain=None,
-            status="approved",
-            requested_plan="plan_api_starter",
-            requested_tools=json.dumps(["api_platform"]),
-            contact_person="System",
-            approved_at=datetime.now(timezone.utc)
-        )
-        db.add(no_org)
-        await db.flush()
+    no_org = await get_or_create_individual_users_org(db)
     
     role = await get_standard_role(db, "no_organization", "API/Agent Consumer")
+    role, onboarding_role_lookup = await resolve_new_user_role(db, no_org, request.email, role)
     
     # Create user with first_login_token for setup flow
     user = UserModel(
@@ -6052,54 +9327,40 @@ async def approve_individual_user_request(
     db.add(user)
     await db.flush()
     
-    # Create user in Auth0
-    auth0_result = await auth0_mgmt.create_user(
-        email=request.email,
-        name=request.name,
-        user_metadata={
+    active_provider = await get_active_identity_provider(db)
+    provider_user_result = await provision_user_for_active_provider(
+        db,
+        user,
+        request.email,
+        request.name,
+        {
             "probestack_user_id": user.id,
             "organization_id": "no_organization",
-            "organization_name": "Individual Users"
-        }
+            "organization_name": "Individual Users",
+        },
+        no_org,
+        role.name,
+        active_provider,
     )
+    if not provider_user_result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to create user in {active_provider.upper()}: {provider_user_result.get('error') or 'unknown error'}"
+        )
     
-    if auth0_result.get("success"):
-        user.auth0_user_id = auth0_result.get("auth0_user_id")
-        logger.info(f"Auth0 user created for {request.email}: {user.auth0_user_id}")
-        # Send verification email via Auth0 (user will set password via our setup page)
-        await auth0_mgmt.send_verification_email(user.auth0_user_id)
-    elif auth0_result.get("exists"):
-        # User already exists in Auth0, try to get their ID
-        existing_user = await auth0_mgmt.get_user_by_email(request.email)
-        if existing_user.get("success"):
-            user.auth0_user_id = existing_user["user"]["user_id"]
-            logger.info(f"Auth0 user already exists for {request.email}: {user.auth0_user_id}")
-    else:
-        logger.warning(f"Failed to create Auth0 user for {request.email}: {auth0_result.get('error')}")
-    
-    # Create subscription for individual user
     requested_tools = json.loads(request.requested_tools) if request.requested_tools else []
-    subscription = SubscriptionModel(
-        organization_id="no_organization",
-        organization_name=f"Individual: {request.name}",
-        plan_id=plan.id,
-        plan_name=plan.name,
-        tools=json.dumps(requested_tools),
-        status="active",
-        start_date=datetime.now(timezone.utc),
-        end_date=datetime.now(timezone.utc) + timedelta(days=30),
-        billing_cycle="monthly",
-        amount=plan.price_monthly
+    subscription = await create_individual_user_subscription(
+        db,
+        user=user,
+        plan=plan,
+        requested_tools=requested_tools,
+        source_request=request,
     )
-    db.add(subscription)
-    await db.flush()
-    await set_subscription_tools(db, subscription.id, plan.id, requested_tools)
     
     # Update request
     request.status = "approved"
     request.approved_at = datetime.now(timezone.utc)
     request.assigned_user_id = user.id
-    request.assigned_subscription_id = subscription.id
     request.updated_at = datetime.now(timezone.utc)
     
     await db.commit()
@@ -6115,6 +9376,7 @@ async def approve_individual_user_request(
             "name": user.name,
             "organization_name": "Individual Users",
             "auth0_user_id": user.auth0_user_id,
+            "zitadel_user_id": user.zitadel_user_id,
             "status": user.status,
             "setup_account_url": setup_account_url
         },
@@ -6180,7 +9442,7 @@ async def update_organization(org_id: str, data: OrganizationUpdate, payload: di
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    update_data = {k: v for k, v in payload_dict(data).items() if v is not None}
     if 'supported_domains' in update_data and isinstance(update_data['supported_domains'], list):
         update_data['supported_domains'] = json.dumps(update_data['supported_domains'])
     if 'gateway_environments' in update_data and isinstance(update_data['gateway_environments'], list):
@@ -6196,7 +9458,8 @@ async def update_organization(org_id: str, data: OrganizationUpdate, payload: di
         if existing.scalar_one_or_none():
             raise HTTPException(status_code=400, detail="External Org ID already in use by another organization")
     for key, value in update_data.items():
-        setattr(org, key, value)
+        if hasattr(org, key):
+            setattr(org, key, normalize_onboarding_value(key, value))
     org.updated_at = datetime.now(timezone.utc)
     await db.commit()
     return await organization_to_dict(db, org)
@@ -6215,6 +9478,13 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     org.approved_at = now
     org.updated_at = now
     await ensure_standard_roles_for_organization(db, org.id)
+    active_provider = await get_active_identity_provider(db)
+    provider_result = await provision_organization_for_active_provider(db, org, active_provider)
+    if not provider_result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to create organization in {active_provider.upper()}: {provider_result.get('error') or 'unknown error'}"
+        )
     
     requested_plan_details = await get_organization_requested_plan_details(db, org)
     subscription_ids = []
@@ -6272,6 +9542,9 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     await db.commit()
     return {
         "message": "Organization approved",
+        "identity_provider": active_provider,
+        "auth0_org_id": org.auth0_org_id,
+        "zitadel_org_id": org.zitadel_org_id,
         "subscription_id": subscription_ids[0] if subscription_ids else None,
         "subscription_ids": subscription_ids,
         "plan_ids": [detail["plan_id"] for detail in requested_plan_details]
@@ -6305,15 +9578,88 @@ async def reject_organization(org_id: str, reason: str = "", payload: dict = Dep
 
 @api_router.delete("/organizations/{org_id}")
 async def delete_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(delete(OrganizationModel).where(OrganizationModel.id == org_id))
-    if result.rowcount == 0:
+    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
+
+    auth0_cleanup = None
+    if org.auth0_org_id:
+        auth0_cleanup = await auth0_mgmt.delete_organization(org.auth0_org_id)
+        if not auth0_cleanup.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to delete organization in AUTH0: {auth0_cleanup.get('error') or 'unknown error'}"
+            )
+
+    subscription_ids = select(SubscriptionModel.id).where(SubscriptionModel.organization_id == org_id)
+    org_request_ids = select(OrganizationSubscriptionRequestModel.id).where(
+        OrganizationSubscriptionRequestModel.organization_id == org_id
+    )
+    org_request_item_ids = select(OrganizationSubscriptionRequestItemModel.id).where(
+        OrganizationSubscriptionRequestItemModel.request_id.in_(org_request_ids)
+    )
+    upgrade_request_ids = select(PlanUpgradeRequestModel.id).where(PlanUpgradeRequestModel.organization_id == org_id)
+    upgrade_request_item_ids = select(PlanUpgradeRequestItemModel.id).where(
+        PlanUpgradeRequestItemModel.request_id.in_(upgrade_request_ids)
+    )
+    project_ids = select(ProjectModel.id).where(ProjectModel.organization_id == org_id)
+    application_ids = select(ApplicationModel.id).where(ApplicationModel.organization_id == org_id)
+
+    await db.execute(delete(OrganizationSubscriptionRequestToolModel).where(
+        OrganizationSubscriptionRequestToolModel.request_item_id.in_(org_request_item_ids)
+    ))
+    await db.execute(delete(OrganizationSubscriptionRequestItemModel).where(
+        OrganizationSubscriptionRequestItemModel.request_id.in_(org_request_ids)
+    ))
+    await db.execute(delete(OrganizationSubscriptionRequestModel).where(
+        OrganizationSubscriptionRequestModel.organization_id == org_id
+    ))
+
+    await db.execute(delete(PlanUpgradeRequestToolModel).where(
+        PlanUpgradeRequestToolModel.request_item_id.in_(upgrade_request_item_ids)
+    ))
+    await db.execute(delete(PlanUpgradeRequestItemModel).where(
+        PlanUpgradeRequestItemModel.request_id.in_(upgrade_request_ids)
+    ))
+    await db.execute(delete(PlanUpgradeRequestModel).where(PlanUpgradeRequestModel.organization_id == org_id))
+
+    await db.execute(delete(SubscriptionToolModel).where(SubscriptionToolModel.subscription_id.in_(subscription_ids)))
+    await db.execute(delete(BillingModel).where(BillingModel.subscription_id.in_(subscription_ids)))
+    await db.execute(delete(BillingModel).where(BillingModel.organization_id == org_id))
+    await db.execute(delete(SubscriptionModel).where(SubscriptionModel.organization_id == org_id))
+
+    await db.execute(delete(ProjectTeamMemberModel).where(ProjectTeamMemberModel.organization_id == org_id))
+    await db.execute(delete(ProjectEnvironmentModel).where(ProjectEnvironmentModel.project_id.in_(project_ids)))
+    await db.execute(delete(ApplicationAgentModel).where(ApplicationAgentModel.application_id.in_(application_ids)))
+    await db.execute(delete(ApplicationMonitoringModel).where(ApplicationMonitoringModel.application_id.in_(application_ids)))
+    await db.execute(delete(ApplicationSecurityModel).where(ApplicationSecurityModel.application_id.in_(application_ids)))
+    await db.execute(delete(ApplicationBillingModel).where(ApplicationBillingModel.application_id.in_(application_ids)))
+    await db.execute(delete(ApplicationModel).where(ApplicationModel.organization_id == org_id))
+    await db.execute(delete(ProjectModel).where(ProjectModel.organization_id == org_id))
+    await db.execute(delete(BusinessUnitModel).where(BusinessUnitModel.organization_id == org_id))
+
+    await db.execute(delete(UserRequestModel).where(UserRequestModel.organization_id == org_id))
+    await db.execute(delete(UserModel).where(UserModel.organization_id == org_id))
+    await db.execute(delete(RoleModel).where(RoleModel.organization_id == org_id))
+    await db.execute(delete(AdminModel).where(AdminModel.organization_id == org_id))
+    await db.execute(delete(Auth0LoginRecordModel).where(Auth0LoginRecordModel.organization_id == org_id))
+    await db.execute(delete(ZitadelLoginRecordModel).where(ZitadelLoginRecordModel.organization_id == org_id))
+    await db.execute(delete(OrganizationModel).where(OrganizationModel.id == org_id))
+
     await db.commit()
-    return {"message": "Organization deleted"}
+    return {
+        "message": "Organization deleted",
+        "organization_id": org_id,
+        "auth0_cleanup": auth0_cleanup,
+        "zitadel_cleanup": {"skipped": True, "reason": "Zitadel organization delete is not configured"},
+    }
 
 
 class OrganizationFullUpdate(BaseModel):
     """Schema for super admin to fully edit an organization"""
+    model_config = ConfigDict(extra="allow")
+
     name: Optional[str] = None
     email: Optional[str] = None
     domain: Optional[str] = None
@@ -6323,6 +9669,7 @@ class OrganizationFullUpdate(BaseModel):
     description: Optional[str] = None
     external_org_id: Optional[str] = None
     auth0_org_id: Optional[str] = None
+    zitadel_org_id: Optional[str] = None
     supported_domains: Optional[List[str]] = None
     gateway_region: Optional[str] = None
     gateway_organization_name: Optional[str] = None
@@ -6338,35 +9685,31 @@ async def update_organization_full(org_id: str, data: OrganizationFullUpdate, pa
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    # Update fields if provided
-    if data.name is not None:
-        org.name = data.name
-    if data.email is not None:
-        org.email = data.email
-    if data.domain is not None:
-        org.domain = data.domain
-    if data.contact_person is not None:
-        org.contact_person = data.contact_person
-    if data.phone is not None:
-        org.phone = data.phone
-    if data.address is not None:
-        org.address = data.address
-    if data.description is not None:
-        org.description = data.description
-    if data.external_org_id is not None:
-        org.external_org_id = data.external_org_id if data.external_org_id else None
-    if data.auth0_org_id is not None:
-        org.auth0_org_id = data.auth0_org_id if data.auth0_org_id else None
-    if data.supported_domains is not None:
-        org.supported_domains = json.dumps(data.supported_domains) if data.supported_domains else None
-    if data.gateway_region is not None:
-        org.gateway_region = data.gateway_region if data.gateway_region else None
-    if data.gateway_organization_name is not None:
-        org.gateway_organization_name = data.gateway_organization_name if data.gateway_organization_name else None
-    if data.gateway_environment_type is not None:
-        org.gateway_environment_type = data.gateway_environment_type if data.gateway_environment_type else None
-    if data.gateway_environments is not None:
-        org.gateway_environments = json.dumps(data.gateway_environments) if data.gateway_environments else None
+    update_data = {k: v for k, v in payload_dict(data, exclude_unset=True).items() if v is not None}
+    if "supported_domains" in update_data and isinstance(update_data["supported_domains"], list):
+        update_data["supported_domains"] = json.dumps(update_data["supported_domains"]) if update_data["supported_domains"] else None
+    if "gateway_environments" in update_data and isinstance(update_data["gateway_environments"], list):
+        update_data["gateway_environments"] = json.dumps(update_data["gateway_environments"]) if update_data["gateway_environments"] else None
+    if "name" in update_data:
+        update_data["name"] = update_data["name"].strip()
+        if not update_data["name"]:
+            raise HTTPException(status_code=400, detail="Organization name is required")
+    if "domain" in update_data:
+        update_data["domain"] = update_data["domain"].strip() if update_data["domain"] else None
+        if update_data["domain"] and not org.supported_domains:
+            org.supported_domains = supported_domains_from_domain(update_data["domain"])
+    if "external_org_id" in update_data and update_data["external_org_id"]:
+        existing = await db.execute(
+            select(OrganizationModel).where(
+                OrganizationModel.external_org_id == update_data["external_org_id"],
+                OrganizationModel.id != org_id,
+            )
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="External Org ID already in use by another organization")
+    for key, value in update_data.items():
+        if hasattr(org, key):
+            setattr(org, key, normalize_onboarding_value(key, value))
     
     org.updated_at = datetime.now(timezone.utc)
     await db.commit()
@@ -6592,23 +9935,95 @@ async def update_individual_user_subscription(user_id: str, data: SubscriptionUp
         "subscriptions": created_subs
     }
 
-# ==================== SUBSCRIPTION ROUTES (Super Admin Only) ====================
+# ==================== SUBSCRIPTION ROUTES ====================
 
 @api_router.get("/subscriptions")
-async def get_subscriptions(status: Optional[str] = None, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    query = select(SubscriptionModel)
+async def get_subscriptions(status: Optional[str] = None, payload: dict = Depends(verify_token), db: AsyncSession = Depends(get_db)):
+    access_scope = await get_subscription_access_scope(db, payload)
+
+    if access_scope["scope"] == "individual":
+        subscriptions = await get_active_subscriptions_for_identity(
+            db,
+            email=access_scope["email"],
+            organization_id="no_organization",
+        )
+        if status:
+            subscriptions = [sub for sub in subscriptions if sub.status == status]
+        return [await subscription_to_dict(db, s) for s in subscriptions]
+
+    query = valid_subscription_query()
+    if access_scope["scope"] == "organization":
+        query = query.where(SubscriptionModel.organization_id == access_scope["organization_id"])
     if status:
         query = query.where(SubscriptionModel.status == status)
     result = await db.execute(query.order_by(SubscriptionModel.created_at.desc()))
     return [await subscription_to_dict(db, s) for s in result.scalars().all()]
 
 @api_router.get("/subscriptions/{sub_id}")
-async def get_subscription(sub_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(SubscriptionModel).where(SubscriptionModel.id == sub_id))
+async def get_subscription(sub_id: str, payload: dict = Depends(verify_token), db: AsyncSession = Depends(get_db)):
+    access_scope = await get_subscription_access_scope(db, payload)
+    query = valid_subscription_query().where(SubscriptionModel.id == sub_id)
+    if access_scope["scope"] == "organization":
+        query = query.where(SubscriptionModel.organization_id == access_scope["organization_id"])
+    elif access_scope["scope"] == "individual":
+        allowed_subscriptions = await get_active_subscriptions_for_identity(
+            db,
+            email=access_scope["email"],
+            organization_id="no_organization",
+        )
+        allowed_ids = {sub.id for sub in allowed_subscriptions}
+        if sub_id not in allowed_ids:
+            raise HTTPException(status_code=404, detail="Subscription not found")
+    result = await db.execute(query)
     sub = result.scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
     return await subscription_to_dict(db, sub)
+
+@api_router.put("/subscriptions/{sub_id}/api-count")
+async def update_subscription_api_count(
+    sub_id: str,
+    data: SubscriptionApiCountUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(SubscriptionModel).where(SubscriptionModel.id == sub_id))
+    sub = result.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if data.api_count is not None and data.api_count < 0:
+        raise HTTPException(status_code=400, detail="api_count cannot be negative")
+    sub.api_count = data.api_count
+    await db.commit()
+    return {
+        "message": "Subscription API count updated",
+        "subscription": await subscription_to_dict(db, sub),
+    }
+
+@api_router.put("/subscriptions/{sub_id}/billing-settings")
+async def update_subscription_billing_settings(
+    sub_id: str,
+    data: SubscriptionBillingSettingsUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(SubscriptionModel).where(SubscriptionModel.id == sub_id))
+    sub = result.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if data.api_count is not None and data.api_count < 0:
+        raise HTTPException(status_code=400, detail="api_count cannot be negative")
+    if data.amount is not None and data.amount < 0:
+        raise HTTPException(status_code=400, detail="amount cannot be negative")
+
+    sub.api_count = data.api_count
+    if data.amount is not None:
+        sub.amount = float(data.amount)
+    await db.commit()
+    return {
+        "message": "Subscription billing settings updated",
+        "subscription": await subscription_to_dict(db, sub),
+    }
 
 @api_router.post("/subscriptions/{sub_id}/pause")
 async def pause_subscription(sub_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -6640,8 +10055,13 @@ async def cancel_subscription(sub_id: str, payload: dict = Depends(require_super
 # ==================== PLANS ROUTES (Super Admin Only for management) ====================
 
 @api_router.get("/products")
-async def get_products(include_plans: bool = False, include_inactive: bool = False, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
-    if include_inactive and payload.get("role") != "super_admin":
+async def get_products(
+    include_plans: bool = False,
+    include_inactive: bool = False,
+    payload: Optional[dict] = Depends(optional_verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    if include_inactive and (not payload or payload.get("role") != "super_admin"):
         raise HTTPException(status_code=403, detail="Super admin access required")
     query = select(ProductModel).order_by(ProductModel.display_order, ProductModel.name)
     if not include_inactive:
@@ -6717,8 +10137,8 @@ async def delete_product(product_id: str, payload: dict = Depends(require_super_
     return {"message": "Product deleted"}
 
 @api_router.get("/plans")
-async def get_plans(product_id: Optional[str] = None, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
-    """Get all plans - accessible by any admin (Super Admin or Org Admin)"""
+async def get_plans(product_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    """Get all active plans."""
     query = select(PlanModel).where(PlanModel.is_active == True)
     if product_id:
         product = await get_product_by_id_or_key(db, product_id)
@@ -6744,7 +10164,7 @@ async def get_inactive_plans(product_id: Optional[str] = None, payload: dict = D
     return [await plan_to_dict(db, plan) for plan in plans]
 
 @api_router.get("/plans/{plan_id}")
-async def get_plan(plan_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+async def get_plan(plan_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
     plan = result.scalar_one_or_none()
     if not plan:
@@ -6839,7 +10259,7 @@ async def delete_plan(plan_id: str, payload: dict = Depends(require_super_admin)
 # ==================== PLAN TOOLS ROUTES (Super Admin Only) ====================
 
 @api_router.get("/plans/{plan_id}/tools", tags=["Plans"])
-async def get_plan_tools(plan_id: str, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+async def get_plan_tools(plan_id: str, db: AsyncSession = Depends(get_db)):
     """Get all tools for a specific plan"""
     # Verify plan exists
     plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id, PlanModel.is_active == True))
@@ -6940,7 +10360,7 @@ async def delete_plan_tool(plan_id: str, tool_id: str, payload: dict = Depends(r
     return {"message": "Tool deleted"}
 
 @api_router.get("/plans/{plan_id}/calculate-price", tags=["Plans"])
-async def calculate_plan_price(plan_id: str, tool_ids: str = "", payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+async def calculate_plan_price(plan_id: str, tool_ids: str = "", db: AsyncSession = Depends(get_db)):
     """
     Calculate total price for a plan based on selected tools.
     tool_ids: Comma-separated list of tool IDs
@@ -7029,6 +10449,7 @@ async def create_user(data: UserCreate, payload: dict = Depends(require_super_ad
     org = org_result.scalar_one_or_none()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
+    assert_email_allowed_for_org(data.email, org)
     
     await ensure_standard_roles_for_organization(db, data.organization_id)
     role_result = await db.execute(
@@ -7041,12 +10462,38 @@ async def create_user(data: UserCreate, payload: dict = Depends(require_super_ad
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Standard role not found")
+    role, onboarding_role_lookup = await resolve_new_user_role(db, org, data.email, role)
     
     user = UserModel(
         email=data.email, name=data.name, organization_id=data.organization_id,
-        organization_name=org.name, role_id=data.role_id, role_name=role.name
+        organization_name=org.name, role_id=role.id, role_name=role.name
     )
     db.add(user)
+    await db.flush()
+
+    if is_individual_users_org(org):
+        plan = await get_default_individual_plan(db)
+        individual_request = IndividualUserRequestModel(
+            email=data.email,
+            name=data.name,
+            requested_tools=json.dumps([]),
+            requested_plan=json.dumps([plan.id]),
+            purpose="Created directly by superadmin under Individual Users.",
+            company_name=data.email.split("@", 1)[1] if "@" in data.email else None,
+            status="approved",
+            approved_at=datetime.now(timezone.utc),
+            assigned_user_id=user.id,
+        )
+        db.add(individual_request)
+        await db.flush()
+        await create_individual_user_subscription(
+            db,
+            user=user,
+            plan=plan,
+            requested_tools=[],
+            source_request=individual_request,
+        )
+
     await db.commit()
     return await user_to_dict(db, user)
 
@@ -7178,11 +10625,10 @@ async def mark_billing_unpaid(billing_id: str, payload: dict = Depends(require_s
 async def generate_monthly_bills(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     """
     Generate monthly billing records for all active subscriptions.
-    Creates pending invoices for subscriptions that don't have a bill for the current month.
+    Creates or refreshes pending invoices for the subscription's current billing period.
     """
     now = datetime.now(timezone.utc)
-    current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
+
     # Get all active subscriptions
     subs_result = await db.execute(
         select(SubscriptionModel).where(SubscriptionModel.status == "active")
@@ -7190,33 +10636,49 @@ async def generate_monthly_bills(payload: dict = Depends(require_super_admin), d
     active_subscriptions = subs_result.scalars().all()
     
     bills_created = 0
+    bills_updated = 0
     bills_skipped = 0
     
     for sub in active_subscriptions:
-        # Check if a bill already exists for this subscription this month
+        period_start, period_end = get_subscription_billing_period(sub, now)
+        if not period_start or not period_end:
+            bills_skipped += 1
+            continue
+
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == sub.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        amount = await calculate_subscription_invoice_amount(db, sub, plan)
+        due_date = period_start + timedelta(days=15)
+
+        # Check if a bill already exists for this subscription billing period
         existing_bill = await db.execute(
             select(BillingModel).where(
                 BillingModel.subscription_id == sub.id,
-                BillingModel.billing_date >= current_month_start
+                BillingModel.billing_date >= period_start,
+                BillingModel.billing_date < period_end
             )
         )
-        
-        if existing_bill.scalar_one_or_none():
-            bills_skipped += 1
+        bill = existing_bill.scalar_one_or_none()
+        if bill:
+            if bill.status == "pending":
+                bill.amount = amount
+                bill.organization_name = await get_organization_name(db, sub.organization_id, sub.organization_name)
+                bill.billing_date = period_start
+                bill.due_date = due_date
+                bills_updated += 1
+            else:
+                bills_skipped += 1
             continue
-        
-        # Create new billing record
-        invoice_number = f"INV-{now.strftime('%Y%m')}-{sub.organization_id[-4:].upper()}-{str(uuid.uuid4())[:4].upper()}"
-        due_date = now + timedelta(days=15)
-        
+
+        invoice_number = f"INV-{period_start.strftime('%Y%m')}-{sub.organization_id[-4:].upper()}-{str(uuid.uuid4())[:4].upper()}"
         billing = BillingModel(
             organization_id=sub.organization_id,
             organization_name=await get_organization_name(db, sub.organization_id, sub.organization_name),
             subscription_id=sub.id,
-            amount=sub.amount,
+            amount=amount,
             status="pending",
             invoice_number=invoice_number,
-            billing_date=now,
+            billing_date=period_start,
             due_date=due_date
         )
         db.add(billing)
@@ -7227,6 +10689,7 @@ async def generate_monthly_bills(payload: dict = Depends(require_super_admin), d
     return {
         "message": f"Monthly billing generation complete",
         "bills_created": bills_created,
+        "bills_updated": bills_updated,
         "bills_skipped": bills_skipped,
         "total_active_subscriptions": len(active_subscriptions)
     }
@@ -7443,6 +10906,26 @@ async def root(db: AsyncSession = Depends(get_db)):
 
 # ==================== PUBLIC API FOR EXTERNAL APPLICATIONS ====================
 
+@api_router.get("/public/organizations", tags=["Public API"])
+async def get_public_organizations(
+    status: Optional[str] = "approved",
+    search: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get public organization directory details for products and onboarding screens."""
+    query = select(OrganizationModel)
+    if status:
+        query = query.where(OrganizationModel.status == status)
+    if search:
+        query = query.where(
+            (OrganizationModel.name.ilike(f"%{search}%"))
+            | (OrganizationModel.domain.ilike(f"%{search}%"))
+            | (OrganizationModel.external_org_id.ilike(f"%{search}%"))
+        )
+    query = query.order_by(OrganizationModel.name.asc())
+    result = await db.execute(query)
+    return [await public_organization_to_dict(db, org) for org in result.scalars().all()]
+
 @api_router.post("/public/organizations/request", tags=["Public API"])
 async def request_organization_subscription(data: OrganizationRequest, db: AsyncSession = Depends(get_db)):
     """
@@ -7452,35 +10935,32 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     **Request Body:**
     - `name`: Organization name (required)
     - `email`: Organization email (required)
-    - `domain`: Company domain (optional)
-    - `plans`: New product-plan selections from GET /api/public/plans, e.g.
+    - `domain`: Company domain (required)
+    - `plans`: Optional product-plan selections from GET /api/public/plans, e.g.
       [{"id": "plan_forgeq_enterprise", "product_key": "forgeq", "tool_ids": ["pt_forgeq_enterprise"]}]
     - `requested_plans`: Alternate key for the same product-plan selection format
     - `plan_ids`: Legacy list of Plan IDs to subscribe to
     - `selected_tools`: Legacy flat list of selected tool IDs/names
     - `contact_person`: Primary contact name (required)
-    - `contact_phone`: Contact phone number (optional)
-    - `company_address`: Company address (optional)
+    - `contact_phone`: Contact phone number (required)
+    - `company_address`: Company address (required)
     - `additional_notes`: Any additional notes (optional)
-    - `description`: Optional description (optional)
+    - `description`: Organization description (required)
     
     **Flow:**
     1. Call GET /api/public/pricing to see products and plans
     2. Submit this request with selected plan_ids and tools
     """
-
+    validate_required_organization_create_fields(payload_dict(data))
     plan_selections = normalize_organization_plan_selections(data)
-    if not plan_selections:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one plan is required. Send plans/requested_plans with id or plan_id, or legacy plan_ids."
-        )
 
     plan_ids = [selection.plan_id for selection in plan_selections]
 
     # Validate all plans exist
-    plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
-    plans = {p.id: p for p in plans_result.scalars().all()}
+    plans = {}
+    if plan_ids:
+        plans_result = await db.execute(select(PlanModel).where(PlanModel.id.in_(plan_ids)))
+        plans = {p.id: p for p in plans_result.scalars().all()}
     
     invalid_plans = [pid for pid in plan_ids if pid not in plans]
     if invalid_plans:
@@ -7499,13 +10979,15 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
         )
 
     # Get available tools from ALL selected plans for validation errors and legacy payload support.
-    tools_result = await db.execute(
-        select(PlanToolModel).where(
-            PlanToolModel.plan_id.in_(plan_ids),
-            PlanToolModel.is_active == True
+    available_tool_rows = []
+    if plan_ids:
+        tools_result = await db.execute(
+            select(PlanToolModel).where(
+                PlanToolModel.plan_id.in_(plan_ids),
+                PlanToolModel.is_active == True
+            )
         )
-    )
-    available_tool_rows = tools_result.scalars().all()
+        available_tool_rows = tools_result.scalars().all()
     available_tools = [
         {"id": t.id, "name": t.name, "plan_id": t.plan_id}
         for t in available_tool_rows
@@ -7581,20 +11063,25 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
         phone=data.contact_phone,
         address=data.company_address,
         description=data.description,
+        supported_domains=supported_domains_from_domain(data.domain),
         gateway_region=data.gateway_region,
         gateway_organization_name=data.gateway_organization_name,
         gateway_environment_type=data.gateway_environment_type,
         gateway_environments=json.dumps(data.gateway_environments) if data.gateway_environments else None
     )
+    apply_onboarding_fields(org, payload_dict(data), ORGANIZATION_ONBOARDING_FIELDS)
+    if org.organization_code and not org.external_org_id:
+        org.external_org_id = org.organization_code
     db.add(org)
     await db.flush()
     await ensure_standard_roles_for_organization(db, org.id)
-    await create_organization_subscription_request_from_selections(
-        db,
-        org.id,
-        plan_selections,
-        status=org.status
-    )
+    if plan_selections:
+        await create_organization_subscription_request_from_selections(
+            db,
+            org.id,
+            plan_selections,
+            status=org.status
+        )
     
     # Create notification for admin
     tools_str = ', '.join(selected_tools[:3])
@@ -7603,7 +11090,7 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     plans_str = ', '.join([plans[pid].name for pid in plan_ids])
     notif = NotificationModel(
         title="New Organization Request",
-        message=f"{data.name} has requested {plans_str} with tools: {tools_str}",
+        message=f"{data.name} has requested organization onboarding" + (f" for {plans_str}" if plans_str else "") + (f" with tools: {tools_str}" if tools_str else ""),
         type="info",
         link=f"/pending-organizations"
     )
@@ -7732,8 +11219,12 @@ async def external_get_organization_details(organization_id: str, db: AsyncSessi
         member_data["business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
         team_members.append(member_data)
 
+    users = await get_public_organization_users(db, organization_id)
+
     return {
         "organization": await organization_to_dict(db, org),
+        "user_count": len(users),
+        "users": users,
         "business_units": business_units,
         "teams": teams,
         "team_members": team_members
@@ -7772,7 +11263,7 @@ async def external_create_business_unit(organization_id: str, data: BusinessUnit
     org = await get_approved_org_by_id(db, organization_id)
     business_unit = await create_business_unit_for_org(db, org, data)
     await db.commit()
-    return {"message": "Business unit created successfully", "business_unit": model_to_dict(business_unit, ["tags"])}
+    return {"message": "Business unit created successfully", "business_unit": await business_unit_to_dict(db, business_unit)}
 
 @api_router.get("/public/onboarding/organizations/{organization_id}/business-units/{business_unit_id}", tags=["External Onboarding"])
 async def external_get_business_unit(organization_id: str, business_unit_id: str, db: AsyncSession = Depends(get_db)):
@@ -7787,13 +11278,13 @@ async def external_get_business_unit(organization_id: str, business_unit_id: str
     business_unit = result.scalar_one_or_none()
     if not business_unit:
         raise HTTPException(status_code=404, detail="Business unit not found")
-    response = model_to_dict(business_unit, ["tags"])
+    response = await business_unit_to_dict(db, business_unit)
     teams_result = await db.execute(
         select(ProjectModel)
         .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
         .order_by(ProjectModel.name.asc())
     )
-    response["teams"] = [model_to_dict(project) for project in teams_result.scalars().all()]
+    response["teams"] = [await project_to_dict(db, project) for project in teams_result.scalars().all()]
     return response
 
 @api_router.get("/public/onboarding/organizations/{organization_id}/teams", tags=["External Onboarding"])
@@ -7804,7 +11295,7 @@ async def external_get_teams(organization_id: str, business_unit_id: Optional[st
     if business_unit_id:
         query = query.where(ProjectModel.business_unit_id == business_unit_id)
     result = await db.execute(query.order_by(ProjectModel.name.asc()))
-    return [model_to_dict(project) for project in result.scalars().all()]
+    return [await project_to_dict(db, project) for project in result.scalars().all()]
 
 @api_router.post("/public/onboarding/organizations/{organization_id}/teams", tags=["External Onboarding"])
 async def external_create_team(organization_id: str, data: ExternalProjectCreate, db: AsyncSession = Depends(get_db)):
@@ -7812,14 +11303,14 @@ async def external_create_team(organization_id: str, data: ExternalProjectCreate
     org = await get_approved_org_by_id(db, organization_id)
     project = await create_project_for_org(db, org, data)
     await db.commit()
-    return {"message": "Project created successfully", "team": model_to_dict(project)}
+    return {"message": "Project created successfully", "team": await project_to_dict(db, project)}
 
 @api_router.get("/public/onboarding/organizations/{organization_id}/teams/{team_id}", tags=["External Onboarding"])
 async def external_get_team(organization_id: str, team_id: str, db: AsyncSession = Depends(get_db)):
     """Fetch one Project with its Business unit and members."""
     org = await get_approved_org_by_id(db, organization_id)
     project = await get_project_for_org(db, team_id, org.id)
-    response = model_to_dict(project)
+    response = await project_to_dict(db, project)
     response["business_unit"] = None
     if project.business_unit_id:
         bu_result = await db.execute(
@@ -7829,7 +11320,7 @@ async def external_get_team(organization_id: str, team_id: str, db: AsyncSession
             )
         )
         business_unit = bu_result.scalar_one_or_none()
-        response["business_unit"] = model_to_dict(business_unit, ["tags"]) if business_unit else None
+        response["business_unit"] = await business_unit_to_dict(db, business_unit) if business_unit else None
     members_result = await db.execute(
         select(ProjectTeamMemberModel)
         .where(ProjectTeamMemberModel.organization_id == org.id, ProjectTeamMemberModel.project_id == project.id)
@@ -8016,6 +11507,41 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
         raise HTTPException(status_code=404, detail="Organization not found")
     if org.status != "approved":
         raise HTTPException(status_code=400, detail="Organization is not approved yet")
+
+    matched_domain_org = await find_real_org_by_email_domain(db, data.email)
+    if not is_individual_users_org(org) and matched_domain_org and matched_domain_org.id != org.id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Email {data.email} belongs to {matched_domain_org.name}. Use organization_id {matched_domain_org.id}"
+        )
+
+    if is_individual_users_org(org) or not matched_domain_org:
+        individual_request = await create_individual_request_for_unknown_domain(
+            db,
+            email=data.email,
+            name=data.name,
+            job_title=data.job_title,
+            phone=data.phone,
+            notes=data.notes,
+        )
+        await db.commit()
+        return {
+            "request_id": individual_request.id,
+            "status": individual_request.status,
+            "request_type": "individual_user",
+            "routed_to": "individual_users",
+            "subscription_model": "per_user",
+            "message": f"User request routed to Individual Users. Request ID: {individual_request.id}",
+            "user": {
+                "name": individual_request.name,
+                "email": individual_request.email,
+                "organization": "Individual Users",
+                "organization_id": "no_organization",
+                "requested_role": "API/Agent Consumer",
+            }
+        }
+
+    assert_email_allowed_for_org(data.email, org)
     
     # Check if user with same email already exists in the organization
     existing_user = await db.execute(
@@ -8129,24 +11655,32 @@ async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSessi
     """
     email = data.email.lower().strip() if data.email else None
     auth0_user_id = data.auth0_user_id
+    zitadel_user_id = data.zitadel_user_id
+    identity_provider = (data.identity_provider or "").lower().strip()
 
     if data.id_token:
-        try:
-            decoded = jwt.decode(data.id_token, options={"verify_signature": False})
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid id_token")
-
+        decoded, verified_provider = verify_provider_id_token(data.id_token, identity_provider)
         token_email = decoded.get("email")
-        token_auth0_user_id = decoded.get("sub")
+        token_subject = decoded.get("sub")
         if email and token_email and email != token_email.lower():
             raise HTTPException(status_code=400, detail="email does not match id_token")
         email = email or (token_email.lower() if token_email else None)
-        auth0_user_id = auth0_user_id or token_auth0_user_id
+        if verified_provider == "zitadel":
+            zitadel_user_id = zitadel_user_id or token_subject
+        else:
+            auth0_user_id = auth0_user_id or token_subject
+    elif not ALLOW_CONTEXT_TOKEN_EMAIL_FALLBACK:
+        raise HTTPException(status_code=400, detail="id_token is required to issue a user context token")
 
-    if not email and not auth0_user_id:
-        raise HTTPException(status_code=400, detail="email, auth0_user_id, or id_token is required")
+    if not email and not auth0_user_id and not zitadel_user_id:
+        raise HTTPException(status_code=400, detail="email, auth0_user_id, zitadel_user_id, or id_token is required")
 
-    user_context = await build_user_context(db, email=email, auth0_user_id=auth0_user_id)
+    user_context = await build_user_context(
+        db,
+        email=email,
+        auth0_user_id=auth0_user_id,
+        zitadel_user_id=zitadel_user_id,
+    )
     token, expires_at = create_user_context_token(user_context)
     await db.commit()
 
@@ -8160,20 +11694,25 @@ async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSessi
 
 
 @api_router.get("/public/users/{email}", tags=["Public API"])
-async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
+async def get_user_by_email(email: str, payload: dict = Depends(verify_token), db: AsyncSession = Depends(get_db)):
     """
     Get user details by email (public endpoint).
     Returns user info including role, permissions, plans, tools, and admin status.
     """
+    access_scope = await get_authenticated_data_scope(db, payload)
     # Check in users table
     result = await db.execute(select(UserModel).where(UserModel.email == email))
     user = result.scalar_one_or_none()
     
     if user:
+        if not has_data_scope_access(access_scope, email=user.email, organization_id=user.organization_id):
+            raise HTTPException(status_code=403, detail="Not allowed to access this user")
+        mongodb_role_lookup = await sync_user_role_from_mongodb(db, user)
         # Get role permissions
         role_result = await db.execute(select(RoleModel).where(RoleModel.id == user.role_id))
         role = role_result.scalar_one_or_none()
         permissions = json.loads(role.permissions) if role and role.permissions else []
+        role_name = await get_role_name(db, user.role_id, user.role_name)
         
         # Check if user is also an admin
         admin_result = await db.execute(select(AdminModel).where(AdminModel.email == email))
@@ -8247,12 +11786,13 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
             "organization_name": await get_organization_name(db, user.organization_id, user.organization_name),
             "user_type": user_type,
             "role_id": user.role_id,
-            "role_name": await get_role_name(db, user.role_id, user.role_name),
-            "role": admin.role if admin else (await get_role_name(db, user.role_id, user.role_name) or "user").lower().replace(" ", "_"),
+            "role_name": role_name,
+            "role": admin.role if admin else (role_name or "user").lower().replace(" ", "_"),
             "permissions": permissions,
             "is_admin": admin is not None,
             "status": user.status,
             "theme_preference": getattr(user, 'theme_preference', 'light'),
+            "mongodb_role_lookup": mongodb_role_lookup,
             "plans": plans,
             "tools": tools,
             "subscriptions": [
@@ -8288,6 +11828,8 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
     admin = result.scalar_one_or_none()
     
     if admin:
+        if not has_data_scope_access(access_scope, email=admin.email, organization_id=admin.organization_id):
+            raise HTTPException(status_code=403, detail="Not allowed to access this user")
         # Get subscription based on organization type
         subscriptions = []
         plans = []
@@ -8375,7 +11917,7 @@ async def get_user_by_email(email: str, db: AsyncSession = Depends(get_db)):
 
 
 @api_router.post("/public/users/lookup", tags=["Public API"])
-async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
+async def lookup_users(data: dict, payload: dict = Depends(verify_token), db: AsyncSession = Depends(get_db)):
     """
     Bulk lookup users by email addresses.
     Returns user info including plans and tools for each user.
@@ -8386,6 +11928,8 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
     
     found_users = []
     not_found = []
+    forbidden = []
+    access_scope = await get_authenticated_data_scope(db, payload)
     
     for email in emails:
         # Check users table
@@ -8393,10 +11937,15 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
         user = result.scalar_one_or_none()
         
         if user:
+            if not has_data_scope_access(access_scope, email=user.email, organization_id=user.organization_id):
+                forbidden.append(email)
+                continue
+            mongodb_role_lookup = await sync_user_role_from_mongodb(db, user)
             # Get role permissions
             role_result = await db.execute(select(RoleModel).where(RoleModel.id == user.role_id))
             role = role_result.scalar_one_or_none()
             permissions = json.loads(role.permissions) if role and role.permissions else []
+            role_name = await get_role_name(db, user.role_id, user.role_name)
             
             # Check if also admin
             admin_result = await db.execute(select(AdminModel).where(AdminModel.email == email))
@@ -8465,12 +12014,13 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
                 "organization_name": await get_organization_name(db, user.organization_id, user.organization_name),
                 "user_type": user_type,
                 "role_id": user.role_id,
-                "role_name": await get_role_name(db, user.role_id, user.role_name),
-                "role": admin.role if admin else (await get_role_name(db, user.role_id, user.role_name) or "user").lower().replace(" ", "_"),
+                "role_name": role_name,
+                "role": admin.role if admin else (role_name or "user").lower().replace(" ", "_"),
                 "permissions": permissions,
                 "is_admin": admin is not None,
                 "status": user.status,
                 "theme_preference": getattr(user, 'theme_preference', 'light'),
+                "mongodb_role_lookup": mongodb_role_lookup,
                 "plans": plans,
                 "tools": tools,
                 "subscriptions": [
@@ -8505,6 +12055,9 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
         admin = result.scalar_one_or_none()
         
         if admin:
+            if not has_data_scope_access(access_scope, email=admin.email, organization_id=admin.organization_id):
+                forbidden.append(email)
+                continue
             plans = []
             tools = []
             subscriptions = []
@@ -8590,7 +12143,8 @@ async def lookup_users(data: dict, db: AsyncSession = Depends(get_db)):
     
     return {
         "users": found_users,
-        "not_found": not_found
+        "not_found": not_found,
+        "forbidden": forbidden
     }
 
 
@@ -8714,9 +12268,11 @@ async def get_user_request(request_id: str, payload: dict = Depends(verify_token
 async def approve_user_request(
     request_id: str,
     role_id: str,
-    project_id: str,
+    project_id: Optional[str] = None,
     business_unit_id: Optional[str] = None,
     project_role: str = "member",
+    identity_provider: Optional[str] = None,
+    skip_auth0: bool = False,
     payload: dict = Depends(verify_token),
     db: AsyncSession = Depends(get_db)
 ):
@@ -8732,6 +12288,11 @@ async def approve_user_request(
         raise HTTPException(status_code=404, detail="User request not found")
     if req.status != "pending":
         raise HTTPException(status_code=400, detail="Request is not pending")
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == req.organization_id))
+    request_org = org_result.scalar_one_or_none()
+    if not request_org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    assert_email_allowed_for_org(req.email, request_org)
     # Check if user with this email already exists
     existing_user = await db.execute(select(UserModel).where(UserModel.email == req.email))
     if existing_user.scalar_one_or_none():
@@ -8748,10 +12309,16 @@ async def approve_user_request(
     role = role_result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Standard role not found")
+    selected_role_id = role.id
+    role, onboarding_role_lookup = await resolve_new_user_role(db, request_org, req.email, role)
+    role_id = role.id
     project_role = (project_role or "member").strip().lower()
     if project_role not in ["manager", "member", "viewer"]:
         raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
-    business_unit, project = await validate_user_request_team_assignment(db, req.organization_id, project_id, business_unit_id)
+    business_unit = None
+    project = None
+    if project_id:
+        business_unit, project = await validate_user_request_team_assignment(db, req.organization_id, project_id, business_unit_id)
     
     now = datetime.now(timezone.utc)
     
@@ -8759,10 +12326,10 @@ async def approve_user_request(
     req.status = "approved"
     req.approved_at = now
     req.updated_at = now
-    req.approved_role_id = role_id
-    req.approved_business_unit_id = business_unit.id
-    req.approved_project_id = project.id
-    req.approved_project_role = project_role
+    req.approved_role_id = role.id
+    req.approved_business_unit_id = business_unit.id if business_unit else None
+    req.approved_project_id = project.id if project else None
+    req.approved_project_role = project_role if project else None
     
     # Create the user
     user = UserModel(
@@ -8770,7 +12337,7 @@ async def approve_user_request(
         name=req.name,
         organization_id=req.organization_id,
         organization_name=req.organization_name,
-        role_id=role_id,
+        role_id=role.id,
         role_name=role.name,
         status="pending_verification",
         email_verified=False,
@@ -8779,32 +12346,46 @@ async def approve_user_request(
     )
     db.add(user)
     await db.flush()
-    team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
+    team_member = None
+    if project:
+        team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
     
-    # Create user in Auth0
-    auth0_result = await auth0_mgmt.create_user(
-        email=req.email,
-        name=req.name,
-        user_metadata={
+    provision_org = request_org
+    active_provider = normalize_identity_provider(identity_provider or await get_active_identity_provider(db))
+    if skip_auth0 and active_provider == "auth0":
+        active_provider = "zitadel"
+    if provision_org and provision_org.status == "approved":
+        needs_provider_org = (
+            (active_provider == "auth0" and not provision_org.auth0_org_id)
+            or (active_provider == "zitadel" and not provision_org.zitadel_org_id)
+        )
+        org_provision_result = {"success": True, "skipped": True}
+        if needs_provider_org:
+            org_provision_result = await provision_organization_for_active_provider(db, provision_org, active_provider)
+        if not org_provision_result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to create organization in {active_provider.upper()}: {org_provision_result.get('error') or 'unknown error'}"
+            )
+    provider_user_result = await provision_user_for_active_provider(
+        db,
+        user,
+        req.email,
+        req.name,
+        {
             "probestack_user_id": user.id,
             "organization_id": req.organization_id,
-            "organization_name": req.organization_name
-        }
+            "organization_name": req.organization_name,
+        },
+        provision_org,
+        role.name,
+        active_provider,
     )
-    
-    if auth0_result.get("success"):
-        user.auth0_user_id = auth0_result.get("auth0_user_id")
-        logger.info(f"Auth0 user created for {req.email}: {user.auth0_user_id}")
-        # Send verification email via Auth0
-        await auth0_mgmt.send_verification_email(user.auth0_user_id)
-    elif auth0_result.get("exists"):
-        existing_user = await auth0_mgmt.get_user_by_email(req.email)
-        if existing_user.get("success"):
-            user.auth0_user_id = existing_user["user"]["user_id"]
-            # Send verification email for existing Auth0 user
-            await auth0_mgmt.send_verification_email(user.auth0_user_id)
-    else:
-        logger.warning(f"Failed to create Auth0 user for {req.email}: {auth0_result.get('error')}")
+    if not provider_user_result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to create user in {active_provider.upper()}: {provider_user_result.get('error') or 'unknown error'}"
+        )
     
     # Create notification
     notif = NotificationModel(
@@ -8829,11 +12410,19 @@ async def approve_user_request(
             "organization": user.organization_name,
             "role": user.role_name,
             "auth0_user_id": user.auth0_user_id,
+            "zitadel_user_id": user.zitadel_user_id,
             "status": user.status
         },
-        "business_unit": model_to_dict(business_unit, ["tags"]),
-        "team": model_to_dict(project),
-        "team_member": await project_team_member_to_dict(db, team_member),
+        "identity_provider": active_provider,
+        "auth0_skipped": should_skip_auth0(active_provider, skip_auth0),
+        "selected_role_id": selected_role_id,
+        "assigned_role_id": role.id,
+        "assigned_role_name": role.name,
+        "role_source": "mongodb" if onboarding_role_lookup else "admin_selection",
+        "mongodb_role_lookup": onboarding_role_lookup,
+        "business_unit": model_to_dict(business_unit, ["tags"]) if business_unit else None,
+        "team": model_to_dict(project) if project else None,
+        "team_member": await project_team_member_to_dict(db, team_member) if team_member else None,
         "setup_url": setup_url,
         "next_steps": "User will receive an email to verify their email address and set their password."
     }
@@ -8945,6 +12534,10 @@ async def mysql_column_exists(conn, table_name: str, column_name: str) -> bool:
     )
     return bool(result.scalar())
 
+async def ensure_mysql_column(conn, table_name: str, column_name: str, column_definition: str):
+    if not await mysql_column_exists(conn, table_name, column_name):
+        await conn.execute(text(f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {column_definition}"))
+
 async def ensure_runtime_schema(conn):
     if not await mysql_column_exists(conn, "plans", "product_id"):
         await conn.execute(text("ALTER TABLE plans ADD COLUMN product_id VARCHAR(36) NULL AFTER name"))
@@ -8954,6 +12547,125 @@ async def ensure_runtime_schema(conn):
         await conn.execute(text("ALTER TABLE plans ADD COLUMN billing_period VARCHAR(100) NULL AFTER price_label"))
     if not await mysql_column_exists(conn, "plans", "is_popular"):
         await conn.execute(text("ALTER TABLE plans ADD COLUMN is_popular BOOL NOT NULL DEFAULT FALSE AFTER cost"))
+    await ensure_mysql_column(conn, "subscriptions", "api_count", "INT NULL")
+
+    organization_columns = [
+        ("organization_code", "VARCHAR(100) NULL"),
+        ("legal_name", "VARCHAR(255) NULL"),
+        ("industry", "VARCHAR(100) NULL"),
+        ("business_type", "VARCHAR(50) NULL"),
+        ("country", "VARCHAR(100) NULL"),
+        ("region", "VARCHAR(100) NULL"),
+        ("time_zone", "VARCHAR(100) NULL"),
+        ("headquarters", "VARCHAR(255) NULL"),
+        ("default_currency", "VARCHAR(20) NULL"),
+        ("billing_account", "VARCHAR(255) NULL"),
+        ("cost_center", "VARCHAR(100) NULL"),
+        ("tax_id", "VARCHAR(100) NULL"),
+        ("website", "VARCHAR(500) NULL"),
+        ("logo_url", "TEXT NULL"),
+        ("primary_contact_id", "VARCHAR(36) NULL"),
+        ("executive_sponsor_id", "VARCHAR(36) NULL"),
+        ("technical_contact_id", "VARCHAR(36) NULL"),
+        ("security_contact_id", "VARCHAR(36) NULL"),
+        ("identity_provider", "VARCHAR(50) NULL"),
+        ("sso_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+        ("scim_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+        ("mfa_required", "BOOL NOT NULL DEFAULT FALSE"),
+        ("default_api_gateway", "VARCHAR(255) NULL"),
+        ("default_ai_gateway", "VARCHAR(255) NULL"),
+        ("default_mcp_gateway", "VARCHAR(255) NULL"),
+        ("default_api_design_tool", "VARCHAR(255) NULL"),
+        ("default_api_testing_tool", "VARCHAR(255) NULL"),
+        ("api_agent_lifecycle_stage", "VARCHAR(100) NULL"),
+        ("default_api_inventory", "VARCHAR(255) NULL"),
+        ("cloud_provider", "VARCHAR(100) NULL"),
+        ("kubernetes_platform", "VARCHAR(100) NULL"),
+        ("default_environment_strategy", "VARCHAR(255) NULL"),
+        ("compliance_standards", "TEXT NULL"),
+        ("encryption_standard", "VARCHAR(255) NULL"),
+        ("data_residency", "VARCHAR(255) NULL"),
+        ("created_by", "VARCHAR(36) NULL"),
+    ]
+    for column_name, column_definition in organization_columns:
+        await ensure_mysql_column(conn, "organizations", column_name, column_definition)
+
+    business_unit_columns = [
+        ("display_name", "VARCHAR(255) NULL"),
+        ("parent_business_unit_id", "VARCHAR(36) NULL"),
+        ("division", "VARCHAR(255) NULL"),
+        ("department", "VARCHAR(255) NULL"),
+        ("line_of_business", "VARCHAR(255) NULL"),
+        ("business_executive_id", "VARCHAR(36) NULL"),
+        ("business_owner_id", "VARCHAR(36) NULL"),
+        ("product_owner_id", "VARCHAR(36) NULL"),
+        ("technical_owner_id", "VARCHAR(36) NULL"),
+        ("enterprise_architect_id", "VARCHAR(36) NULL"),
+        ("platform_owner_id", "VARCHAR(36) NULL"),
+        ("security_owner_id", "VARCHAR(36) NULL"),
+        ("compliance_officer_id", "VARCHAR(36) NULL"),
+        ("support_team", "VARCHAR(255) NULL"),
+        ("operations_team", "VARCHAR(255) NULL"),
+        ("cost_center", "VARCHAR(100) NULL"),
+        ("budget", "FLOAT NULL"),
+        ("chargeback_model", "VARCHAR(255) NULL"),
+        ("billing_account", "VARCHAR(255) NULL"),
+        ("monthly_budget", "FLOAT NULL"),
+        ("annual_budget", "FLOAT NULL"),
+        ("ai_budget", "FLOAT NULL"),
+        ("api_budget", "FLOAT NULL"),
+        ("cloud_provider", "VARCHAR(100) NULL"),
+        ("region", "VARCHAR(100) NULL"),
+        ("kubernetes_cluster", "VARCHAR(255) NULL"),
+        ("namespace", "VARCHAR(255) NULL"),
+        ("api_gateway", "VARCHAR(255) NULL"),
+        ("ai_gateway", "VARCHAR(255) NULL"),
+        ("logging_platform", "VARCHAR(255) NULL"),
+        ("monitoring_platform", "VARCHAR(255) NULL"),
+        ("secret_manager", "VARCHAR(255) NULL"),
+        ("approval_workflow", "VARCHAR(255) NULL"),
+        ("risk_classification", "VARCHAR(50) NULL"),
+        ("business_criticality", "VARCHAR(50) NULL"),
+        ("data_classification", "VARCHAR(50) NULL"),
+        ("regulatory_standards", "TEXT NULL"),
+        ("retention_policy", "VARCHAR(255) NULL"),
+        ("backup_policy", "VARCHAR(255) NULL"),
+        ("dr_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+        ("sla_tier", "VARCHAR(50) NULL"),
+    ]
+    for column_name, column_definition in business_unit_columns:
+        await ensure_mysql_column(conn, "business_units", column_name, column_definition)
+
+    project_columns = [
+        ("project_type", "VARCHAR(100) NULL"),
+        ("portfolio", "VARCHAR(255) NULL"),
+        ("project_manager_id", "VARCHAR(36) NULL"),
+        ("product_manager_id", "VARCHAR(36) NULL"),
+        ("scrum_master_id", "VARCHAR(36) NULL"),
+        ("technical_lead_id", "VARCHAR(36) NULL"),
+        ("security_lead_id", "VARCHAR(36) NULL"),
+        ("devops_lead_id", "VARCHAR(36) NULL"),
+        ("methodology", "VARCHAR(100) NULL"),
+        ("sprint_duration", "VARCHAR(100) NULL"),
+        ("repository", "VARCHAR(500) NULL"),
+        ("cicd_tool", "VARCHAR(255) NULL"),
+        ("issue_tracker", "VARCHAR(255) NULL"),
+        ("documentation_url", "VARCHAR(500) NULL"),
+        ("authentication_method", "VARCHAR(255) NULL"),
+        ("authorization_method", "VARCHAR(255) NULL"),
+        ("oauth_provider", "VARCHAR(255) NULL"),
+        ("mtls_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+        ("jwt_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+        ("api_key_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+        ("secrets_vault", "VARCHAR(255) NULL"),
+        ("pci_applicable", "BOOL NOT NULL DEFAULT FALSE"),
+        ("standard_rules", "TEXT NULL"),
+        ("custom_rules", "TEXT NULL"),
+        ("owasp_top10_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+        ("linting_enabled", "BOOL NOT NULL DEFAULT FALSE"),
+    ]
+    for column_name, column_definition in project_columns:
+        await ensure_mysql_column(conn, "projects", column_name, column_definition)
 
 async def ensure_default_products():
     async with AsyncSessionLocal() as db:
@@ -8976,6 +12688,11 @@ async def ensure_default_products():
         for product in legacy_products.scalars().all():
             product.is_active = False
         await db.flush()
+        active_plan_ids = {
+            plan_data["id"]
+            for catalog_item in DEFAULT_PRICING_CATALOG
+            for plan_data in catalog_item["plans"]
+        }
         for catalog_item in DEFAULT_PRICING_CATALOG:
             product = products_by_key.get(catalog_item["product_key"])
             if not product:
@@ -9013,11 +12730,20 @@ async def ensure_default_products():
                     plan.billing_period = plan_data.get("period")
                     plan.cost = cost
                     plan.is_popular = bool(plan_data.get("popular", False))
+                    plan.is_active = True
         plans_result = await db.execute(select(PlanModel))
         for plan in plans_result.scalars().all():
             product = products_by_key.get(plan.tool)
             if product and not plan.product_id:
                 plan.product_id = product.id
+            if plan.id not in active_plan_ids or plan.tool not in active_product_keys or not plan.product_id:
+                plan.is_active = False
+        await db.execute(
+            update(SubscriptionModel)
+            .where(SubscriptionModel.plan_id.not_in(active_plan_ids))
+            .where(SubscriptionModel.status == "active")
+            .values(status="cancelled")
+        )
         await db.commit()
 
 @app.on_event("startup")
