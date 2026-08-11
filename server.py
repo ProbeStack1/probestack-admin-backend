@@ -25,6 +25,7 @@ import secrets
 import smtplib
 from email.message import EmailMessage
 from html import escape
+from cryptography.hazmat.primitives import serialization
 
 from passlib.context import CryptContext
 
@@ -139,9 +140,64 @@ AsyncSessionLocal = async_sessionmaker(
 
 # JWT Config
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
-JWT_ALGORITHM = "HS256"
+JWT_ALGORITHM_ALIASES = {
+    "RSA-256": "RS256",
+    "RSA256": "RS256",
+}
+REQUESTED_JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256").strip().upper()
+JWT_ALGORITHM = JWT_ALGORITHM_ALIASES.get(
+    REQUESTED_JWT_ALGORITHM,
+    REQUESTED_JWT_ALGORITHM,
+)
+JWT_PRIVATE_KEY = os.environ.get("JWT_PRIVATE_KEY", "")
+JWT_PUBLIC_KEY = os.environ.get("JWT_PUBLIC_KEY", "")
+JWT_PRIVATE_KEY_FILE = os.environ.get("JWT_PRIVATE_KEY_FILE", "")
+JWT_PUBLIC_KEY_FILE = os.environ.get("JWT_PUBLIC_KEY_FILE", "")
+JWT_KEY_ID = os.environ.get("JWT_KEY_ID", "")
 PROBESTACK_TOKEN_ISSUER = os.environ.get("PROBESTACK_TOKEN_ISSUER", "https://auth.probestack.io")
 PROBESTACK_TOKEN_AUDIENCE = ["probestack-api", "probestack-ui"]
+
+def load_jwt_key(raw_value: str, file_path: str) -> str:
+    if file_path:
+        return Path(file_path).read_text(encoding="utf-8").strip()
+    return (raw_value or "").replace("\\n", "\n").strip()
+
+JWT_SIGNING_KEY = load_jwt_key(JWT_PRIVATE_KEY, JWT_PRIVATE_KEY_FILE) if JWT_ALGORITHM.startswith("RS") else JWT_SECRET
+JWT_VERIFICATION_KEY = (
+    (load_jwt_key(JWT_PUBLIC_KEY, JWT_PUBLIC_KEY_FILE) or JWT_SIGNING_KEY)
+    if JWT_ALGORITHM.startswith("RS")
+    else JWT_SECRET
+)
+
+def encode_internal_jwt(payload: dict) -> str:
+    if JWT_ALGORITHM.startswith("RS") and not JWT_SIGNING_KEY:
+        raise RuntimeError("JWT_PRIVATE_KEY or JWT_PRIVATE_KEY_FILE is required when JWT_ALGORITHM uses RSA")
+    headers = {"kid": JWT_KEY_ID} if JWT_KEY_ID else None
+    return jwt.encode(payload, JWT_SIGNING_KEY, algorithm=JWT_ALGORITHM, headers=headers)
+
+def decode_internal_jwt(token: str, **kwargs) -> dict:
+    if JWT_ALGORITHM.startswith("RS") and not JWT_VERIFICATION_KEY:
+        raise RuntimeError("JWT_PUBLIC_KEY/JWT_PUBLIC_KEY_FILE or JWT_PRIVATE_KEY/JWT_PRIVATE_KEY_FILE is required when JWT_ALGORITHM uses RSA")
+    return jwt.decode(token, JWT_VERIFICATION_KEY, algorithms=[JWT_ALGORITHM], **kwargs)
+
+def build_internal_jwks() -> dict:
+    if not JWT_ALGORITHM.startswith("RS"):
+        raise HTTPException(status_code=404, detail="JWKS is only available when JWT_ALGORITHM uses RSA")
+    if not JWT_VERIFICATION_KEY:
+        raise HTTPException(status_code=500, detail="JWT public key is not configured")
+    try:
+        key_bytes = JWT_VERIFICATION_KEY.encode("utf-8")
+        try:
+            key = serialization.load_pem_public_key(key_bytes)
+        except ValueError:
+            key = serialization.load_pem_private_key(key_bytes, password=None).public_key()
+        jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to build JWT public key set: {str(exc)}")
+    jwk["use"] = "sig"
+    jwk["alg"] = JWT_ALGORITHM
+    jwk["kid"] = JWT_KEY_ID or "probestack-internal"
+    return {"keys": [jwk]}
 
 # Application email config. When SMTP_HOST is not set, email sending is skipped
 # and the generated setup link is returned/logged for local testing.
@@ -2425,6 +2481,21 @@ def map_to_standard_role_name(role_name: Optional[str], fallback: str = "Read-On
     }
     return legacy_mapping.get(normalized, fallback)
 
+def role_code_for_role_name(role_name: Optional[str], fallback: str = "user") -> str:
+    if not role_name:
+        return fallback
+    role_key = normalize_token_value(role_name, fallback)
+    if role_key in {"super_admin", "org_admin"}:
+        return role_key
+    standard_name = map_to_standard_role_name(role_name, role_name)
+    standard_key = normalize_token_value(standard_name, fallback)
+    role_code_mapping = {
+        "org_admin_owner": "org_admin",
+        "admin": "org_admin",
+        "owner": "org_admin",
+    }
+    return role_code_mapping.get(standard_key, standard_key)
+
 def onboarding_org_identifier_candidates(org: Optional[OrganizationModel]) -> List[str]:
     if not org:
         return []
@@ -3317,7 +3388,7 @@ async def public_user_detail_to_dict(
         "role_id": user.role_id,
         "role_name": role_name,
         "org_role": role_name,
-        "role": normalize_token_value(role_name, "user"),
+        "role": role_code_for_role_name(role_name, "user"),
         "role_permissions": role_permissions,
         "status": user.status,
         "email_verified": bool(user.email_verified),
@@ -3554,7 +3625,8 @@ async def build_business_unit_context(
     business_units_by_id = {}
     projects_without_business_unit = []
     project_memberships = []
-    is_org_admin = bool(admin and admin.role == "org_admin")
+    user_role_code = role_code_for_role_name(role.name if role else None, "user") if user else None
+    is_org_admin = bool((admin and admin.role == "org_admin") or user_role_code == "org_admin")
     is_super_admin = bool(admin and admin.role == "super_admin")
 
     if not organization_id or organization_id == "no_organization" or is_super_admin:
@@ -3760,7 +3832,7 @@ async def build_user_context(
     }
 
 def normalize_scoped_role(role: Optional[str], scope: str, is_admin_scope: bool = False) -> str:
-    role_key = normalize_token_value(role, "member")
+    role_key = role_code_for_role_name(role, "member") if scope == "org" else normalize_token_value(role, "member")
     if is_admin_scope or role_key in {"admin", f"{scope}_admin"}:
         return f"{scope}_admin"
     return role_key
@@ -3856,7 +3928,7 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
     elif user_context.get("is_org_admin"):
         token_role = "org_admin"
     else:
-        token_role = normalize_token_value(org_role.get("name"), "user")
+        token_role = role_code_for_role_name(org_role.get("name"), "user")
 
     return {
         "iss": PROBESTACK_TOKEN_ISSUER,
@@ -3885,7 +3957,7 @@ def create_user_context_token(user_context: dict) -> tuple[str, int]:
     expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
     issued_at = int(datetime.now(timezone.utc).timestamp())
     payload = build_user_context_token_claims(user_context, issued_at, expires_at)
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM), expires_at
+    return encode_internal_jwt(payload), expires_at
 
 async def billing_to_dict(db: AsyncSession, billing: BillingModel) -> dict:
     data = model_to_dict(billing)
@@ -4025,14 +4097,12 @@ def create_token(admin_id: str, email: str, role: str, organization_id: Optional
         "organization_id": organization_id,
         "exp": datetime.now(timezone.utc).timestamp() + 86400
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encode_internal_jwt(payload)
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
-        payload = jwt.decode(
+        payload = decode_internal_jwt(
             credentials.credentials,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
             options={"verify_aud": False},
         )
         return payload
@@ -5370,15 +5440,13 @@ async def forgot_password(data: PasswordResetRequest, db: AsyncSession = Depends
         return {"message": "If the email exists, a password reset link will be sent."}
 
     # Generate a reset token (valid for 1 hour)
-    reset_token = jwt.encode(
+    reset_token = encode_internal_jwt(
         {
             "sub": admin.id,
             "email": admin.email,
             "type": "password_reset",
             "exp": datetime.now(timezone.utc).timestamp() + 3600  # 1 hour
-        },
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM
+        }
     )
 
     # In production, send email with reset link
@@ -5395,7 +5463,7 @@ async def reset_password_with_token(reset_token: str, new_password: str, db: Asy
     Reset password using a reset token (from forgot password flow)
     """
     try:
-        payload = jwt.decode(reset_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = decode_internal_jwt(reset_token)
         if payload.get("type") != "password_reset":
             raise HTTPException(status_code=400, detail="Invalid reset token")
     except jwt.ExpiredSignatureError:
@@ -8458,7 +8526,8 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
             "id": synced_user.id if synced_user else None,
             "email": synced_user.email if synced_user else None,
             "name": synced_user.name if synced_user else None,
-            "role": synced_user.role_name if synced_user else None
+            "role": role_code_for_role_name(synced_user.role_name, "user") if synced_user else None,
+            "role_name": synced_user.role_name if synced_user else None,
         } if synced_user else None,
         "synced_roles": synced_roles,
         "auth0_roles": auth0_roles
@@ -8905,7 +8974,8 @@ async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depe
             "id": synced_user.id if synced_user else None,
             "email": synced_user.email if synced_user else None,
             "name": synced_user.name if synced_user else None,
-            "role": synced_user.role_name if synced_user else None,
+            "role": role_code_for_role_name(synced_user.role_name, "user") if synced_user else None,
+            "role_name": synced_user.role_name if synced_user else None,
         } if synced_user else None,
         "synced_roles": synced_roles,
         "zitadel_roles": zitadel_roles,
@@ -11778,6 +11848,7 @@ async def get_user_by_email(email: str, payload: dict = Depends(verify_token), d
                 pass
         
         # Build response with admin details if user is also an admin
+        response_role = admin.role if admin else role_code_for_role_name(role_name, "user")
         response = {
             "id": user.id,
             "email": user.email,
@@ -11787,7 +11858,7 @@ async def get_user_by_email(email: str, payload: dict = Depends(verify_token), d
             "user_type": user_type,
             "role_id": user.role_id,
             "role_name": role_name,
-            "role": admin.role if admin else (role_name or "user").lower().replace(" ", "_"),
+            "role": response_role,
             "permissions": permissions,
             "is_admin": admin is not None,
             "status": user.status,
@@ -12007,6 +12078,7 @@ async def lookup_users(data: dict, payload: dict = Depends(verify_token), db: As
                 except (json.JSONDecodeError, TypeError):
                     pass
             
+            response_role = admin.role if admin else role_code_for_role_name(role_name, "user")
             user_data = {
                 "email": user.email,
                 "name": user.name,
@@ -12015,7 +12087,7 @@ async def lookup_users(data: dict, payload: dict = Depends(verify_token), db: As
                 "user_type": user_type,
                 "role_id": user.role_id,
                 "role_name": role_name,
-                "role": admin.role if admin else (role_name or "user").lower().replace(" ", "_"),
+                "role": response_role,
                 "permissions": permissions,
                 "is_admin": admin is not None,
                 "status": user.status,
@@ -12408,7 +12480,8 @@ async def approve_user_request(
             "name": user.name,
             "email": user.email,
             "organization": user.organization_name,
-            "role": user.role_name,
+            "role": role_code_for_role_name(user.role_name, "user"),
+            "role_name": user.role_name,
             "auth0_user_id": user.auth0_user_id,
             "zitadel_user_id": user.zitadel_user_id,
             "status": user.status
@@ -12506,6 +12579,14 @@ async def db_health_check(db: AsyncSession = Depends(get_db)):
             "error": str(e),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+
+@api_router.get("/.well-known/jwks.json", tags=["Authentication"])
+async def api_jwks():
+    return build_internal_jwks()
+
+@app.get("/.well-known/jwks.json", tags=["Authentication"])
+async def root_jwks():
+    return build_internal_jwks()
 
 # Include the router
 app.include_router(api_router)
