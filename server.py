@@ -1549,6 +1549,15 @@ class SubscriptionUpdateRequest(BaseModel):
 class SubscriptionApiCountUpdate(BaseModel):
     api_count: Optional[int] = None
 
+class OrganizationSubscriptionApiCountUpdate(BaseModel):
+    subscription_id: str
+    api_count: Optional[int] = None
+
+class OrganizationApiCountUpdate(BaseModel):
+    api_count: Optional[int] = None
+    subscription_id: Optional[str] = None
+    subscriptions: Optional[List[OrganizationSubscriptionApiCountUpdate]] = None
+
 class SubscriptionBillingSettingsUpdate(BaseModel):
     api_count: Optional[int] = None
     amount: Optional[float] = None
@@ -7414,6 +7423,71 @@ async def get_organization_api_counts(
         raise HTTPException(status_code=404, detail="Organization not found")
 
     return await get_organization_api_count_summary(db, org)
+
+@api_router.put("/organizations/{org_id}/api-counts")
+async def update_organization_api_counts(
+    org_id: str,
+    data: OrganizationApiCountUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    org = await get_organization_by_id(db, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    if data.api_count is not None and data.api_count < 0:
+        raise HTTPException(status_code=400, detail="api_count cannot be negative")
+
+    if data.subscriptions:
+        seen_subscription_ids = set()
+        updated_subscription_ids = []
+        for item in data.subscriptions:
+            if item.subscription_id in seen_subscription_ids:
+                raise HTTPException(status_code=400, detail=f"Duplicate subscription_id: {item.subscription_id}")
+            seen_subscription_ids.add(item.subscription_id)
+            if item.api_count is not None and item.api_count < 0:
+                raise HTTPException(status_code=400, detail="api_count cannot be negative")
+
+            result = await db.execute(
+                select(SubscriptionModel).where(
+                    SubscriptionModel.id == item.subscription_id,
+                    SubscriptionModel.organization_id == org_id,
+                    SubscriptionModel.status == "active",
+                )
+            )
+            subscription = result.scalar_one_or_none()
+            if not subscription:
+                raise HTTPException(status_code=404, detail=f"Active subscription not found: {item.subscription_id}")
+            subscription.api_count = item.api_count
+            updated_subscription_ids.append(subscription.id)
+    else:
+        query = select(SubscriptionModel).where(
+            SubscriptionModel.organization_id == org_id,
+            SubscriptionModel.status == "active",
+        )
+        if data.subscription_id:
+            query = query.where(SubscriptionModel.id == data.subscription_id)
+
+        result = await db.execute(query.order_by(SubscriptionModel.created_at.desc()))
+        subscriptions = list(result.scalars().all())
+        if not subscriptions:
+            raise HTTPException(status_code=404, detail="Active subscription not found")
+        if not data.subscription_id and len(subscriptions) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Multiple active subscriptions found. Pass subscription_id or subscriptions to update specific subscriptions.",
+            )
+
+        subscriptions[0].api_count = data.api_count
+        updated_subscription_ids = [subscriptions[0].id]
+
+    await db.commit()
+    summary = await get_organization_api_count_summary(db, org)
+    return {
+        "message": "Organization API count updated",
+        "updated_subscription_ids": updated_subscription_ids,
+        **summary,
+    }
 
 @api_router.get("/organizations/{org_id}")
 async def get_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
