@@ -3937,6 +3937,7 @@ def _invoice_sheet_xml(invoice: dict, line_items: list[dict]) -> str:
     due_date = invoice["due_date"].strftime("%Y-%m-%d")
     billing_period = f"{invoice['period_start'].strftime('%Y-%m-%d')} - {invoice['period_end'].strftime('%Y-%m-%d')}"
     organization = invoice["organization"]
+    customer_address = _organization_invoice_address(organization)
     rows = [
         _xlsx_row(1, ["PROBESTACK", "", "", "", "", "", "", ""], 1, height=28),
         _xlsx_row(2, ["Annual Software Subscriptions & AI Platform", "", "", "", "", "", "", ""], 3),
@@ -3948,7 +3949,7 @@ def _invoice_sheet_xml(invoice: dict, line_items: list[dict]) -> str:
         _xlsx_row(9, ["Cumming, GA 30041 | billing@probestack.com"], 4),
         _xlsx_row(11, ["Bill To"], 7),
         _xlsx_row(12, [organization.get("legal_name") or organization.get("name") or "Customer"], 4),
-        _xlsx_row(13, [organization.get("headquarters") or organization.get("billing_account") or ""], 4),
+        _xlsx_row(13, [customer_address], 4),
         _xlsx_row(14, [organization.get("default_currency") or "USD"], 4),
         _xlsx_row(16, ["SKU", "Product Plan", "Description", "Payment", "Qty", "Unit Price", "Tax %", "Amount"], 2),
     ]
@@ -4105,10 +4106,17 @@ def _wrap_pdf_text(text: Any, max_chars: int) -> list[str]:
         lines.append(current)
     return lines or [""]
 
+def _organization_invoice_address(organization: dict) -> str:
+    for key in ("address", "headquarters", "billing_account"):
+        value = str(organization.get(key) or "").strip()
+        if value:
+            return value
+    return "100 Customer Avenue, Suite 200, San Francisco, CA 94105"
+
 def build_invoice_pdf(invoice: dict, line_items: list[dict]) -> bytes:
     organization = invoice["organization"]
     org_name = organization.get("legal_name") or organization.get("name") or "Customer"
-    customer_address = organization.get("headquarters") or organization.get("billing_account") or "100 Customer Avenue, Suite 200, San Francisco, CA 94105"
+    customer_address = _organization_invoice_address(organization)
     sender_address_lines = ["415 Peachtree Pkwy", "Ste 250", "Cumming, GA 30041"]
     invoice_date = invoice["billing_date"].strftime("%Y-%m-%d")
     due_date = invoice["due_date"].strftime("%Y-%m-%d")
