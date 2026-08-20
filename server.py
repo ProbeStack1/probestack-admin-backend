@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -9,6 +10,8 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 
 import os
 import logging
+import io
+import zipfile
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, List, Optional
@@ -25,6 +28,7 @@ import secrets
 import smtplib
 from email.message import EmailMessage
 from html import escape
+from xml.sax.saxutils import escape as xml_escape
 
 from passlib.context import CryptContext
 
@@ -1146,7 +1150,7 @@ class PlanUpgradeRequestModel(Base):
     __tablename__ = "plan_upgrade_requests"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    current_plan_id: Mapped[str] = mapped_column(String(100), nullable=False)  # JSON array of current plan IDs
+    current_plan_id: Mapped[str] = mapped_column(Text, nullable=False)  # JSON array of current plan IDs
     status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, approved, rejected
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Why they want to upgrade
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -2599,6 +2603,37 @@ async def cancel_active_real_org_subscription_for_plan(
     result = await db.execute(stmt.values(status="cancelled"))
     return result.rowcount or 0
 
+async def cancel_active_real_org_subscriptions_for_product(
+    db: AsyncSession,
+    organization_id: str,
+    product_id: str,
+    *,
+    exclude_subscription_id: Optional[str] = None,
+):
+    org = await get_organization_by_id(db, organization_id)
+    if not await is_real_organization(db, org):
+        return 0
+
+    result = await db.execute(
+        select(SubscriptionModel.id)
+        .join(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(SubscriptionModel.organization_id == organization_id)
+        .where(SubscriptionModel.status == "active")
+        .where(PlanModel.product_id == product_id)
+    )
+    subscription_ids = [sub_id for sub_id in result.scalars().all() if sub_id]
+    if exclude_subscription_id:
+        subscription_ids = [sub_id for sub_id in subscription_ids if sub_id != exclude_subscription_id]
+    if not subscription_ids:
+        return 0
+
+    result = await db.execute(
+        update(SubscriptionModel)
+        .where(SubscriptionModel.id.in_(subscription_ids))
+        .values(status="cancelled")
+    )
+    return result.rowcount or 0
+
 async def ensure_can_activate_subscription(db: AsyncSession, subscription: SubscriptionModel):
     org = await get_organization_by_id(db, subscription.organization_id)
     if not await is_real_organization(db, org):
@@ -2685,6 +2720,96 @@ async def calculate_subscription_invoice_amount(
         return float(subscription.amount or plan_unit_price(plan, subscription.billing_cycle))
     return float(subscription.amount or 0)
 
+def _invoice_safe_token(value: Optional[str]) -> str:
+    token = "".join(ch if ch.isalnum() else "-" for ch in (value or "").upper()).strip("-")
+    return "-".join(part for part in token.split("-") if part) or "PRODUCT"
+
+def _product_sku_code(product: Optional[ProductModel], plan: Optional[PlanModel]) -> str:
+    raw = product.key if product and product.key else product.name if product and product.name else plan.tool if plan else "product"
+    text = (raw or "product").replace("_", "-").replace(" ", "-").lower()
+    for prefix in ("probestack-", "pb-"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    parts = [part for part in text.split("-") if part]
+    compact = "".join(parts)
+    if compact.startswith("forge") and len(compact) > 5:
+        return f"F{compact[5].upper()}"
+    if parts:
+        return "".join(part[0].upper() for part in parts[:3])[:3]
+    return "PRD"
+
+def _plan_display_name(plan: Optional[PlanModel]) -> str:
+    if not plan:
+        return "Subscription"
+    tier = get_plan_tier(plan)
+    if tier == "starter":
+        return "Starter"
+    if tier == "enterprise_plus":
+        return "Enterprise Plus"
+    if tier == "enterprise":
+        return "Enterprise"
+    return plan.name or "Subscription"
+
+def _invoice_sku(product: Optional[ProductModel], plan: Optional[PlanModel]) -> str:
+    return f"PB-{_product_sku_code(product, plan)}-001"
+
+def _annual_unit_price(subscription: SubscriptionModel, plan: Optional[PlanModel]) -> float:
+    if plan:
+        price = plan_unit_price(plan, "yearly")
+        if price:
+            return float(price)
+    amount = float(subscription.amount or 0)
+    if subscription.billing_cycle == "monthly":
+        return amount * 12
+    return amount
+
+async def build_invoice_line_items(db: AsyncSession, organization_id: str) -> list[dict]:
+    subs_result = await db.execute(
+        select(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == organization_id)
+        .where(SubscriptionModel.status == "active")
+        .order_by(SubscriptionModel.created_at.asc())
+    )
+    subscriptions = subs_result.scalars().all()
+    line_items: list[dict] = []
+
+    for subscription in subscriptions:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == subscription.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        product = await get_plan_product(db, plan) if plan else None
+        per_user = is_per_user_plan(plan)
+        qty = await get_billable_user_count(db, organization_id) if per_user else 1
+        if qty < 1:
+            qty = 1
+        unit_price = _annual_unit_price(subscription, plan)
+        description_parts = []
+        if product and product.name:
+            description_parts.append(product.name)
+        if plan and plan.description:
+            description_parts.append(plan.description)
+        elif plan and plan.name:
+            description_parts.append(plan.name)
+        description = " - ".join(description_parts) or "Annual subscription"
+        amount = float(qty * unit_price)
+        line_items.append({
+            "subscription_id": subscription.id,
+            "sku": _invoice_sku(product, plan),
+            "product_plan": _plan_display_name(plan),
+            "description": description,
+            "payment": "Annually",
+            "qty": qty,
+            "unit_price": unit_price,
+            "tax_rate": 0,
+            "amount": amount,
+            "product_name": product.name if product else None,
+            "product_key": product.key if product else (plan.tool if plan else None),
+        })
+
+    return line_items
+
+async def calculate_organization_annual_invoice_amount(db: AsyncSession, organization_id: str) -> float:
+    return float(sum(item["amount"] for item in await build_invoice_line_items(db, organization_id)))
+
 def add_months(value: datetime, months: int) -> datetime:
     month_index = value.month - 1 + months
     year = value.year + month_index // 12
@@ -2769,6 +2894,132 @@ async def set_upgrade_request_items(db: AsyncSession, request_id: str, selection
                 plan_tool_id=plan_tool.id,
                 tool_key=None
             ))
+
+async def prepare_product_upgrade_selections(
+    db: AsyncSession,
+    organization_id: str,
+    selections: List[PlanSelectionItem],
+) -> List[dict]:
+    if not selections:
+        raise HTTPException(status_code=400, detail="At least one plan must be selected")
+
+    selected_plan_ids = set()
+    selections_by_product = {}
+    prepared = []
+
+    for selection in selections:
+        if selection.plan_id in selected_plan_ids:
+            raise HTTPException(status_code=400, detail=f"Duplicate plan selected: {selection.plan_id}")
+        selected_plan_ids.add(selection.plan_id)
+
+        plan_result = await db.execute(
+            select(PlanModel).where(PlanModel.id == selection.plan_id, PlanModel.is_active == True)
+        )
+        plan = plan_result.scalar_one_or_none()
+        if not plan:
+            raise HTTPException(status_code=404, detail=f"Plan {selection.plan_id} not found")
+
+        product = await get_plan_product(db, plan)
+        if not product:
+            raise HTTPException(status_code=400, detail=f"Plan {plan.id} is not linked to a product")
+        if product.id in selections_by_product:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only one plan can be requested per product. Duplicate product: {product.name}",
+            )
+        selections_by_product[product.id] = selection
+
+        await calculate_plan_total(db, plan, selection.tool_ids, "monthly")
+        prepared.append({
+            "selection": selection,
+            "plan": plan,
+            "product": product,
+            "tools": selection.tool_ids or [],
+        })
+
+    product_ids = list(selections_by_product.keys())
+    pending_result = await db.execute(
+        select(PlanModel.product_id)
+        .select_from(PlanUpgradeRequestModel)
+        .join(PlanUpgradeRequestItemModel, PlanUpgradeRequestItemModel.request_id == PlanUpgradeRequestModel.id)
+        .join(PlanModel, PlanUpgradeRequestItemModel.plan_id == PlanModel.id)
+        .where(PlanUpgradeRequestModel.organization_id == organization_id)
+        .where(PlanUpgradeRequestModel.status == "pending")
+        .where(PlanModel.product_id.in_(product_ids))
+        .distinct()
+    )
+    pending_product_ids = {product_id for product_id in pending_result.scalars().all() if product_id}
+    if pending_product_ids:
+        pending_product_names = [
+            item["product"].name
+            for item in prepared
+            if item["product"].id in pending_product_ids
+        ]
+        raise HTTPException(
+            status_code=409,
+            detail=f"Pending upgrade request already exists for product(s): {', '.join(pending_product_names)}",
+        )
+
+    current_result = await db.execute(
+        select(SubscriptionModel, PlanModel)
+        .join(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(SubscriptionModel.organization_id == organization_id)
+        .where(SubscriptionModel.status == "active")
+        .where(PlanModel.product_id.in_(product_ids))
+    )
+    current_plan_ids_by_product = {}
+    current_plan_names_by_product = {}
+    for subscription, plan in current_result.all():
+        current_plan_ids_by_product.setdefault(plan.product_id, []).append(subscription.plan_id)
+        current_plan_names_by_product.setdefault(plan.product_id, []).append(plan.name)
+
+    for item in prepared:
+        product_id = item["product"].id
+        item["current_plan_ids"] = current_plan_ids_by_product.get(product_id, [])
+        item["current_plan_names"] = current_plan_names_by_product.get(product_id, [])
+        if item["plan"].id in item["current_plan_ids"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{item['product'].name} is already subscribed to the {item['plan'].name} plan",
+            )
+
+    return prepared
+
+async def create_product_upgrade_requests(
+    db: AsyncSession,
+    *,
+    org: OrganizationModel,
+    organization_id: str,
+    selections: List[PlanSelectionItem],
+    reason: Optional[str],
+    requested_by: str,
+) -> tuple[List[PlanUpgradeRequestModel], List[dict]]:
+    prepared = await prepare_product_upgrade_selections(db, organization_id, selections)
+    current_plan_ids = []
+    for item in prepared:
+        current_plan_ids.extend(item["current_plan_ids"])
+    upgrade_request = PlanUpgradeRequestModel(
+        organization_id=organization_id,
+        current_plan_id=json.dumps(current_plan_ids) if current_plan_ids else "",
+        reason=reason,
+        requested_by=requested_by,
+    )
+    db.add(upgrade_request)
+    await db.flush()
+    await set_upgrade_request_items(db, upgrade_request.id, [item["selection"] for item in prepared])
+
+    requested_labels = [
+        f"{item['product'].name} - {item['plan'].name}"
+        for item in prepared
+    ]
+    db.add(NotificationModel(
+        title="Plan Upgrade Request",
+        message=f"{org.name} requested: {', '.join(requested_labels)}",
+        type="info",
+        link="/plan-upgrade-requests",
+    ))
+
+    return [upgrade_request], prepared
 
 async def get_upgrade_request_items(db: AsyncSession, request: PlanUpgradeRequestModel) -> List[dict]:
     result = await db.execute(
@@ -3610,6 +3861,390 @@ async def billing_to_dict(db: AsyncSession, billing: BillingModel) -> dict:
     data["organization_name"] = await get_organization_name(db, billing.organization_id)
     return data
 
+def _xlsx_col(index: int) -> str:
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+def _xlsx_cell(ref: str, value: Any = "", style: int = 0, formula: Optional[str] = None) -> str:
+    style_attr = f' s="{style}"' if style else ""
+    if formula:
+        cached = value if isinstance(value, (int, float)) else 0
+        return f'<c r="{ref}"{style_attr}><f>{xml_escape(formula)}</f><v>{cached}</v></c>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+    text = xml_escape("" if value is None else str(value))
+    return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t>{text}</t></is></c>'
+
+def _xlsx_row(row_number: int, values: list[Any], style: int = 0, start_col: int = 1, height: Optional[int] = None) -> str:
+    height_attr = f' ht="{height}" customHeight="1"' if height else ""
+    cells = []
+    for offset, value in enumerate(values):
+        ref = f"{_xlsx_col(start_col + offset)}{row_number}"
+        cell_style = value.get("style", style) if isinstance(value, dict) else style
+        if isinstance(value, dict):
+            cells.append(_xlsx_cell(ref, value.get("value", ""), cell_style, value.get("formula")))
+        else:
+            cells.append(_xlsx_cell(ref, value, cell_style))
+    return f'<row r="{row_number}"{height_attr}>{"".join(cells)}</row>'
+
+def _xlsx_styles() -> str:
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="3">
+    <numFmt numFmtId="164" formatCode="$#,##0.00"/>
+    <numFmt numFmtId="165" formatCode="0%"/>
+    <numFmt numFmtId="166" formatCode="yyyy-mm-dd"/>
+  </numFmts>
+  <fonts count="5">
+    <font><sz val="11"/><color theme="1"/><name val="Calibri"/></font>
+    <font><b/><sz val="20"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>
+    <font><b/><sz val="12"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><color rgb="FF0F172A"/><name val="Calibri"/></font>
+    <font><sz val="10"/><color rgb="FF334155"/><name val="Calibri"/></font>
+  </fonts>
+  <fills count="5">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFFF6B2C"/><bgColor indexed="64"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFF1F5F9"/><bgColor indexed="64"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFE2E8F0"/><bgColor indexed="64"/></patternFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border><left style="thin"><color rgb="FFCBD5E1"/></left><right style="thin"><color rgb="FFCBD5E1"/></right><top style="thin"><color rgb="FFCBD5E1"/></top><bottom style="thin"><color rgb="FFCBD5E1"/></bottom><diagonal/></border>
+  </borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="10">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+    <xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="3" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf>
+    <xf numFmtId="164" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>
+    <xf numFmtId="165" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="3" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="164" fontId="3" fillId="4" borderId="1" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="4" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf>
+  </cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>"""
+
+def _invoice_sheet_xml(invoice: dict, line_items: list[dict]) -> str:
+    invoice_date = invoice["billing_date"].strftime("%Y-%m-%d")
+    due_date = invoice["due_date"].strftime("%Y-%m-%d")
+    billing_period = f"{invoice['period_start'].strftime('%Y-%m-%d')} - {invoice['period_end'].strftime('%Y-%m-%d')}"
+    organization = invoice["organization"]
+    rows = [
+        _xlsx_row(1, ["PROBESTACK", "", "", "", "", "", "", ""], 1, height=28),
+        _xlsx_row(2, ["Annual Software Subscriptions & AI Platform", "", "", "", "", "", "", ""], 3),
+        _xlsx_row(4, ["INVOICE", "", "", "", "Invoice Details", "", "", ""], 7),
+        _xlsx_row(5, ["", "", "", "", "Invoice #", invoice["invoice_number"], "Invoice Date", invoice_date], 4),
+        _xlsx_row(6, ["From", "", "", "", "Customer PO #", "", "Due Date", due_date], 4),
+        _xlsx_row(7, ["ProbeStack Inc. (USA)", "", "", "", "Payment Terms", "Net 15", "Currency", "USD"], 4),
+        _xlsx_row(8, ["415 Peachtree Pkwy, Ste 250", "", "", "", "Billing Period", billing_period, "Status", invoice["status"]], 4),
+        _xlsx_row(9, ["Cumming, GA 30041 | billing@probestack.com"], 4),
+        _xlsx_row(11, ["Bill To"], 7),
+        _xlsx_row(12, [organization.get("legal_name") or organization.get("name") or "Customer"], 4),
+        _xlsx_row(13, [organization.get("headquarters") or organization.get("billing_account") or ""], 4),
+        _xlsx_row(14, [organization.get("default_currency") or "USD"], 4),
+        _xlsx_row(16, ["SKU", "Product Plan", "Description", "Payment", "Qty", "Unit Price", "Tax %", "Amount"], 2),
+    ]
+    subtotal = 0.0
+    for index, item in enumerate(line_items, start=17):
+        subtotal += float(item["amount"])
+        rows.append(_xlsx_row(index, [
+            item["sku"],
+            item["product_plan"],
+            item["description"],
+            "Annually",
+            item["qty"],
+            {"value": item["unit_price"], "style": 5},
+            {"value": item["tax_rate"], "style": 6},
+            {"value": item["amount"], "formula": f"E{index}*F{index}", "style": 5},
+        ], 4, height=34))
+
+    total_row = max(23, 18 + len(line_items))
+    tax = 0.0
+    rows.extend([
+        _xlsx_row(total_row, ["Payment Instructions", "", "", "", "", "Subtotal", "", {"value": subtotal, "formula": f"SUM(H17:H{16 + len(line_items)})", "style": 8}], 7),
+        _xlsx_row(total_row + 1, ["Payment Method: ACH / Wire / Credit Card\nBank / Payment Portal: [Insert Details]\nPayment Frequency: Annually for all organizations\nReference: Please include the invoice number on payment.", "", "", "", "", "Tax", "", {"value": tax, "formula": f"SUMPRODUCT(H17:H{16 + len(line_items)},G17:G{16 + len(line_items)})", "style": 8}], 9, height=62),
+        _xlsx_row(total_row + 2, ["", "", "", "", "", "Total Due", "", {"value": subtotal + tax, "formula": f"H{total_row}+H{total_row + 1}", "style": 8}], 7),
+        _xlsx_row(total_row + 5, ["Notes & Terms"], 7),
+        _xlsx_row(total_row + 6, ["SKU is the unique product-plan ID for each product such as ForgeShift or ForgeFuzz. Product Plan should be Starter, Enterprise, or Enterprise Plus. Payment is annual for all organizations. Use Qty for number of users when user-priced; use Qty = 1 for each subscription-priced or /month subscription line."], 9, height=56),
+    ])
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetFormatPr defaultRowHeight="15"/>
+  <cols>
+    <col min="1" max="1" width="24" customWidth="1"/><col min="2" max="2" width="20" customWidth="1"/>
+    <col min="3" max="3" width="54" customWidth="1"/><col min="4" max="4" width="14" customWidth="1"/>
+    <col min="5" max="5" width="9" customWidth="1"/><col min="6" max="6" width="15" customWidth="1"/>
+    <col min="7" max="7" width="10" customWidth="1"/><col min="8" max="8" width="16" customWidth="1"/>
+  </cols>
+  <sheetData>{"".join(rows)}</sheetData>
+  <mergeCells count="6"><mergeCell ref="A1:H1"/><mergeCell ref="A2:H2"/><mergeCell ref="A4:D4"/><mergeCell ref="E4:H4"/><mergeCell ref="A{total_row + 1}:D{total_row + 1}"/><mergeCell ref="A{total_row + 6}:H{total_row + 6}"/></mergeCells>
+</worksheet>"""
+
+def _catalog_sheet_xml(line_items: list[dict]) -> str:
+    rows = [
+        _xlsx_row(1, ["SKU", "Product Plan", "Description", "Payment", "Unit Price", "Currency", "Qty Rule", "", "Invoice Usage"], 2)
+    ]
+    usage_notes = {
+        2: "Use SKU as the unique product-plan ID.",
+        3: "Plans are Starter, Enterprise, Enterprise Plus.",
+        4: "Payment is annually for every organization.",
+        5: "For user-priced rows, Qty = number of users.",
+        6: "For subscription or /month rows, Qty = 1.",
+    }
+    seen = set()
+    row_number = 2
+    for item in line_items:
+        if item["sku"] in seen:
+            continue
+        seen.add(item["sku"])
+        qty_rule = "Qty = number of users when user-priced" if item["qty"] != 1 else "Qty = 1 for subscription or /month pricing"
+        rows.append(_xlsx_row(row_number, [
+            item["sku"], item["product_plan"], item["description"], "Annually",
+            {"value": item["unit_price"], "style": 5}, "USD", qty_rule, "", usage_notes.get(row_number, "")
+        ], 4, height=32))
+        row_number += 1
+    while row_number <= 6:
+        rows.append(_xlsx_row(row_number, ["", "", "", "", "", "", "", "", usage_notes.get(row_number, "")], 4))
+        row_number += 1
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetFormatPr defaultRowHeight="15"/>
+  <cols>
+    <col min="1" max="1" width="24" customWidth="1"/><col min="2" max="2" width="20" customWidth="1"/>
+    <col min="3" max="3" width="58" customWidth="1"/><col min="4" max="4" width="14" customWidth="1"/>
+    <col min="5" max="5" width="15" customWidth="1"/><col min="6" max="6" width="12" customWidth="1"/>
+    <col min="7" max="7" width="40" customWidth="1"/><col min="9" max="9" width="44" customWidth="1"/>
+  </cols>
+  <sheetData>{"".join(rows)}</sheetData>
+</worksheet>"""
+
+def build_invoice_workbook(invoice: dict, line_items: list[dict]) -> bytes:
+    workbook = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Invoice" sheetId="1" r:id="rId1"/><sheet name="Product Plans" sheetId="2" r:id="rId2"/></sheets>
+</workbook>"""
+    workbook_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"""
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>"""
+    root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", _xlsx_styles())
+        zf.writestr("xl/worksheets/sheet1.xml", _invoice_sheet_xml(invoice, line_items))
+        zf.writestr("xl/worksheets/sheet2.xml", _catalog_sheet_xml(line_items))
+    return output.getvalue()
+
+def _pdf_escape(value: Any) -> str:
+    return str(value if value is not None else "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+def _pdf_text_width(text: Any, size: float) -> float:
+    return len(str(text or "")) * size * 0.48
+
+def _pdf_text_line(
+    x: float,
+    y: float,
+    text: Any,
+    size: float = 10,
+    bold: bool = False,
+    color: tuple[float, float, float] = (0.10, 0.14, 0.22),
+    align: str = "left",
+    width: float = 0,
+) -> str:
+    if align == "right" and width:
+        x = x + width - _pdf_text_width(text, size)
+    font = "F2" if bold else "F1"
+    return f"q {color[0]} {color[1]} {color[2]} rg BT /{font} {size:.1f} Tf {x:.1f} {y:.1f} Td ({_pdf_escape(text)}) Tj ET Q\n"
+
+def _pdf_rect(x: float, y: float, width: float, height: float, fill: Optional[tuple[float, float, float]] = None) -> str:
+    if fill:
+        return f"q {fill[0]} {fill[1]} {fill[2]} rg {x:.1f} {y:.1f} {width:.1f} {height:.1f} re f Q\n"
+    return f"q 0.82 0.86 0.91 RG {x:.1f} {y:.1f} {width:.1f} {height:.1f} re S Q\n"
+
+def _pdf_line(x1: float, y1: float, x2: float, y2: float, color: tuple[float, float, float] = (0.82, 0.86, 0.91), width: float = 0.7) -> str:
+    return f"q {color[0]} {color[1]} {color[2]} RG {width:.1f} w {x1:.1f} {y1:.1f} m {x2:.1f} {y2:.1f} l S Q\n"
+
+def _wrap_pdf_text(text: Any, max_chars: int) -> list[str]:
+    words = str(text or "").split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if len(current) + len(word) + (1 if current else 0) <= max_chars:
+            current = f"{current} {word}".strip()
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+def build_invoice_pdf(invoice: dict, line_items: list[dict]) -> bytes:
+    organization = invoice["organization"]
+    org_name = organization.get("legal_name") or organization.get("name") or "Customer"
+    customer_address = organization.get("headquarters") or organization.get("billing_account") or "100 Customer Avenue, Suite 200, San Francisco, CA 94105"
+    sender_address_lines = ["415 Peachtree Pkwy", "Ste 250", "Cumming, GA 30041"]
+    invoice_date = invoice["billing_date"].strftime("%Y-%m-%d")
+    due_date = invoice["due_date"].strftime("%Y-%m-%d")
+    billing_period = f"{invoice['period_start'].strftime('%Y-%m-%d')} - {invoice['period_end'].strftime('%Y-%m-%d')}"
+    subtotal = float(sum(item["amount"] for item in line_items))
+    tax = 0.0
+    total = subtotal + tax
+
+    orange = (0.95, 0.38, 0.14)
+    dark = (0.09, 0.12, 0.18)
+    muted = (0.39, 0.46, 0.57)
+    border = (0.82, 0.86, 0.91)
+    soft = (0.97, 0.98, 0.99)
+    white = (1.0, 1.0, 1.0)
+
+    stream = _pdf_rect(42, 714, 528, 48, orange)
+    stream += _pdf_text_line(58, 742, "PROBESTACK", 18, True, white)
+    stream += _pdf_text_line(58, 724, "Enterprise Software & AI Platform", 9.5, False, white)
+    stream += _pdf_text_line(434, 732, "INVOICE", 24, True, white)
+    stream += _pdf_text_line(42, 690, "Annual Software Subscriptions & AI Platform", 10, False, muted)
+
+    stream += _pdf_text_line(42, 658, "From", 11, True, orange)
+    stream += _pdf_text_line(42, 638, "ProbeStack Inc. (USA)", 10, True, dark)
+    for index, line in enumerate(sender_address_lines):
+        stream += _pdf_text_line(42, 624 - (index * 13), line, 8.5, False, muted)
+    stream += _pdf_text_line(42, 585, "billing@probestack.com", 8.5, False, muted)
+
+    stream += _pdf_text_line(42, 572, "Bill To", 11, True, orange)
+    stream += _pdf_text_line(42, 552, org_name, 10, True, dark)
+    for index, line in enumerate(_wrap_pdf_text(customer_address, 52)[:2]):
+        stream += _pdf_text_line(42, 538 - (index * 13), line, 8.5, False, muted)
+
+    stream += _pdf_rect(334, 532, 236, 130, soft)
+    stream += _pdf_text_line(348, 644, "Invoice Details", 11, True, orange)
+    detail_x = 348
+    details = [
+        ("Invoice #", invoice["invoice_number"]),
+        ("Invoice Date", invoice_date),
+        ("Due Date", due_date),
+        ("Payment Terms", "Net 30"),
+        ("Billing", "Annual"),
+        ("Billing Period", billing_period),
+        ("Status", str(invoice["status"]).title()),
+    ]
+    y = 624
+    for label, value in details:
+        stream += _pdf_text_line(detail_x, y, label, 8.2, True, muted)
+        stream += _pdf_text_line(detail_x + 92, y, value, 8.2, False, dark)
+        y -= 15
+
+    table_left = 42
+    table_top = 486
+    columns = [
+        ("SKU", 66),
+        ("Product Plan", 76),
+        ("Description", 146),
+        ("Billing", 52),
+        ("Qty", 28),
+        ("Unit Price", 58),
+        ("Tax %", 34),
+        ("Amount", 68),
+    ]
+    x_positions = [table_left]
+    for _, col_width in columns[:-1]:
+        x_positions.append(x_positions[-1] + col_width)
+
+    stream += _pdf_rect(table_left, table_top, 528, 24, dark)
+    for (header, _), x in zip(columns, x_positions):
+        stream += _pdf_text_line(x + 6, table_top + 8, header, 7.4, True, white)
+
+    y = table_top - 28
+    for item in line_items:
+        if y < 170:
+            break
+        row_height = 34 if len(line_items) > 5 else 40
+        desc_lines = _wrap_pdf_text(item["description"], 34)[:2]
+        if (int((table_top - y) / row_height) % 2) == 0:
+            stream += _pdf_rect(table_left, y - 13, 528, row_height, (0.985, 0.99, 0.995))
+        stream += _pdf_text_line(x_positions[0] + 6, y, item["sku"], 7.5, True, dark)
+        stream += _pdf_text_line(x_positions[1] + 6, y, item["product_plan"], 7.5, False, dark)
+        stream += _pdf_text_line(x_positions[2] + 6, y, desc_lines[0], 7.5, False, dark)
+        if len(desc_lines) > 1:
+            stream += _pdf_text_line(x_positions[2] + 6, y - 11, desc_lines[1], 7.2, False, muted)
+        stream += _pdf_text_line(x_positions[3] + 6, y, item.get("payment") or "Annually", 7.5, False, dark)
+        stream += _pdf_text_line(x_positions[4] + 6, y, item["qty"], 7.5, False, dark)
+        stream += _pdf_text_line(x_positions[5] + 4, y, f"${item['unit_price']:,.2f}", 7.2, False, dark, "right", columns[5][1] - 8)
+        stream += _pdf_text_line(x_positions[6] + 4, y, f"{item['tax_rate']:.0f}%", 7.2, False, dark, "right", columns[6][1] - 8)
+        stream += _pdf_text_line(x_positions[7] + 4, y, f"${item['amount']:,.2f}", 7.2, True, dark, "right", columns[7][1] - 8)
+        stream += _pdf_line(table_left, y - 16, table_left + 528, y - 16, border)
+        y -= row_height
+
+    totals_y = max(158, y - 8)
+    stream += _pdf_line(396, totals_y + 16, 570, totals_y + 16, border)
+    stream += _pdf_text_line(410, totals_y, "Subtotal", 9, True, muted)
+    stream += _pdf_text_line(484, totals_y, f"${subtotal:,.2f}", 9, True, dark, "right", 78)
+    stream += _pdf_text_line(410, totals_y - 17, "Tax", 9, True, muted)
+    stream += _pdf_text_line(484, totals_y - 17, f"${tax:,.2f}", 9, True, dark, "right", 78)
+    stream += _pdf_rect(396, totals_y - 54, 174, 26, orange)
+    stream += _pdf_text_line(410, totals_y - 45, "Total Due", 10.5, True, white)
+    stream += _pdf_text_line(484, totals_y - 45, f"${total:,.2f}", 10.5, True, white, "right", 78)
+
+    notes_y = 108
+    stream += _pdf_rect(42, 46, 320, 78, soft)
+    stream += _pdf_text_line(56, notes_y, "Payment Instructions", 9.5, True, orange)
+    stream += _pdf_text_line(56, notes_y - 15, "Payment Method: ACH / Wire / Credit Card", 7.8, False, dark)
+    stream += _pdf_text_line(56, notes_y - 28, "Payment Frequency: Annually for all organizations", 7.8, False, dark)
+    stream += _pdf_text_line(56, notes_y - 41, "Reference: Include the invoice number on payment.", 7.8, False, dark)
+    stream += _pdf_text_line(56, notes_y - 60, "Notes & Terms", 8, True, muted)
+    stream += _pdf_text_line(122, notes_y - 60, "Services are governed by the applicable ProbeStack agreement.", 7.2, False, muted)
+    stream += _pdf_text_line(42, 28, "Questions: billing@probestack.com", 7.2, False, muted)
+
+    stream_bytes = stream.encode("latin-1", "replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+        f"<< /Length {len(stream_bytes)} >>\nstream\n".encode("latin-1") + stream_bytes + b"endstream",
+    ]
+    output = io.BytesIO()
+    output.write(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(output.tell())
+        output.write(f"{index} 0 obj\n".encode("latin-1"))
+        output.write(obj)
+        output.write(b"\nendobj\n")
+    xref_offset = output.tell()
+    output.write(f"xref\n0 {len(objects) + 1}\n".encode("latin-1"))
+    output.write(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.write(f"{offset:010d} 00000 n \n".encode("latin-1"))
+    output.write(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("latin-1"))
+    return output.getvalue()
+
 async def user_request_to_dict(db: AsyncSession, request: UserRequestModel) -> dict:
     data = model_to_dict(request)
     data["organization_name"] = await get_organization_name(db, request.organization_id)
@@ -3723,7 +4358,23 @@ async def upgrade_request_to_dict(db: AsyncSession, request: PlanUpgradeRequestM
     data = model_to_dict(request)
     request_items = await get_upgrade_request_items(db, request)
     data["organization_name"] = await get_organization_name(db, request.organization_id)
-    data["current_plan_name"] = await get_plan_name(db, request.current_plan_id)
+    current_plan_ids = parse_json_list(request.current_plan_id)
+    data["current_plan_ids"] = current_plan_ids
+    current_plan_details = []
+    for plan_id in current_plan_ids:
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_id))
+        plan = plan_result.scalar_one_or_none()
+        product = await get_plan_product(db, plan) if plan else None
+        current_plan_details.append({
+            "plan_id": plan_id,
+            "plan_name": plan.name if plan else plan_id,
+            "product_id": product.id if product else None,
+            "product_name": product.name if product else None,
+            "display_name": f"{product.name} - {plan.name}" if product and plan else plan.name if plan else plan_id,
+        })
+    data["current_plan_details"] = current_plan_details
+    data["current_plan_name"] = ", ".join([item["display_name"] for item in current_plan_details]) if current_plan_details else "No current plan for selected product"
+    data["current_plan_names"] = [item["plan_name"] for item in current_plan_details]
     data["requested_plan_name"] = None
     data["requested_plans_details"] = []
     data["requested_plan_ids"] = []
@@ -3733,7 +4384,12 @@ async def upgrade_request_to_dict(db: AsyncSession, request: PlanUpgradeRequestM
         data["requested_plan_ids"] = [item["plan_id"] for item in request_items]
         for item in request_items:
             data["requested_tools"].extend(item.get("tools", []))
-        data["requested_plan_name"] = ", ".join([item["plan_name"] for item in request_items if item.get("plan_name")])
+            item["display_name"] = (
+                f"{item['product_name']} - {item['plan_name']}"
+                if item.get("product_name") and item.get("plan_name")
+                else item.get("plan_name")
+            )
+        data["requested_plan_name"] = ", ".join([item["display_name"] for item in request_items if item.get("display_name")])
     return data
 
 def create_token(admin_id: str, email: str, role: str, organization_id: Optional[str] = None) -> str:
@@ -6682,85 +7338,42 @@ async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    # Get current subscriptions
-    sub_result = await db.execute(
-        select(SubscriptionModel)
-        .where(SubscriptionModel.organization_id == org_id)
-        .where(SubscriptionModel.status == "active")
-    )
-    current_subs = sub_result.scalars().all()
-    
-    # Build current plan info
-    current_plan_ids = [s.plan_id for s in current_subs]
-    current_plan_names = [await get_plan_name(db, s.plan_id) for s in current_subs]
-    
     requested_selections = normalize_plan_selections(data)
-
-    # Validate requested plans exist and build details
-    if not requested_selections:
-        raise HTTPException(status_code=400, detail="At least one plan must be selected")
-    
-    requested_plan_ids = []
-    requested_plans_details = []
-    all_tools = []
-    
-    for plan_selection in requested_selections:
-        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == plan_selection.plan_id))
-        plan = plan_result.scalar_one_or_none()
-        if not plan:
-            raise HTTPException(status_code=404, detail=f"Plan {plan_selection.plan_id} not found")
-        product = await get_plan_product(db, plan)
-        
-        requested_plan_ids.append(plan_selection.plan_id)
-        requested_plans_details.append({
-            "plan_id": plan.id,
-            "plan_name": plan.name,
-            "product_id": product.id if product else None,
-            "product_name": product.name if product else None,
-            "tools": plan_selection.tool_ids
-        })
-        all_tools.extend(plan_selection.tool_ids)
-    
-    # Check for existing pending request
-    existing = await db.execute(
-        select(PlanUpgradeRequestModel)
-        .where(PlanUpgradeRequestModel.organization_id == org_id)
-        .where(PlanUpgradeRequestModel.status == "pending")
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="You already have a pending upgrade request")
-    
-    # Create upgrade request
-    upgrade_request = PlanUpgradeRequestModel(
+    created_requests, requested_plans_details = await create_product_upgrade_requests(
+        db,
+        org=org,
         organization_id=org_id,
-        current_plan_id=json.dumps(current_plan_ids),
+        selections=requested_selections,
         reason=data.reason,
-        requested_by=payload["sub"]
+        requested_by=payload["sub"],
     )
-    db.add(upgrade_request)
-    await db.flush()
-    await set_upgrade_request_items(db, upgrade_request.id, requested_selections)
-    
-    # Create notification
-    plan_names = [d["plan_name"] for d in requested_plans_details]
-    notif = NotificationModel(
-        title="Plan Upgrade Request",
-        message=f"{org.name} requested to change plans to: {', '.join(plan_names)}",
-        type="info",
-        link="/upgrade-requests"
-    )
-    db.add(notif)
     
     await db.commit()
+    request_dicts = [await upgrade_request_to_dict(db, request) for request in created_requests]
+    all_tools = []
+    from_plan_names = []
+    for detail in requested_plans_details:
+        all_tools.extend(detail["tools"])
+        from_plan_names.extend(detail["current_plan_names"])
     
     return {
-        "request_id": upgrade_request.id,
+        "request_id": created_requests[0].id if len(created_requests) == 1 else None,
+        "request_ids": [request.id for request in created_requests],
         "status": "pending",
         "message": "Upgrade request submitted successfully",
+        "requests": request_dicts,
         "upgrade": {
-            "from_plans": current_plan_names,
-            "to_plans": plan_names,
-            "requested_tools": all_tools
+            "from_plans_by_product": [
+                {
+                    "product_id": detail["product"].id,
+                    "product_name": detail["product"].name,
+                    "plans": detail["current_plan_names"],
+                }
+                for detail in requested_plans_details
+            ],
+            "from_plans": from_plan_names,
+            "to_plans": [detail["plan"].name for detail in requested_plans_details],
+            "requested_tools": all_tools,
         }
     }
 
@@ -6812,7 +7425,11 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
         if plan:
             tools = plan_detail.get("tools", [])
             total_price = await calculate_plan_total(db, plan, tools, "monthly")
-            await cancel_active_real_org_subscription_for_plan(db, req.organization_id, plan.id)
+            product = await get_plan_product(db, plan)
+            if product:
+                await cancel_active_real_org_subscriptions_for_product(db, req.organization_id, product.id)
+            else:
+                await cancel_active_real_org_subscription_for_plan(db, req.organization_id, plan.id)
             
             new_sub = SubscriptionModel(
                 organization_id=req.organization_id,
@@ -6925,46 +7542,24 @@ async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = D
     requested_selections = normalize_plan_selections(data)
     if not requested_selections:
         raise HTTPException(status_code=400, detail="At least one plan must be selected")
-    primary_selection = requested_selections[0]
-    current_sub = next((sub for sub in current_subs if sub.plan_id == primary_selection.plan_id), current_subs[0])
-
-    # Validate requested plan exists
-    plan_result = await db.execute(select(PlanModel).where(PlanModel.id == primary_selection.plan_id))
-    plan = plan_result.scalar_one_or_none()
-    if not plan:
-        raise HTTPException(status_code=404, detail="Requested plan not found")
-    
-    # Check if there's already a pending request
-    existing_request = await db.execute(
-        select(PlanUpgradeRequestModel)
-        .where(PlanUpgradeRequestModel.organization_id == org_id)
-        .where(PlanUpgradeRequestModel.status == "pending")
-    )
-    if existing_request.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A pending upgrade request already exists")
-    
-    # Create upgrade request
-    upgrade_request = PlanUpgradeRequestModel(
+    created_requests, _ = await create_product_upgrade_requests(
+        db,
+        org=org,
         organization_id=org_id,
-        current_plan_id=current_sub.plan_id,
+        selections=requested_selections,
         reason=data.reason,
-        requested_by=payload["sub"]
+        requested_by=payload["sub"],
     )
-    db.add(upgrade_request)
-    await db.flush()
-    await set_upgrade_request_items(db, upgrade_request.id, requested_selections)
-    
-    # Create notification for super admin
-    notif = NotificationModel(
-        title="Plan Upgrade Request",
-        message=f"{org.name} requested upgrade to {plan.name}",
-        type="info",
-        link=f"/plan-upgrade-requests"
-    )
-    db.add(notif)
     
     await db.commit()
-    return await upgrade_request_to_dict(db, upgrade_request)
+    request_dicts = [await upgrade_request_to_dict(db, request) for request in created_requests]
+    if len(request_dicts) == 1:
+        return request_dicts[0]
+    return {
+        "message": "Upgrade requests submitted successfully",
+        "request_ids": [request.id for request in created_requests],
+        "requests": request_dicts,
+    }
 
 @api_router.post("/plan-upgrade-requests/{request_id}/approve", tags=["Plan Upgrade Requests"])
 async def approve_plan_upgrade_request(request_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -6990,7 +7585,11 @@ async def approve_plan_upgrade_request(request_id: str, payload: dict = Depends(
             continue
         tools = item.get("tools", [])
         total_price = await calculate_plan_total(db, plan, tools, "monthly")
-        await cancel_active_real_org_subscription_for_plan(db, request.organization_id, plan.id)
+        product = await get_plan_product(db, plan)
+        if product:
+            await cancel_active_real_org_subscriptions_for_product(db, request.organization_id, product.id)
+        else:
+            await cancel_active_real_org_subscription_for_plan(db, request.organization_id, plan.id)
         subscription = SubscriptionModel(
             organization_id=request.organization_id,
             plan_id=plan.id,
@@ -10375,6 +10974,80 @@ async def get_billing_record(billing_id: str, payload: dict = Depends(require_su
         raise HTTPException(status_code=404, detail="Billing record not found")
     return await billing_to_dict(db, record)
 
+@api_router.get("/billing/{billing_id}/invoice.xlsx")
+async def download_billing_invoice(billing_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(BillingModel).where(BillingModel.id == billing_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Billing record not found")
+
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == record.organization_id))
+    organization = org_result.scalar_one_or_none()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    line_items = await build_invoice_line_items(db, record.organization_id)
+    if not line_items:
+        raise HTTPException(status_code=400, detail="No active subscriptions found for this organization")
+
+    billing_date = record.billing_date
+    if billing_date.tzinfo is None:
+        billing_date = billing_date.replace(tzinfo=timezone.utc)
+    period_start = datetime(billing_date.year, 1, 1, tzinfo=timezone.utc)
+    period_end = datetime(billing_date.year, 12, 31, tzinfo=timezone.utc)
+    invoice = {
+        "invoice_number": record.invoice_number,
+        "billing_date": billing_date,
+        "due_date": record.due_date if record.due_date.tzinfo else record.due_date.replace(tzinfo=timezone.utc),
+        "period_start": period_start,
+        "period_end": period_end,
+        "status": record.status,
+        "organization": model_to_dict(organization, ["requested_tools", "supported_domains", "gateway_environments", "compliance_standards"]),
+    }
+    contents = build_invoice_workbook(invoice, line_items)
+    filename = f"{record.invoice_number}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(contents),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+@api_router.get("/billing/{billing_id}/invoice.pdf")
+async def download_billing_invoice_pdf(billing_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(BillingModel).where(BillingModel.id == billing_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Billing record not found")
+
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == record.organization_id))
+    organization = org_result.scalar_one_or_none()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    line_items = await build_invoice_line_items(db, record.organization_id)
+    if not line_items:
+        raise HTTPException(status_code=400, detail="No active subscriptions found for this organization")
+
+    billing_date = record.billing_date
+    if billing_date.tzinfo is None:
+        billing_date = billing_date.replace(tzinfo=timezone.utc)
+    invoice = {
+        "invoice_number": record.invoice_number,
+        "billing_date": billing_date,
+        "due_date": record.due_date if record.due_date.tzinfo else record.due_date.replace(tzinfo=timezone.utc),
+        "period_start": datetime(billing_date.year, 1, 1, tzinfo=timezone.utc),
+        "period_end": datetime(billing_date.year, 12, 31, tzinfo=timezone.utc),
+        "status": record.status,
+        "organization": model_to_dict(organization, ["requested_tools", "supported_domains", "gateway_environments", "compliance_standards"]),
+    }
+    contents = build_invoice_pdf(invoice, line_items)
+    filename = f"{record.invoice_number}.pdf"
+    return StreamingResponse(
+        io.BytesIO(contents),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 @api_router.post("/billing/{billing_id}/mark-paid")
 async def mark_billing_paid(billing_id: str, payment_method: str = "card", payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
@@ -10397,76 +11070,94 @@ async def mark_billing_unpaid(billing_id: str, payload: dict = Depends(require_s
     await db.commit()
     return {"message": "Billing marked as unpaid"}
 
-@api_router.post("/billing/generate-monthly")
-async def generate_monthly_bills(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+async def generate_annual_billing_records(db: AsyncSession) -> dict:
     """
-    Generate monthly billing records for all active subscriptions.
-    Creates or refreshes pending invoices for the subscription's current billing period.
+    Generate one annual invoice record per organization with active subscriptions.
+    Pending invoices for the same organization/year are refreshed and duplicate
+    pending rows are removed so the Billing page shows one invoice per org.
     """
     now = datetime.now(timezone.utc)
+    period_start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    period_end = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+    due_date = now + timedelta(days=15)
 
-    # Get all active subscriptions
     subs_result = await db.execute(
-        select(SubscriptionModel).where(SubscriptionModel.status == "active")
+        select(SubscriptionModel)
+        .where(SubscriptionModel.status == "active")
+        .order_by(SubscriptionModel.organization_id.asc(), SubscriptionModel.created_at.asc())
     )
     active_subscriptions = subs_result.scalars().all()
-    
+    subscriptions_by_org: dict[str, list[SubscriptionModel]] = {}
+    for subscription in active_subscriptions:
+        subscriptions_by_org.setdefault(subscription.organization_id, []).append(subscription)
+
     bills_created = 0
     bills_updated = 0
     bills_skipped = 0
-    
-    for sub in active_subscriptions:
-        period_start, period_end = get_subscription_billing_period(sub, now)
-        if not period_start or not period_end:
+
+    for organization_id, org_subscriptions in subscriptions_by_org.items():
+        amount = await calculate_organization_annual_invoice_amount(db, organization_id)
+        if amount <= 0:
             bills_skipped += 1
             continue
 
-        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == sub.plan_id))
-        plan = plan_result.scalar_one_or_none()
-        amount = await calculate_subscription_invoice_amount(db, sub, plan)
-        due_date = period_start + timedelta(days=15)
-
-        # Check if a bill already exists for this subscription billing period
         existing_bill = await db.execute(
-            select(BillingModel).where(
-                BillingModel.subscription_id == sub.id,
+            select(BillingModel)
+            .where(
+                BillingModel.organization_id == organization_id,
                 BillingModel.billing_date >= period_start,
                 BillingModel.billing_date < period_end
             )
+            .order_by(BillingModel.created_at.asc())
         )
-        bill = existing_bill.scalar_one_or_none()
-        if bill:
-            if bill.status == "pending":
-                bill.amount = amount
-                bill.billing_date = period_start
-                bill.due_date = due_date
-                bills_updated += 1
-            else:
-                bills_skipped += 1
+        bills = existing_bill.scalars().all()
+        editable_bill = next((bill for bill in bills if bill.status == "pending"), None)
+        if editable_bill:
+            editable_bill.subscription_id = org_subscriptions[0].id
+            editable_bill.amount = amount
+            editable_bill.billing_date = now
+            editable_bill.due_date = due_date
+            duplicate_ids = [bill.id for bill in bills if bill.id != editable_bill.id and bill.status == "pending"]
+            if duplicate_ids:
+                await db.execute(delete(BillingModel).where(BillingModel.id.in_(duplicate_ids)))
+            bills_updated += 1
             continue
 
-        invoice_number = f"INV-{period_start.strftime('%Y%m')}-{sub.organization_id[-4:].upper()}-{str(uuid.uuid4())[:4].upper()}"
+        if any(bill.status == "paid" for bill in bills):
+            bills_skipped += 1
+            continue
+
+        invoice_number = f"INV-{now.strftime('%Y')}-{organization_id[-8:].upper()}-{str(uuid.uuid4())[:4].upper()}"
         billing = BillingModel(
-            organization_id=sub.organization_id,
-            subscription_id=sub.id,
+            organization_id=organization_id,
+            subscription_id=org_subscriptions[0].id,
             amount=amount,
             status="pending",
             invoice_number=invoice_number,
-            billing_date=period_start,
+            billing_date=now,
             due_date=due_date
         )
         db.add(billing)
         bills_created += 1
-    
+
     await db.commit()
-    
+
     return {
-        "message": f"Monthly billing generation complete",
+        "message": "Annual invoice generation complete",
         "bills_created": bills_created,
         "bills_updated": bills_updated,
         "bills_skipped": bills_skipped,
-        "total_active_subscriptions": len(active_subscriptions)
+        "total_active_subscriptions": len(active_subscriptions),
+        "total_organizations": len(subscriptions_by_org),
     }
+
+@api_router.post("/billing/generate-annual")
+async def generate_annual_bills(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    return await generate_annual_billing_records(db)
+
+@api_router.post("/billing/generate-monthly")
+async def generate_monthly_bills(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    return await generate_annual_billing_records(db)
 
 # ==================== NOTIFICATIONS ROUTES (Super Admin Only) ====================
 
@@ -12202,6 +12893,8 @@ async def ensure_runtime_schema(conn):
     if not await mysql_column_exists(conn, "plans", "is_popular"):
         await conn.execute(text("ALTER TABLE plans ADD COLUMN is_popular BOOL NOT NULL DEFAULT FALSE AFTER cost"))
     await ensure_mysql_column(conn, "subscriptions", "api_count", "INT NULL")
+    if await mysql_column_exists(conn, "plan_upgrade_requests", "current_plan_id"):
+        await conn.execute(text("ALTER TABLE plan_upgrade_requests MODIFY COLUMN current_plan_id TEXT NOT NULL"))
 
     organization_columns = [
         ("organization_code", "VARCHAR(100) NULL"),
