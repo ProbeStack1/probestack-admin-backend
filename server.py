@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Response
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -8650,7 +8650,11 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
     }
 
 @api_router.post("/public/auth/callback", tags=["Public API - Identity"])
-async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(get_db)):
+async def auth0_callback(
+    data: Auth0CallbackRequest,
+    fastapi_response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Step 2: Exchange the active identity-provider authorization code for tokens.
     
@@ -8664,6 +8668,7 @@ async def auth0_callback(data: Auth0CallbackRequest, db: AsyncSession = Depends(
     if active_provider == "zitadel":
         return await zitadel_callback(
             ZitadelCallbackRequest(code=data.code, email=data.email, product=data.product, redirect_uri=data.redirect_uri),
+            fastapi_response,
             db,
         )
     require_identity_provider_configured("auth0")
@@ -9152,7 +9157,11 @@ def extract_zitadel_resource_owner(zitadel_user: dict) -> Optional[str]:
     )
 
 @api_router.post("/public/zitadel/auth/callback", tags=["Public API - Zitadel"])
-async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depends(get_db)):
+async def zitadel_callback(
+    data: ZitadelCallbackRequest,
+    fastapi_response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Step 2: Exchange Zitadel authorization code for tokens and sync user locally.
     """
@@ -9172,24 +9181,24 @@ async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depe
 
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(
+            token_response = await client.post(
                 f"{zitadel_mgmt.base_url}/oauth/v2/token",
                 data=token_payload,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=30.0,
             )
-            if response.status_code != 200:
-                error_detail = response.text
+            if token_response.status_code != 200:
+                error_detail = token_response.text
                 try:
-                    error_json = response.json()
-                    error_detail = error_json.get("error_description", error_json.get("error", response.text))
+                    error_json = token_response.json()
+                    error_detail = error_json.get("error_description", error_json.get("error", token_response.text))
                 except Exception:
                     pass
                 raise HTTPException(
-                    status_code=response.status_code,
+                    status_code=token_response.status_code,
                     detail=f"Zitadel token exchange failed: {error_detail}"
                 )
-            tokens = response.json()
+            tokens = token_response.json()
         except httpx.RequestError as e:
             raise HTTPException(status_code=500, detail=f"Failed to connect to Zitadel: {str(e)}")
 
@@ -9375,6 +9384,22 @@ async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depe
 
     product_token = tokens.get("access_token")
     admin_token = admin_login["token"] if admin_login else None
+    if product_token:
+        cookie_max_age = max(1, min(int(expires_in or 86400), 86400))
+        for cookie_name, cookie_value in {
+            "ps_auth_token": product_token,
+            "ps_auth_session": "true",
+        }.items():
+            fastapi_response.set_cookie(
+                key=cookie_name,
+                value=cookie_value,
+                max_age=cookie_max_age,
+                path="/",
+                domain=".probestack.io",
+                secure=True,
+                httponly=False,
+                samesite="lax",
+            )
 
     return {
         "success": True,
