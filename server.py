@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Response, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -9819,6 +9819,90 @@ async def logout_identity_provider_session(
         "post_logout_redirect_uri": post_logout_uri,
         "login_record_id": login_record.id if login_record else None,
     }
+
+@api_router.get("/public/auth/logout/redirect", tags=["Public API - Identity"])
+async def logout_identity_provider_session_redirect(
+    request: Request,
+    identity_provider: Optional[str] = None,
+    login_record_id: Optional[str] = None,
+    product: Optional[str] = None,
+    post_logout_redirect_uri: Optional[str] = None,
+    state: Optional[str] = None,
+    logout_hint: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Browser-facing logout route.
+
+    Use this when the browser should receive cookie deletion headers directly
+    and then be redirected through the upstream provider logout endpoint.
+    """
+    token = request.cookies.get("ps_auth_token")
+    provider = infer_identity_provider_from_token(token, identity_provider)
+    login_record = None
+
+    if not provider and login_record_id:
+        for candidate_provider in ("zitadel", "auth0"):
+            candidate_record = await get_logout_login_record(db, candidate_provider, login_record_id, None)
+            if candidate_record:
+                provider = candidate_provider
+                login_record = candidate_record
+                break
+
+    if not provider:
+        provider = await get_active_identity_provider(db)
+
+    if not login_record:
+        login_record = await get_logout_login_record(db, provider, login_record_id, token)
+
+    token_claims = decode_unverified_jwt_claims(token)
+    id_token_hint = token if token_claims.get("iss") else None
+    if not id_token_hint and login_record:
+        id_token_hint = login_record.id_token
+
+    selected_logout_hint = logout_hint or (login_record.email if login_record else None)
+    selected_product = infer_logout_product(provider, product, post_logout_redirect_uri)
+
+    revoke_token = None
+    if login_record and hasattr(login_record, "refresh_token"):
+        revoke_token = login_record.refresh_token
+    if not revoke_token and provider == "zitadel" and login_record:
+        revoke_token = login_record.access_token
+    await revoke_provider_token(provider, revoke_token)
+
+    if login_record:
+        clear_login_record_tokens(login_record)
+        await db.commit()
+
+    if provider == "zitadel":
+        if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
+            raise HTTPException(status_code=500, detail="Zitadel logout is not configured")
+        _, post_logout_uri = resolve_zitadel_post_logout_uri(selected_product, post_logout_redirect_uri)
+        logout_params = {
+            "client_id": ZITADEL_CLIENT_ID,
+            "post_logout_redirect_uri": post_logout_uri,
+        }
+        if id_token_hint:
+            logout_params["id_token_hint"] = id_token_hint
+        if state:
+            logout_params["state"] = state
+        if selected_logout_hint:
+            logout_params["logout_hint"] = selected_logout_hint
+        logout_url = f"{zitadel_mgmt.base_url}/oidc/v1/end_session?{urlencode(logout_params)}"
+    else:
+        require_identity_provider_configured("auth0")
+        _, post_logout_uri = resolve_auth0_post_logout_uri(selected_product, post_logout_redirect_uri)
+        logout_params = {
+            "client_id": AUTH0_CLIENT_ID,
+            "returnTo": post_logout_uri,
+        }
+        if state:
+            logout_params["state"] = state
+        logout_url = f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
+
+    redirect_response = RedirectResponse(url=logout_url, status_code=302)
+    clear_product_auth_cookies(redirect_response)
+    return redirect_response
 
 @api_router.get("/zitadel-logins", tags=["Admin - Zitadel"])
 async def get_zitadel_logins(
