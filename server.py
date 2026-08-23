@@ -8864,10 +8864,15 @@ async def auth0_callback(
             synced_user = new_user
     await db.commit()
 
+    product_token = id_token or tokens.get("access_token")
+    set_product_auth_cookies(fastapi_response, product_token, expires_in)
+
     return {
         "success": True,
         "identity_provider": "auth0",
-        "access_token": tokens.get("access_token"),
+        "token": product_token,
+        "access_token": product_token,
+        "oauth_access_token": tokens.get("access_token"),
         "id_token": id_token,
         "token_type": tokens.get("token_type"),
         "expires_in": expires_in,
@@ -9156,6 +9161,28 @@ def extract_zitadel_resource_owner(zitadel_user: dict) -> Optional[str]:
         or zitadel_user.get("organizationId")
     )
 
+def set_product_auth_cookies(response: Response, token: Optional[str], expires_in: Any = None) -> None:
+    if not token:
+        return
+    try:
+        cookie_max_age = max(1, min(int(float(expires_in or 86400)), 86400))
+    except (TypeError, ValueError):
+        cookie_max_age = 86400
+    for cookie_name, cookie_value in {
+        "ps_auth_token": token,
+        "ps_auth_session": "true",
+    }.items():
+        response.set_cookie(
+            key=cookie_name,
+            value=cookie_value,
+            max_age=cookie_max_age,
+            path="/",
+            domain=".probestack.io",
+            secure=True,
+            httponly=False,
+            samesite="lax",
+        )
+
 @api_router.post("/public/zitadel/auth/callback", tags=["Public API - Zitadel"])
 async def zitadel_callback(
     data: ZitadelCallbackRequest,
@@ -9384,22 +9411,7 @@ async def zitadel_callback(
 
     product_token = id_token or tokens.get("access_token")
     admin_token = admin_login["token"] if admin_login else None
-    if product_token:
-        cookie_max_age = max(1, min(int(expires_in or 86400), 86400))
-        for cookie_name, cookie_value in {
-            "ps_auth_token": product_token,
-            "ps_auth_session": "true",
-        }.items():
-            fastapi_response.set_cookie(
-                key=cookie_name,
-                value=cookie_value,
-                max_age=cookie_max_age,
-                path="/",
-                domain=".probestack.io",
-                secure=True,
-                httponly=False,
-                samesite="lax",
-            )
+    set_product_auth_cookies(fastapi_response, product_token, expires_in)
 
     return {
         "success": True,
@@ -9408,6 +9420,7 @@ async def zitadel_callback(
         "admin_token": admin_token,
         "admin": admin_login["admin"] if admin_login else None,
         "access_token": product_token,
+        "oauth_access_token": tokens.get("access_token"),
         "refresh_token": tokens.get("refresh_token"),
         "id_token": id_token,
         "token_type": tokens.get("token_type"),
