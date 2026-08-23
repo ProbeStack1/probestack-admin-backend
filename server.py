@@ -88,15 +88,19 @@ INDIVIDUAL_USERS_CONTACT_PERSON_FALLBACK = os.environ.get("INDIVIDUAL_USERS_CONT
 ZITADEL_DOMAIN = os.environ.get('ZITADEL_DOMAIN', '')
 ZITADEL_CLIENT_ID = os.environ.get('ZITADEL_CLIENT_ID', '')
 ZITADEL_CLIENT_SECRET = os.environ.get('ZITADEL_CLIENT_SECRET', '')
-ZITADEL_CALLBACK_URI = os.environ.get('ZITADEL_CALLBACK_URI', 'https://probestack.io/auth/zitadel/callback')
+ZITADEL_CALLBACK_URI = os.environ.get('ZITADEL_CALLBACK_URI', 'https://probestack.io/admin/auth/zitadel/callback')
+ZITADEL_SHARED_CALLBACK_URI = os.environ.get(
+    "ZITADEL_SHARED_CALLBACK_URI",
+    os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_CALLBACK_URI),
+)
 ZITADEL_API_TOKEN = os.environ.get('ZITADEL_API_TOKEN', '')
 ZITADEL_DEFAULT_ORG_ID = os.environ.get('ZITADEL_DEFAULT_ORG_ID', '')
 ZITADEL_PROJECT_ID = os.environ.get('ZITADEL_PROJECT_ID', '')
 ZITADEL_REDIRECT_URIS = {
-    "probestack": os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_CALLBACK_URI),
-    "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_CALLBACK_URI", "https://forgecatalog.com/auth/zitadel/callback"),
-    "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_CALLBACK_URI", "https://forgefuzz.com/auth/zitadel/callback"),
-    "console": os.environ.get("ZITADEL_CONSOLE_CALLBACK_URI", "https://console.probestack.io/admin/auth/zitadel/callback"),
+    "probestack": os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
+    "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
+    "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
+    "console": os.environ.get("ZITADEL_CONSOLE_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
     "local": os.environ.get("ZITADEL_LOCAL_CALLBACK_URI", "http://localhost:3000/admin/zitadel-test"),
 }
 ZITADEL_POST_LOGOUT_URIS = {
@@ -8977,14 +8981,11 @@ def resolve_zitadel_redirect_uri(product: Optional[str] = None, redirect_uri: Op
 
     if redirect_uri:
         selected_redirect_uri = redirect_uri.strip()
-        matching_products = [
-            key for key, allowed_redirect_uri in ZITADEL_REDIRECT_URIS.items()
-            if allowed_redirect_uri == selected_redirect_uri
-        ]
-        if not matching_products:
+        allowed_redirect_uris = set(ZITADEL_REDIRECT_URIS.values())
+        if ZITADEL_SHARED_CALLBACK_URI:
+            allowed_redirect_uris.add(ZITADEL_SHARED_CALLBACK_URI)
+        if selected_redirect_uri not in allowed_redirect_uris:
             raise HTTPException(status_code=400, detail="redirect_uri is not registered for Zitadel login")
-        if selected_redirect_uri != ZITADEL_REDIRECT_URIS[product_key]:
-            raise HTTPException(status_code=400, detail="redirect_uri does not match the selected Zitadel product")
     else:
         selected_redirect_uri = ZITADEL_REDIRECT_URIS[product_key]
 
@@ -9127,6 +9128,8 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
     }
     if data.state:
         zitadel_params["state"] = data.state
+    else:
+        zitadel_params["state"] = encode_product_oauth_state(product_key)
 
     authorize_url = f"{zitadel_mgmt.base_url}/oauth/v2/authorize?{urlencode(zitadel_params)}"
 
@@ -9173,6 +9176,10 @@ def extract_zitadel_resource_owner(zitadel_user: dict) -> Optional[str]:
         or zitadel_user.get("resourceOwnerId")
         or zitadel_user.get("organizationId")
     )
+
+def encode_product_oauth_state(product: str) -> str:
+    payload = json.dumps({"product": product}, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 def set_product_auth_cookies(response: Response, token: Optional[str], expires_in: Any = None) -> None:
     if not token:
