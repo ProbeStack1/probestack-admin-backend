@@ -9382,7 +9382,7 @@ async def zitadel_callback(
 
     await db.commit()
 
-    product_token = tokens.get("access_token")
+    product_token = id_token or tokens.get("access_token")
     admin_token = admin_login["token"] if admin_login else None
     if product_token:
         cookie_max_age = max(1, min(int(expires_in or 86400), 86400))
