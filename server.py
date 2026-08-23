@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON, UniqueConstraint, text
+from sqlalchemy import String, Text, Float, Boolean, DateTime, ForeignKey, select, delete, update, func, JSON, UniqueConstraint, text, or_
 from sqlalchemy.dialects.mysql import LONGTEXT
 
 import os
@@ -23,6 +23,7 @@ import bcrypt
 import json
 import httpx
 import base64
+import hashlib
 from urllib.parse import urlencode
 import secrets
 import smtplib
@@ -1277,6 +1278,21 @@ class ZitadelLoginRecordModel(Base):
     ip_address: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+class IdentitySessionRevocationModel(Base):
+    """Provider token/session revocations checked by all products."""
+    __tablename__ = "identity_session_revocations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    identity_provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    issuer: Mapped[str] = mapped_column(String(255), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    session_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    login_record_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
 class BusinessUnitModel(Base):
     """Business units owned by an approved organization."""
     __tablename__ = "business_units"
@@ -1683,6 +1699,12 @@ class IdentityLogoutRequest(BaseModel):
     post_logout_redirect_uri: Optional[str] = None
     state: Optional[str] = None
     logout_hint: Optional[str] = None
+
+class IdentitySessionValidateRequest(BaseModel):
+    """Request to verify provider token and central logout status."""
+    token: Optional[str] = None
+    id_token: Optional[str] = None
+    identity_provider: Optional[str] = None
 
 class UserContextTokenRequest(BaseModel):
     """Request to issue a ProbeStack user-context token after probestack.io login."""
@@ -4486,7 +4508,10 @@ def get_jwks_client(issuer: str):
     normalized_issuer = normalized_issuer_url(issuer)
     if not normalized_issuer:
         raise HTTPException(status_code=401, detail="id_token issuer is missing")
-    jwks_url = f"{normalized_issuer}/.well-known/jwks.json"
+    if "zitadel" in normalized_issuer.lower():
+        jwks_url = f"{normalized_issuer}/oauth/v2/keys"
+    else:
+        jwks_url = f"{normalized_issuer}/.well-known/jwks.json"
     if jwks_url not in _jwks_clients:
         _jwks_clients[jwks_url] = jwt.PyJWKClient(jwks_url)
     return _jwks_clients[jwks_url]
@@ -4513,7 +4538,7 @@ def verify_provider_id_token(id_token: str, requested_provider: Optional[str] = 
         decoded = jwt.decode(
             id_token,
             signing_key,
-            algorithms=["RS256", "ES256"],
+            algorithms=["RS256", "EdDSA", "ES256"],
             audience=audience,
             issuer=issuer_claim or issuer,
         )
@@ -9181,6 +9206,111 @@ def encode_product_oauth_state(product: str) -> str:
     payload = json.dumps({"product": product}, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
+def token_hash(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def datetime_from_jwt_timestamp(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError, OSError):
+        return None
+
+def get_login_record_identity(login_record) -> dict:
+    if not login_record:
+        return {}
+    if isinstance(login_record, ZitadelLoginRecordModel):
+        return {
+            "provider": "zitadel",
+            "subject": login_record.zitadel_user_id,
+            "issuer": normalized_issuer_url(ZITADEL_DOMAIN),
+        }
+    if isinstance(login_record, Auth0LoginRecordModel):
+        return {
+            "provider": "auth0",
+            "subject": login_record.auth0_user_id,
+            "issuer": normalized_issuer_url(AUTH0_DOMAIN),
+        }
+    return {}
+
+async def record_identity_session_revocation(
+    db: AsyncSession,
+    provider: str,
+    token: Optional[str],
+    login_record=None,
+    reason: str = "logout",
+) -> Optional[IdentitySessionRevocationModel]:
+    decoded = decode_unverified_jwt_claims(token)
+    record_identity = get_login_record_identity(login_record)
+    issuer = normalized_issuer_url(decoded.get("iss") or record_identity.get("issuer") or expected_provider_issuer(provider))
+    subject = decoded.get("sub") or record_identity.get("subject")
+    if not issuer or not subject:
+        return None
+
+    expires_at = datetime_from_jwt_timestamp(decoded.get("exp"))
+    if not expires_at and login_record and login_record.expires_at:
+        expires_at = login_record.expires_at
+
+    revocation = IdentitySessionRevocationModel(
+        identity_provider=provider,
+        issuer=issuer,
+        subject=subject,
+        session_id=decoded.get("sid"),
+        token_hash=token_hash(token),
+        login_record_id=login_record.id if login_record else None,
+        email=(login_record.email if login_record else decoded.get("email")),
+        reason=reason,
+        expires_at=expires_at,
+    )
+    db.add(revocation)
+    return revocation
+
+async def get_identity_session_revocation(
+    db: AsyncSession,
+    provider: str,
+    decoded_token: dict,
+    token: Optional[str],
+) -> Optional[IdentitySessionRevocationModel]:
+    issuer = normalized_issuer_url(decoded_token.get("iss") or expected_provider_issuer(provider))
+    subject = decoded_token.get("sub")
+    if not issuer or not subject:
+        return None
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    issued_at = datetime_from_jwt_timestamp(decoded_token.get("iat"))
+    hashed = token_hash(token)
+
+    exact_token_query = select(IdentitySessionRevocationModel).where(
+        IdentitySessionRevocationModel.identity_provider == provider,
+        IdentitySessionRevocationModel.issuer == issuer,
+        IdentitySessionRevocationModel.token_hash == hashed,
+        or_(
+            IdentitySessionRevocationModel.expires_at.is_(None),
+            IdentitySessionRevocationModel.expires_at > now,
+        ),
+    )
+    if hashed:
+        exact_result = await db.execute(exact_token_query.limit(1))
+        exact_revocation = exact_result.scalar_one_or_none()
+        if exact_revocation:
+            return exact_revocation
+
+    subject_query = select(IdentitySessionRevocationModel).where(
+        IdentitySessionRevocationModel.identity_provider == provider,
+        IdentitySessionRevocationModel.issuer == issuer,
+        IdentitySessionRevocationModel.subject == subject,
+        or_(
+            IdentitySessionRevocationModel.expires_at.is_(None),
+            IdentitySessionRevocationModel.expires_at > now,
+        ),
+    )
+    if issued_at:
+        subject_query = subject_query.where(IdentitySessionRevocationModel.revoked_at >= issued_at)
+    subject_query = subject_query.order_by(IdentitySessionRevocationModel.revoked_at.desc()).limit(1)
+    result = await db.execute(subject_query)
+    return result.scalar_one_or_none()
+
 def set_product_auth_cookies(response: Response, token: Optional[str], expires_in: Any = None) -> None:
     if not token:
         return
@@ -9702,6 +9832,45 @@ async def refresh_active_identity_provider_token(
         return await zitadel_refresh_token(data)
     raise HTTPException(status_code=400, detail="Auth0 refresh is not implemented for the generic identity endpoint")
 
+@api_router.post("/public/auth/session/validate", tags=["Public API - Identity"])
+async def validate_identity_provider_session(
+    data: IdentitySessionValidateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verify a provider ID token and check central logout revocation state.
+
+    Products should call this before accepting a stored provider token. If
+    active=false, clear local storage/cookies and send the user to login.
+    """
+    token = data.id_token or data.token or request.cookies.get("ps_auth_token")
+    if not token:
+        return {"success": True, "active": False, "reason": "missing_token"}
+
+    decoded, provider = verify_provider_id_token(token, data.identity_provider)
+    revocation = await get_identity_session_revocation(db, provider, decoded, token)
+    if revocation:
+        return {
+            "success": True,
+            "active": False,
+            "reason": "revoked",
+            "identity_provider": provider,
+            "revoked_at": revocation.revoked_at.isoformat() if revocation.revoked_at else None,
+            "revocation_id": revocation.id,
+        }
+
+    return {
+        "success": True,
+        "active": True,
+        "identity_provider": provider,
+        "issuer": decoded.get("iss"),
+        "subject": decoded.get("sub"),
+        "session_id": decoded.get("sid"),
+        "email": decoded.get("email"),
+        "expires_at": decoded.get("exp"),
+    }
+
 @api_router.get("/public/auth/logout-url", tags=["Public API - Identity"])
 async def active_identity_provider_logout_url(
     product: Optional[str] = "probestack",
@@ -9783,10 +9952,17 @@ async def logout_identity_provider_session(
     if not revoke_token and provider == "zitadel" and login_record:
         revoke_token = login_record.access_token
 
-    revocation = await revoke_provider_token(provider, revoke_token)
+    provider_revocation = await revoke_provider_token(provider, revoke_token)
+    session_revocation = await record_identity_session_revocation(
+        db,
+        provider,
+        id_token_hint or token,
+        login_record,
+    )
 
     if login_record:
         clear_login_record_tokens(login_record)
+    if login_record or session_revocation:
         await db.commit()
 
     if provider == "zitadel":
@@ -9821,7 +9997,12 @@ async def logout_identity_provider_session(
         "logout_url": logout_url,
         "redirect_required": True,
         "cleared_cookies": True,
-        "revocation": revocation,
+        "revocation": provider_revocation,
+        "session_revocation": {
+            "id": session_revocation.id if session_revocation else None,
+            "subject": session_revocation.subject if session_revocation else None,
+            "revoked_at": session_revocation.revoked_at.isoformat() if session_revocation else None,
+        } if session_revocation else None,
         "product": product_key,
         "post_logout_redirect_uri": post_logout_uri,
         "login_record_id": login_record.id if login_record else None,
@@ -9876,9 +10057,16 @@ async def logout_identity_provider_session_redirect(
     if not revoke_token and provider == "zitadel" and login_record:
         revoke_token = login_record.access_token
     await revoke_provider_token(provider, revoke_token)
+    session_revocation = await record_identity_session_revocation(
+        db,
+        provider,
+        id_token_hint or token,
+        login_record,
+    )
 
     if login_record:
         clear_login_record_tokens(login_record)
+    if login_record or session_revocation:
         await db.commit()
 
     if provider == "zitadel":
