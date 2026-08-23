@@ -95,12 +95,14 @@ ZITADEL_REDIRECT_URIS = {
     "probestack": os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_CALLBACK_URI),
     "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_CALLBACK_URI", "https://forgecatalog.com/auth/zitadel/callback"),
     "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_CALLBACK_URI", "https://forgefuzz.com/auth/zitadel/callback"),
+    "console": os.environ.get("ZITADEL_CONSOLE_CALLBACK_URI", "https://console.probestack.io/admin/auth/zitadel/callback"),
     "local": os.environ.get("ZITADEL_LOCAL_CALLBACK_URI", "http://localhost:3000/admin/zitadel-test"),
 }
 ZITADEL_POST_LOGOUT_URIS = {
     "probestack": os.environ.get("ZITADEL_PROBESTACK_POST_LOGOUT_URI", "https://probestack.io"),
     "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_POST_LOGOUT_URI", "https://forgecatalog.com"),
     "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_POST_LOGOUT_URI", "https://forgefuzz.com"),
+    "console": os.environ.get("ZITADEL_CONSOLE_POST_LOGOUT_URI", "https://console.probestack.io"),
     "local": os.environ.get("ZITADEL_LOCAL_POST_LOGOUT_URI", "http://localhost:3000/admin/zitadel-test"),
 }
 
@@ -8939,6 +8941,7 @@ def resolve_zitadel_redirect_uri(product: Optional[str] = None, redirect_uri: Op
         "forgecatalog": "forgecatalog",
         "fuzz": "forgefuzz",
         "forgefuzz": "forgefuzz",
+        "console": "console",
     }.get(requested_product, requested_product)
 
     if product_key not in ZITADEL_REDIRECT_URIS:
@@ -8974,6 +8977,7 @@ def resolve_zitadel_post_logout_uri(
         "forgecatalog": "forgecatalog",
         "fuzz": "forgefuzz",
         "forgefuzz": "forgefuzz",
+        "console": "console",
     }.get(requested_product, requested_product)
 
     if product_key not in ZITADEL_POST_LOGOUT_URIS:
@@ -9292,11 +9296,32 @@ async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depe
             db.add(new_user)
             synced_user = new_user
 
+    admin_login = None
+    if email:
+        admin_result = await db.execute(select(AdminModel).where(AdminModel.email == email))
+        admin = admin_result.scalar_one_or_none()
+        if admin and admin.is_active:
+            organization_name = await get_organization_name(db, admin.organization_id)
+            admin_login = {
+                "token": create_token(admin.id, admin.email, admin.role, admin.organization_id),
+                "admin": {
+                    "id": admin.id,
+                    "email": admin.email,
+                    "name": admin.name,
+                    "role": admin.role,
+                    "organization_id": admin.organization_id,
+                    "organization_name": organization_name,
+                    "is_active": admin.is_active,
+                },
+            }
+
     await db.commit()
 
     return {
         "success": True,
         "identity_provider": "zitadel",
+        "token": admin_login["token"] if admin_login else None,
+        "admin": admin_login["admin"] if admin_login else None,
         "access_token": tokens.get("access_token"),
         "refresh_token": tokens.get("refresh_token"),
         "id_token": id_token,
