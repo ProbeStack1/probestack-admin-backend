@@ -9055,6 +9055,7 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
         "scope": scope,
         "redirect_uri": redirect_uri,
         "login_hint": email,
+        "organization": selected_zitadel_org_id,
     }
     if data.state:
         zitadel_params["state"] = data.state
