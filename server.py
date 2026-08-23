@@ -747,13 +747,18 @@ class ZitadelManagementAPI:
         logger.warning(f"Zitadel role assignment error: {response.text}")
         return {"success": False, "error": response.text, "status_code": response.status_code, "role_keys": cleaned_role_keys}
 
-    async def get_user_by_email(self, email: str, organization_id: Optional[str] = None) -> dict:
+    async def get_user_by_email(
+        self,
+        email: str,
+        organization_id: Optional[str] = None,
+        use_default_org: bool = True,
+    ) -> dict:
         """Get a Zitadel user by exact email match."""
         if not self.enabled:
             return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
 
         queries = [{"emailQuery": {"emailAddress": email, "method": 1}}]
-        target_org_id = organization_id or self.default_org_id
+        target_org_id = organization_id if organization_id is not None else (self.default_org_id if use_default_org else None)
         if target_org_id:
             queries.insert(0, {"organizationIdQuery": {"organizationId": target_org_id}})
         payload = {
@@ -9037,19 +9042,29 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
     selected_zitadel_org_id = None
     existing_user_result = await db.execute(select(UserModel).where(UserModel.email == email))
     existing_user = existing_user_result.scalar_one_or_none()
-    if existing_user and existing_user.zitadel_user_id:
-        zitadel_user_result = await zitadel_mgmt.get_user_by_id(existing_user.zitadel_user_id)
-        if zitadel_user_result.get("success"):
-            zitadel_user = zitadel_user_result.get("user") or {}
-            selected_zitadel_org_id = (
-                (zitadel_user.get("details") or {}).get("resourceOwner")
-                or zitadel_user.get("resourceOwner")
-                or zitadel_user.get("resourceOwnerId")
-                or zitadel_user.get("organizationId")
+    if existing_user:
+        zitadel_user = None
+        if existing_user.zitadel_user_id:
+            zitadel_user_result = await zitadel_mgmt.get_user_by_id(existing_user.zitadel_user_id)
+            if zitadel_user_result.get("success"):
+                zitadel_user = zitadel_user_result.get("user") or {}
+
+        if not zitadel_user:
+            zitadel_user_result = await zitadel_mgmt.get_user_by_email(
+                email,
+                organization_id=None,
+                use_default_org=False,
             )
+            if zitadel_user_result.get("success"):
+                zitadel_user = zitadel_user_result.get("user") or {}
+                zitadel_user_id = zitadel_user.get("userId") or zitadel_user.get("id")
+                if zitadel_user_id and existing_user.zitadel_user_id != zitadel_user_id:
+                    existing_user.zitadel_user_id = zitadel_user_id
+
+        selected_zitadel_org_id = extract_zitadel_resource_owner(zitadel_user)
+        if selected_zitadel_org_id:
             if (
-                selected_zitadel_org_id
-                and found_org.zitadel_org_id != selected_zitadel_org_id
+                found_org.zitadel_org_id != selected_zitadel_org_id
                 and (not found_org.zitadel_org_id or found_org.zitadel_org_id == ZITADEL_DEFAULT_ORG_ID)
             ):
                 logger.info(
@@ -9061,6 +9076,7 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
                 )
                 found_org.zitadel_org_id = selected_zitadel_org_id
                 found_org.updated_at = datetime.now(timezone.utc)
+            if db.is_modified(found_org) or db.is_modified(existing_user):
                 await db.commit()
 
     selected_zitadel_org_id = selected_zitadel_org_id or found_org.zitadel_org_id or ZITADEL_DEFAULT_ORG_ID
@@ -9124,6 +9140,16 @@ def extract_zitadel_roles(decoded_token: dict) -> list[str]:
         elif isinstance(claim, dict):
             roles.extend([key for key in claim.keys() if key])
     return list(dict.fromkeys(roles))
+
+def extract_zitadel_resource_owner(zitadel_user: dict) -> Optional[str]:
+    if not zitadel_user:
+        return None
+    return (
+        (zitadel_user.get("details") or {}).get("resourceOwner")
+        or zitadel_user.get("resourceOwner")
+        or zitadel_user.get("resourceOwnerId")
+        or zitadel_user.get("organizationId")
+    )
 
 @api_router.post("/public/zitadel/auth/callback", tags=["Public API - Zitadel"])
 async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depends(get_db)):
