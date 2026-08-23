@@ -9034,7 +9034,36 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
     if not found_org:
         raise HTTPException(status_code=404, detail=f"No organization found for email domain {email_domain}")
 
-    selected_zitadel_org_id = found_org.zitadel_org_id or ZITADEL_DEFAULT_ORG_ID
+    selected_zitadel_org_id = None
+    existing_user_result = await db.execute(select(UserModel).where(UserModel.email == email))
+    existing_user = existing_user_result.scalar_one_or_none()
+    if existing_user and existing_user.zitadel_user_id:
+        zitadel_user_result = await zitadel_mgmt.get_user_by_id(existing_user.zitadel_user_id)
+        if zitadel_user_result.get("success"):
+            zitadel_user = zitadel_user_result.get("user") or {}
+            selected_zitadel_org_id = (
+                (zitadel_user.get("details") or {}).get("resourceOwner")
+                or zitadel_user.get("resourceOwner")
+                or zitadel_user.get("resourceOwnerId")
+                or zitadel_user.get("organizationId")
+            )
+            if (
+                selected_zitadel_org_id
+                and found_org.zitadel_org_id != selected_zitadel_org_id
+                and (not found_org.zitadel_org_id or found_org.zitadel_org_id == ZITADEL_DEFAULT_ORG_ID)
+            ):
+                logger.info(
+                    "Updating %s Zitadel org id from %s to %s based on user %s",
+                    found_org.name,
+                    found_org.zitadel_org_id,
+                    selected_zitadel_org_id,
+                    email,
+                )
+                found_org.zitadel_org_id = selected_zitadel_org_id
+                found_org.updated_at = datetime.now(timezone.utc)
+                await db.commit()
+
+    selected_zitadel_org_id = selected_zitadel_org_id or found_org.zitadel_org_id or ZITADEL_DEFAULT_ORG_ID
     if not selected_zitadel_org_id:
         raise HTTPException(
             status_code=400,
