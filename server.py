@@ -9373,12 +9373,16 @@ async def zitadel_callback(data: ZitadelCallbackRequest, db: AsyncSession = Depe
 
     await db.commit()
 
+    product_token = tokens.get("access_token")
+    admin_token = admin_login["token"] if admin_login else None
+
     return {
         "success": True,
         "identity_provider": "zitadel",
-        "token": admin_login["token"] if admin_login else None,
+        "token": product_token,
+        "admin_token": admin_token,
         "admin": admin_login["admin"] if admin_login else None,
-        "access_token": tokens.get("access_token"),
+        "access_token": product_token,
         "refresh_token": tokens.get("refresh_token"),
         "id_token": id_token,
         "token_type": tokens.get("token_type"),
