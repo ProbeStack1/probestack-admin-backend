@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Response, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -62,6 +62,7 @@ AUTH0_POST_LOGOUT_URIS = {
     "probestack": os.environ.get("AUTH0_PROBESTACK_POST_LOGOUT_URI", "https://probestack.io"),
     "forgecatalog": os.environ.get("AUTH0_FORGECATALOG_POST_LOGOUT_URI", "https://forgecatalog.com"),
     "forgefuzz": os.environ.get("AUTH0_FORGEFUZZ_POST_LOGOUT_URI", "https://forgefuzz.com"),
+    "console": os.environ.get("AUTH0_CONSOLE_POST_LOGOUT_URI", "https://console.probestack.io"),
     "local": os.environ.get("AUTH0_LOCAL_POST_LOGOUT_URI", "http://localhost:3000/admin/zitadel-test"),
 }
 
@@ -1666,6 +1667,18 @@ class ZitadelCallbackRequest(BaseModel):
 class ZitadelRefreshTokenRequest(BaseModel):
     """Request to refresh Zitadel user tokens."""
     refresh_token: str
+
+class IdentityLogoutRequest(BaseModel):
+    """Request to clear product auth and start provider logout."""
+    token: Optional[str] = None
+    id_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    identity_provider: Optional[str] = None
+    login_record_id: Optional[str] = None
+    product: Optional[str] = None
+    post_logout_redirect_uri: Optional[str] = None
+    state: Optional[str] = None
+    logout_hint: Optional[str] = None
 
 class UserContextTokenRequest(BaseModel):
     """Request to issue a ProbeStack user-context token after probestack.io login."""
@@ -9183,6 +9196,147 @@ def set_product_auth_cookies(response: Response, token: Optional[str], expires_i
             samesite="lax",
         )
 
+def clear_product_auth_cookies(response: Response) -> None:
+    for cookie_name in ("ps_auth_token", "ps_auth_session"):
+        response.delete_cookie(
+            key=cookie_name,
+            path="/",
+            domain=".probestack.io",
+            secure=True,
+            httponly=False,
+            samesite="lax",
+        )
+        response.delete_cookie(
+            key=cookie_name,
+            path="/",
+            secure=True,
+            httponly=False,
+            samesite="lax",
+        )
+
+def decode_unverified_jwt_claims(token: Optional[str]) -> dict:
+    if not token:
+        return {}
+    try:
+        return jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+            },
+        )
+    except Exception:
+        return {}
+
+def infer_identity_provider_from_token(token: Optional[str], requested_provider: Optional[str] = None) -> Optional[str]:
+    if requested_provider:
+        return normalize_identity_provider(requested_provider)
+    decoded = decode_unverified_jwt_claims(token)
+    issuer = (decoded.get("iss") or "").strip()
+    if not issuer:
+        return None
+    return infer_identity_provider_from_issuer(issuer)
+
+def infer_logout_product(
+    provider: str,
+    product: Optional[str],
+    post_logout_redirect_uri: Optional[str],
+) -> str:
+    if product:
+        return product
+    selected_uri = (post_logout_redirect_uri or "").strip()
+    if selected_uri:
+        uri_map = ZITADEL_POST_LOGOUT_URIS if provider == "zitadel" else AUTH0_POST_LOGOUT_URIS
+        for product_key, allowed_uri in uri_map.items():
+            if allowed_uri == selected_uri:
+                return product_key
+    return "probestack"
+
+async def get_logout_login_record(
+    db: AsyncSession,
+    provider: str,
+    login_record_id: Optional[str],
+    token: Optional[str],
+):
+    model = ZitadelLoginRecordModel if provider == "zitadel" else Auth0LoginRecordModel
+    if login_record_id:
+        result = await db.execute(select(model).where(model.id == login_record_id))
+        record = result.scalar_one_or_none()
+        if record:
+            return record
+
+    if not token:
+        return None
+
+    result = await db.execute(
+        select(model)
+        .where(model.id_token == token)
+        .order_by(model.login_at.desc())
+        .limit(1)
+    )
+    record = result.scalar_one_or_none()
+    if record:
+        return record
+
+    result = await db.execute(
+        select(model)
+        .where(model.access_token == token)
+        .order_by(model.login_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+async def revoke_provider_token(provider: str, token: Optional[str]) -> dict:
+    if not token:
+        return {"success": False, "skipped": True, "reason": "no_token"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if provider == "zitadel":
+                if not ZITADEL_CLIENT_ID or not ZITADEL_CLIENT_SECRET or not zitadel_mgmt.base_url:
+                    return {"success": False, "skipped": True, "reason": "zitadel_not_configured"}
+                response = await client.post(
+                    f"{zitadel_mgmt.base_url}/oauth/v2/revoke",
+                    data={
+                        "client_id": ZITADEL_CLIENT_ID,
+                        "client_secret": ZITADEL_CLIENT_SECRET,
+                        "token": token,
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+            else:
+                if not AUTH0_CLIENT_ID or not AUTH0_CLIENT_SECRET or not AUTH0_DOMAIN:
+                    return {"success": False, "skipped": True, "reason": "auth0_not_configured"}
+                response = await client.post(
+                    f"https://{AUTH0_DOMAIN}/oauth/revoke",
+                    json={
+                        "client_id": AUTH0_CLIENT_ID,
+                        "client_secret": AUTH0_CLIENT_SECRET,
+                        "token": token,
+                    },
+                    headers={"Content-Type": "application/json"},
+                )
+    except httpx.RequestError as exc:
+        logger.warning(f"{provider} token revocation request failed: {exc}")
+        return {"success": False, "error": str(exc)}
+
+    if response.status_code in (200, 204):
+        return {"success": True, "status_code": response.status_code}
+
+    logger.warning(f"{provider} token revocation failed: {response.text}")
+    return {"success": False, "status_code": response.status_code, "error": response.text}
+
+def clear_login_record_tokens(login_record) -> None:
+    if not login_record:
+        return
+    login_record.access_token = None
+    login_record.id_token = None
+    if hasattr(login_record, "refresh_token"):
+        login_record.refresh_token = None
+    login_record.expires_at = datetime.now(timezone.utc)
+    login_record.expires_in = 0
+
 @api_router.post("/public/zitadel/auth/callback", tags=["Public API - Zitadel"])
 async def zitadel_callback(
     data: ZitadelCallbackRequest,
@@ -9569,6 +9723,101 @@ async def active_identity_provider_logout_url(
         "logout_url": f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}",
         "product": product_key,
         "post_logout_redirect_uri": return_to,
+    }
+
+@api_router.post("/public/auth/logout", tags=["Public API - Identity"])
+async def logout_identity_provider_session(
+    data: IdentityLogoutRequest,
+    request: Request,
+    fastapi_response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Clear product auth locally and return the provider logout URL.
+
+    The caller must redirect the browser to logout_url so Auth0/Zitadel can
+    clear its own SSO cookie. JWT access/id tokens remain valid until exp.
+    """
+    clear_product_auth_cookies(fastapi_response)
+
+    token = data.id_token or data.token or request.cookies.get("ps_auth_token")
+    provider = infer_identity_provider_from_token(token, data.identity_provider)
+    login_record = None
+
+    if not provider and data.login_record_id:
+        for candidate_provider in ("zitadel", "auth0"):
+            candidate_record = await get_logout_login_record(db, candidate_provider, data.login_record_id, None)
+            if candidate_record:
+                provider = candidate_provider
+                login_record = candidate_record
+                break
+
+    if not provider:
+        provider = await get_active_identity_provider(db)
+
+    if not login_record:
+        login_record = await get_logout_login_record(db, provider, data.login_record_id, token)
+
+    id_token_hint = data.id_token
+    token_claims = decode_unverified_jwt_claims(token)
+    if not id_token_hint and token_claims.get("iss"):
+        id_token_hint = token
+    if not id_token_hint and login_record:
+        id_token_hint = login_record.id_token
+
+    logout_hint = data.logout_hint or (login_record.email if login_record else None)
+    product = infer_logout_product(provider, data.product, data.post_logout_redirect_uri)
+
+    refresh_token = data.refresh_token
+    if not refresh_token and login_record and hasattr(login_record, "refresh_token"):
+        refresh_token = login_record.refresh_token
+
+    revoke_token = refresh_token
+    if not revoke_token and provider == "zitadel" and login_record:
+        revoke_token = login_record.access_token
+
+    revocation = await revoke_provider_token(provider, revoke_token)
+
+    if login_record:
+        clear_login_record_tokens(login_record)
+        await db.commit()
+
+    if provider == "zitadel":
+        if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
+            raise HTTPException(status_code=500, detail="Zitadel logout is not configured")
+        product_key, post_logout_uri = resolve_zitadel_post_logout_uri(product, data.post_logout_redirect_uri)
+        logout_params = {
+            "client_id": ZITADEL_CLIENT_ID,
+            "post_logout_redirect_uri": post_logout_uri,
+        }
+        if id_token_hint:
+            logout_params["id_token_hint"] = id_token_hint
+        if data.state:
+            logout_params["state"] = data.state
+        if logout_hint:
+            logout_params["logout_hint"] = logout_hint
+        logout_url = f"{zitadel_mgmt.base_url}/oidc/v1/end_session?{urlencode(logout_params)}"
+    else:
+        require_identity_provider_configured("auth0")
+        product_key, post_logout_uri = resolve_auth0_post_logout_uri(product, data.post_logout_redirect_uri)
+        logout_params = {
+            "client_id": AUTH0_CLIENT_ID,
+            "returnTo": post_logout_uri,
+        }
+        if data.state:
+            logout_params["state"] = data.state
+        logout_url = f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
+
+    return {
+        "success": True,
+        "identity_provider": provider,
+        "logout_url": logout_url,
+        "redirect_required": True,
+        "cleared_cookies": True,
+        "revocation": revocation,
+        "product": product_key,
+        "post_logout_redirect_uri": post_logout_uri,
+        "login_record_id": login_record.id if login_record else None,
     }
 
 @api_router.get("/zitadel-logins", tags=["Admin - Zitadel"])
