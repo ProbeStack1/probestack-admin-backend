@@ -30,6 +30,8 @@ import smtplib
 from email.message import EmailMessage
 from html import escape
 from xml.sax.saxutils import escape as xml_escape
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from passlib.context import CryptContext
 
@@ -162,7 +164,22 @@ AsyncSessionLocal = async_sessionmaker(
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
 PROBESTACK_TOKEN_ISSUER = os.environ.get("PROBESTACK_TOKEN_ISSUER", "https://auth.probestack.io")
-PROBESTACK_TOKEN_AUDIENCE = ["probestack-api", "probestack-ui"]
+_PROBESTACK_TOKEN_AUDIENCE_RAW = os.environ.get("PROBESTACK_TOKEN_AUDIENCE", '["probestack-api", "probestack-ui"]')
+try:
+    PROBESTACK_TOKEN_AUDIENCE = json.loads(_PROBESTACK_TOKEN_AUDIENCE_RAW)
+except json.JSONDecodeError:
+    PROBESTACK_TOKEN_AUDIENCE = [
+        value.strip() for value in _PROBESTACK_TOKEN_AUDIENCE_RAW.split(",") if value.strip()
+    ] or ["probestack-api", "probestack-ui"]
+PROBESTACK_CONTEXT_TOKEN_ALGORITHM = "RS256"
+PROBESTACK_CONTEXT_TOKEN_KID = os.environ.get("PROBESTACK_CONTEXT_TOKEN_KID", "probestack-context-rs256-1")
+PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY = os.environ.get("PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY", "")
+PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY_PASSPHRASE = os.environ.get("PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY_PASSPHRASE")
+PROBESTACK_CONTEXT_TOKEN_JWKS_URI = os.environ.get(
+    "PROBESTACK_CONTEXT_TOKEN_JWKS_URI",
+    "https://probestack.io/admin-backend/api/public/users/context-token/jwks",
+)
+_context_token_private_key = None
 
 # Application email config. When SMTP_HOST is not set, email sending is skipped
 # and the generated setup link is returned/logged for local testing.
@@ -3734,7 +3751,8 @@ async def build_user_context(
     primary_email = normalized_email or (user.email if user else admin.email)
     organization_id = user.organization_id if user else admin.organization_id
     organization = None
-    if organization_id and not await is_individual_users_org_id(db, organization_id):
+    is_individual_identity = await is_individual_users_org_id(db, organization_id)
+    if organization_id and not is_individual_identity:
         org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == organization_id))
         organization = org_result.scalar_one_or_none()
 
@@ -3814,6 +3832,7 @@ async def build_user_context(
         "is_admin": bool(admin),
         "is_org_admin": is_org_admin,
         "is_super_admin": is_super_admin,
+        "account_type": "individual" if is_individual_identity else "enterprise",
         "permissions": permissions,
         "mongodb_role_lookup": mongodb_role_lookup,
         "business_units": business_unit_context["business_units"],
@@ -3910,6 +3929,60 @@ def build_entitlements_claim(user_context: dict) -> dict:
 
     return {"products": products}
 
+def normalize_pem_env_value(value: str) -> bytes:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return b""
+    cleaned = cleaned.replace("\\n", "\n")
+    if "-----BEGIN" in cleaned:
+        return cleaned.encode()
+    try:
+        return base64.b64decode(cleaned)
+    except Exception:
+        return cleaned.encode()
+
+def get_context_token_private_key():
+    global _context_token_private_key
+    if _context_token_private_key:
+        return _context_token_private_key
+
+    pem = normalize_pem_env_value(PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY)
+    if pem:
+        password = (
+            PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY_PASSPHRASE.encode()
+            if PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY_PASSPHRASE
+            else None
+        )
+        _context_token_private_key = serialization.load_pem_private_key(pem, password=password)
+    else:
+        logger.warning(
+            "PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY is not configured; using an ephemeral RS256 key for context tokens"
+        )
+        _context_token_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return _context_token_private_key
+
+def get_context_token_public_key():
+    return get_context_token_private_key().public_key()
+
+def base64url_uint(value: int) -> str:
+    byte_length = max(1, (value.bit_length() + 7) // 8)
+    return base64.urlsafe_b64encode(value.to_bytes(byte_length, "big")).rstrip(b"=").decode()
+
+def build_context_token_jwks() -> dict:
+    public_numbers = get_context_token_public_key().public_numbers()
+    return {
+        "keys": [
+            {
+                "kty": "RSA",
+                "use": "sig",
+                "alg": PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
+                "kid": PROBESTACK_CONTEXT_TOKEN_KID,
+                "n": base64url_uint(public_numbers.n),
+                "e": base64url_uint(public_numbers.e),
+            }
+        ]
+    }
+
 def build_user_context_token_claims(user_context: dict, issued_at: int, expires_at: int) -> dict:
     user = user_context["user"]
     organization = user_context.get("organization") or {}
@@ -3933,6 +4006,12 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "role": token_role,
         "organization_id": organization.get("id"),
         "organization_name": organization.get("name"),
+        "userId": user["id"],
+        "userEmail": user["email"],
+        "userRole": org_role.get("name") or token_role,
+        "userOrgId": organization.get("id"),
+        "userOrgName": organization.get("name"),
+        "tokenType": user_context.get("account_type", "enterprise"),
         "admin_id": admin.get("id"),
         "is_admin": bool(user_context.get("is_admin")),
         "is_org_admin": bool(user_context.get("is_org_admin")),
@@ -3950,7 +4029,13 @@ def create_user_context_token(user_context: dict) -> tuple[str, int]:
     expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
     issued_at = int(datetime.now(timezone.utc).timestamp())
     payload = build_user_context_token_claims(user_context, issued_at, expires_at)
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM), expires_at
+    headers = {"kid": PROBESTACK_CONTEXT_TOKEN_KID, "typ": "JWT"}
+    return jwt.encode(
+        payload,
+        get_context_token_private_key(),
+        algorithm=PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
+        headers=headers,
+    ), expires_at
 
 async def billing_to_dict(db: AsyncSession, billing: BillingModel) -> dict:
     data = model_to_dict(billing)
@@ -4507,13 +4592,25 @@ def create_token(admin_id: str, email: str, role: str, organization_id: Optional
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
     try:
-        payload = jwt.decode(
-            credentials.credentials,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
-            options={"verify_aud": False},
-        )
+        header = jwt.get_unverified_header(token)
+        algorithm = header.get("alg")
+        if algorithm == PROBESTACK_CONTEXT_TOKEN_ALGORITHM:
+            payload = jwt.decode(
+                token,
+                get_context_token_public_key(),
+                algorithms=[PROBESTACK_CONTEXT_TOKEN_ALGORITHM],
+                issuer=PROBESTACK_TOKEN_ISSUER,
+                options={"verify_aud": False},
+            )
+        else:
+            payload = jwt.decode(
+                token,
+                JWT_SECRET,
+                algorithms=[JWT_ALGORITHM],
+                options={"verify_aud": False},
+            )
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -12801,6 +12898,12 @@ async def get_user_request_status(request_id: str, db: AsyncSession = Depends(ge
     return response
 
 
+@api_router.get("/.well-known/jwks.json", tags=["Public API"])
+@api_router.get("/public/.well-known/jwks.json", tags=["Public API"])
+@api_router.get("/public/users/context-token/jwks", tags=["Public API"])
+async def get_user_context_token_jwks():
+    return build_context_token_jwks()
+
 @api_router.post("/public/users/context-token", tags=["Public API"])
 async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSession = Depends(get_db)):
     """
@@ -12844,6 +12947,11 @@ async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSessi
         "success": True,
         "token": token,
         "token_type": "Bearer",
+        "token_algorithm": PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
+        "kid": PROBESTACK_CONTEXT_TOKEN_KID,
+        "issuer": PROBESTACK_TOKEN_ISSUER,
+        "audience": PROBESTACK_TOKEN_AUDIENCE,
+        "jwks_uri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
         "user": user_context,
     }
