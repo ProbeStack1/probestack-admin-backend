@@ -91,7 +91,7 @@ INDIVIDUAL_USERS_CONTACT_PERSON_FALLBACK = os.environ.get("INDIVIDUAL_USERS_CONT
 ZITADEL_DOMAIN = os.environ.get('ZITADEL_DOMAIN', '')
 ZITADEL_CLIENT_ID = os.environ.get('ZITADEL_CLIENT_ID', '')
 ZITADEL_CLIENT_SECRET = os.environ.get('ZITADEL_CLIENT_SECRET', '')
-ZITADEL_CALLBACK_URI = os.environ.get('ZITADEL_CALLBACK_URI', 'https://probestack.io/admin/auth/zitadel/callback')
+ZITADEL_CALLBACK_URI = os.environ.get('ZITADEL_CALLBACK_URI', AUTH0_CALLBACK_URI)
 ZITADEL_SHARED_CALLBACK_URI = os.environ.get(
     "ZITADEL_SHARED_CALLBACK_URI",
     os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_CALLBACK_URI),
@@ -101,10 +101,10 @@ ZITADEL_DEFAULT_ORG_ID = os.environ.get('ZITADEL_DEFAULT_ORG_ID', '')
 ZITADEL_PROJECT_ID = os.environ.get('ZITADEL_PROJECT_ID', '')
 ZITADEL_REDIRECT_URIS = {
     "probestack": os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
-    "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
-    "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
+    "forgecatalog": os.environ.get("ZITADEL_FORGECATALOG_CALLBACK_URI", AUTH0_REDIRECT_URIS["forgecatalog"]),
+    "forgefuzz": os.environ.get("ZITADEL_FORGEFUZZ_CALLBACK_URI", AUTH0_REDIRECT_URIS["forgefuzz"]),
     "console": os.environ.get("ZITADEL_CONSOLE_CALLBACK_URI", ZITADEL_SHARED_CALLBACK_URI),
-    "local": os.environ.get("ZITADEL_LOCAL_CALLBACK_URI", "http://localhost:3000/admin/zitadel-test"),
+    "local": os.environ.get("ZITADEL_LOCAL_CALLBACK_URI", AUTH0_REDIRECT_URIS["local"]),
 }
 ZITADEL_POST_LOGOUT_URIS = {
     "probestack": os.environ.get("ZITADEL_PROBESTACK_POST_LOGOUT_URI", "https://probestack.io"),
