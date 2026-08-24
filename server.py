@@ -91,7 +91,7 @@ INDIVIDUAL_USERS_CONTACT_PERSON_FALLBACK = os.environ.get("INDIVIDUAL_USERS_CONT
 ZITADEL_DOMAIN = os.environ.get('ZITADEL_DOMAIN', '')
 ZITADEL_CLIENT_ID = os.environ.get('ZITADEL_CLIENT_ID', '')
 ZITADEL_CLIENT_SECRET = os.environ.get('ZITADEL_CLIENT_SECRET', '')
-ZITADEL_CALLBACK_URI = os.environ.get('ZITADEL_CALLBACK_URI', 'https://probestack.io/admin/auth/zitadel/callback')
+ZITADEL_CALLBACK_URI = os.environ.get('ZITADEL_CALLBACK_URI', 'https://probestack.io/auth/zitadel/callback')
 ZITADEL_SHARED_CALLBACK_URI = os.environ.get(
     "ZITADEL_SHARED_CALLBACK_URI",
     os.environ.get("ZITADEL_PROBESTACK_CALLBACK_URI", ZITADEL_CALLBACK_URI),
