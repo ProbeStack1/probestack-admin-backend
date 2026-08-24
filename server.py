@@ -713,6 +713,56 @@ class ZitadelManagementAPI:
         logger.warning(f"Zitadel add organization domain error: {response.text}")
         return {"success": False, "error": response.text, "status_code": response.status_code}
 
+    async def set_user_metadata(self, user_id: str, metadata: dict) -> dict:
+        """Set ProbeStack metadata on a Zitadel user for token action custom claims."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        if not user_id:
+            return {"success": False, "skipped": True, "error": "Zitadel user ID is required"}
+
+        entries = self._metadata_entries({k: v for k, v in (metadata or {}).items() if v is not None})
+        if not entries:
+            return {"success": True, "skipped": True, "metadata": []}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/users/{user_id}/metadata",
+                headers=self._headers(),
+                json={"metadata": entries},
+                timeout=30.0,
+            )
+
+        if response.status_code == 200:
+            return {"success": True, "metadata_keys": [entry["key"] for entry in entries]}
+
+        logger.warning(f"Zitadel set user metadata error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def set_organization_metadata(self, organization_id: str, metadata: dict) -> dict:
+        """Set ProbeStack metadata on a Zitadel organization for token action custom claims."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        if not organization_id:
+            return {"success": False, "skipped": True, "error": "Zitadel organization ID is required"}
+
+        entries = self._metadata_entries({k: v for k, v in (metadata or {}).items() if v is not None})
+        if not entries:
+            return {"success": True, "skipped": True, "metadata": []}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/organizations/{organization_id}/metadata",
+                headers=self._headers(),
+                json={"metadata": entries},
+                timeout=30.0,
+            )
+
+        if response.status_code == 200:
+            return {"success": True, "metadata_keys": [entry["key"] for entry in entries]}
+
+        logger.warning(f"Zitadel set organization metadata error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
     async def assign_user_roles(
         self,
         user_id: str,
@@ -5251,13 +5301,60 @@ def supported_domains_from_domain(domain: Optional[str]) -> Optional[str]:
         return None
     return json.dumps([f"@{cleaned_domain}"])
 
+def build_probestack_org_metadata(org: OrganizationModel) -> dict:
+    return {
+        "probestack_org_id": org.id,
+        "probestack_org_name": org.name,
+    }
+
+async def probestack_token_type_for_org(db: AsyncSession, org: Optional[OrganizationModel]) -> str:
+    return "individual" if await is_individual_users_org(db, org) else "enterprise"
+
+async def build_probestack_user_metadata(
+    db: AsyncSession,
+    user: UserModel,
+    email: str,
+    org: Optional[OrganizationModel],
+    role_name: Optional[str],
+    base_metadata: Optional[dict] = None,
+) -> dict:
+    metadata = dict(base_metadata or {})
+    token_type = await probestack_token_type_for_org(db, org)
+    metadata.update(
+        {
+            "probestack_user_id": user.id,
+            "probestack_user_email": email,
+            "probestack_user_role": role_name or await get_role_name(db, user.role_id, "API/Agent Consumer"),
+            "probestack_token_type": token_type,
+        }
+    )
+    if org:
+        metadata.update(
+            {
+                "organization_id": org.id,
+                "organization_name": org.name,
+                "probestack_org_id": org.id,
+                "probestack_org_name": org.name,
+            }
+        )
+    return metadata
+
 async def provision_organization_in_zitadel(org: OrganizationModel) -> dict:
     """Create the matching Zitadel organization and persist its ID on the local organization row."""
     if not zitadel_mgmt.enabled:
         logger.info(f"Zitadel organization provisioning skipped for {org.name}: not configured")
         return {"success": False, "skipped": True}
     if org.zitadel_org_id:
-        return {"success": True, "exists": True, "zitadel_org_id": org.zitadel_org_id}
+        metadata_result = await zitadel_mgmt.set_organization_metadata(
+            org.zitadel_org_id,
+            build_probestack_org_metadata(org),
+        )
+        return {
+            "success": True,
+            "exists": True,
+            "zitadel_org_id": org.zitadel_org_id,
+            "metadata": metadata_result,
+        }
 
     zitadel_result = await zitadel_mgmt.create_organization(org.name)
     if not zitadel_result.get("success"):
@@ -5272,6 +5369,12 @@ async def provision_organization_in_zitadel(org: OrganizationModel) -> dict:
         zitadel_result["domain"] = domain_result
         if not org.supported_domains:
             org.supported_domains = supported_domains_from_domain(org.domain)
+
+    metadata_result = await zitadel_mgmt.set_organization_metadata(
+        org.zitadel_org_id,
+        build_probestack_org_metadata(org),
+    )
+    zitadel_result["metadata"] = metadata_result
 
     logger.info(f"Zitadel organization created for {org.name}: {org.zitadel_org_id}")
     return zitadel_result
@@ -5383,6 +5486,13 @@ async def provision_user_in_zitadel(
             logger.warning(
                 f"Failed to assign Zitadel role for {email}: {role_assignment.get('error')}"
             )
+    if user.zitadel_user_id:
+        metadata_result = await zitadel_mgmt.set_user_metadata(user.zitadel_user_id, user_metadata or {})
+        zitadel_result["metadata"] = metadata_result
+        if not metadata_result.get("success") and not metadata_result.get("skipped"):
+            logger.warning(
+                f"Failed to set Zitadel user metadata for {email}: {metadata_result.get('error')}"
+            )
     return zitadel_result
 
 async def provision_user_in_auth0(
@@ -5451,12 +5561,20 @@ async def provision_user_for_active_provider(
 ) -> dict:
     active_provider = normalize_identity_provider(provider or await get_active_identity_provider(db))
     require_identity_provider_configured(active_provider)
+    metadata = await build_probestack_user_metadata(
+        db,
+        user,
+        email,
+        org,
+        role_name,
+        user_metadata,
+    )
     if active_provider == "auth0":
         result = await provision_user_in_auth0(
             user,
             email,
             name,
-            user_metadata,
+            metadata,
             org.auth0_org_id if org else None,
             role_name,
         )
@@ -5471,7 +5589,7 @@ async def provision_user_for_active_provider(
             user,
             email,
             name,
-            user_metadata,
+            metadata,
             org.zitadel_org_id if org else None,
             role_name,
         )
@@ -9631,6 +9749,8 @@ async def zitadel_callback(
 
     synced_user = None
     synced_roles = []
+    primary_role = None
+    metadata_sync = {}
 
     if org and email:
         result = await db.execute(
@@ -9679,6 +9799,30 @@ async def zitadel_callback(
             db.add(new_user)
             synced_user = new_user
 
+    if org and org.zitadel_org_id:
+        metadata_sync["organization"] = await zitadel_mgmt.set_organization_metadata(
+            org.zitadel_org_id,
+            build_probestack_org_metadata(org),
+        )
+
+    if synced_user and zitadel_user_id:
+        await db.flush()
+        if not synced_user.zitadel_user_id:
+            synced_user.zitadel_user_id = zitadel_user_id
+        role_name_for_metadata = (primary_role or {}).get("name") or await get_role_name(
+            db,
+            synced_user.role_id,
+            "API/Agent Consumer",
+        )
+        user_metadata = await build_probestack_user_metadata(
+            db,
+            synced_user,
+            synced_user.email,
+            org,
+            role_name_for_metadata,
+        )
+        metadata_sync["user"] = await zitadel_mgmt.set_user_metadata(zitadel_user_id, user_metadata)
+
     admin_login = None
     if email:
         admin_result = await db.execute(select(AdminModel).where(AdminModel.email == email))
@@ -9726,6 +9870,7 @@ async def zitadel_callback(
             "external_org_id": org.external_org_id if org else zitadel_org_id,
         },
         "login_record_id": login_record.id,
+        "metadata_sync": metadata_sync,
         "synced_user": {
             "id": synced_user.id if synced_user else None,
             "email": synced_user.email if synced_user else None,
@@ -10494,35 +10639,6 @@ async def delete_individual_user_request(
     await db.commit()
 
     return {"message": "Request deleted successfully"}
-
-@api_router.put("/organizations/{org_id}")
-async def update_organization(org_id: str, data: OrganizationUpdate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
-    org = result.scalar_one_or_none()
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    
-    update_data = {k: v for k, v in payload_dict(data).items() if v is not None}
-    if 'supported_domains' in update_data and isinstance(update_data['supported_domains'], list):
-        update_data['supported_domains'] = json.dumps(update_data['supported_domains'])
-    if 'gateway_environments' in update_data and isinstance(update_data['gateway_environments'], list):
-        update_data['gateway_environments'] = json.dumps(update_data['gateway_environments'])
-
-    if 'external_org_id' in update_data and update_data['external_org_id']:
-        existing = await db.execute(
-            select(OrganizationModel).where(
-                OrganizationModel.external_org_id == update_data['external_org_id'],
-                OrganizationModel.id != org_id
-            )
-        )
-        if existing.scalar_one_or_none():
-            raise HTTPException(status_code=400, detail="External Org ID already in use by another organization")
-    for key, value in update_data.items():
-        if hasattr(org, key):
-            setattr(org, key, normalize_onboarding_value(key, value))
-    org.updated_at = datetime.now(timezone.utc)
-    await db.commit()
-    return await organization_to_dict(db, org)
 
 @api_router.post("/organizations/{org_id}/approve")
 async def approve_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -11527,6 +11643,40 @@ async def create_user(data: UserCreate, payload: dict = Depends(require_super_ad
             requested_tools=[],
             source_request=individual_request,
         )
+
+    active_provider = await get_active_identity_provider(db)
+    if org.status == "approved":
+        needs_provider_org = (
+            (active_provider == "auth0" and not org.auth0_org_id)
+            or (active_provider == "zitadel" and not org.zitadel_org_id)
+        )
+        org_provision_result = {"success": True, "skipped": True}
+        if needs_provider_org:
+            org_provision_result = await provision_organization_for_active_provider(db, org, active_provider)
+        if not org_provision_result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to create organization in {active_provider.upper()}: {org_provision_result.get('error') or 'unknown error'}",
+            )
+        provider_user_result = await provision_user_for_active_provider(
+            db,
+            user,
+            data.email,
+            data.name,
+            {
+                "probestack_user_id": user.id,
+                "organization_id": org.id,
+                "organization_name": org.name,
+            },
+            org,
+            role.name,
+            active_provider,
+        )
+        if not provider_user_result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to create user in {active_provider.upper()}: {provider_user_result.get('error') or 'unknown error'}",
+            )
 
     await db.commit()
     return await user_to_dict(db, user)
