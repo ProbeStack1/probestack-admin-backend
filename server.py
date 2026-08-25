@@ -68,6 +68,16 @@ AUTH0_POST_LOGOUT_URIS = {
     "console": os.environ.get("AUTH0_CONSOLE_POST_LOGOUT_URI", "https://console.probestack.io"),
     "local": os.environ.get("AUTH0_LOCAL_POST_LOGOUT_URI", "http://localhost:3000/admin/zitadel-test"),
 }
+PRODUCT_AUTH_RETURN_URLS = {
+    "probestack": os.environ.get(
+        "PROBESTACK_PRODUCT_RETURN_URL",
+        os.environ.get("CONSOLE_PRODUCT_RETURN_URL", "https://console.probestack.io"),
+    ),
+    "console": os.environ.get("CONSOLE_PRODUCT_RETURN_URL", "https://console.probestack.io"),
+    "forgecatalog": os.environ.get("FORGECATALOG_PRODUCT_RETURN_URL", "https://forgecatalog.com"),
+    "forgefuzz": os.environ.get("FORGEFUZZ_PRODUCT_RETURN_URL", "https://forgefuzz.com"),
+    "local": os.environ.get("LOCAL_PRODUCT_RETURN_URL", "http://localhost:3000"),
+}
 
 SUPPORTED_IDENTITY_PROVIDERS = {"auth0", "zitadel"}
 DEFAULT_IDENTITY_PROVIDER = os.environ.get(
@@ -8818,6 +8828,25 @@ def resolve_auth0_post_logout_uri(
 
     return product_key, selected_post_logout_uri
 
+def normalize_auth_product(product: Optional[str] = None) -> str:
+    requested_product = (product or "probestack").strip().lower().replace("-", "")
+    return {
+        "probe": "probestack",
+        "probestack": "probestack",
+        "localhost": "local",
+        "local": "local",
+        "dev": "local",
+        "catalog": "forgecatalog",
+        "forgecatalog": "forgecatalog",
+        "fuzz": "forgefuzz",
+        "forgefuzz": "forgefuzz",
+        "console": "console",
+    }.get(requested_product, requested_product)
+
+def resolve_product_auth_return_url(product: Optional[str] = None) -> str:
+    product_key = normalize_auth_product(product)
+    return PRODUCT_AUTH_RETURN_URLS.get(product_key) or PRODUCT_AUTH_RETURN_URLS["probestack"]
+
 @api_router.post("/public/auth/init", tags=["Public API - Identity"])
 async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db)):
     """
@@ -8839,6 +8868,7 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
     if not data.email or "@" not in data.email:
         raise HTTPException(status_code=400, detail="Invalid email format")
     product_key, redirect_uri = resolve_auth0_redirect_uri(data.product, data.redirect_uri)
+    product_redirect_url = resolve_product_auth_return_url(product_key)
 
     # Extract domain from email
     email_domain = "@" + data.email.split("@")[1].lower()
@@ -8887,6 +8917,8 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
     # Add state if provided (for CSRF protection)
     if data.state:
         auth0_params["state"] = data.state
+    else:
+        auth0_params["state"] = encode_product_oauth_state(product_key, product_redirect_url)
 
     authorize_url = f"https://{AUTH0_DOMAIN}/authorize?{urlencode(auth0_params)}"
 
@@ -8904,6 +8936,8 @@ async def auth0_init(data: Auth0InitRequest, db: AsyncSession = Depends(get_db))
         "domain": email_domain,
         "product": product_key,
         "redirect_uri": redirect_uri,
+        "product_redirect_url": product_redirect_url,
+        "return_to": product_redirect_url,
     }
 
 @api_router.post("/public/auth/callback", tags=["Public API - Identity"])
@@ -8932,6 +8966,7 @@ async def auth0_callback(
     if not data.code:
         raise HTTPException(status_code=400, detail="Authorization code is required")
     product_key, redirect_uri = resolve_auth0_redirect_uri(data.product, data.redirect_uri)
+    product_redirect_url = resolve_product_auth_return_url(product_key)
 
     # Exchange code for tokens
     token_url = f"https://{AUTH0_DOMAIN}/oauth/token"
@@ -9137,6 +9172,8 @@ async def auth0_callback(
         "user": user_info,
         "product": product_key,
         "redirect_uri": redirect_uri,
+        "product_redirect_url": product_redirect_url,
+        "return_to": product_redirect_url,
         "organization": {
             "id": org.id if org else None,
             "name": org.name if org else None,
@@ -9277,6 +9314,7 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
     if not data.email or "@" not in data.email:
         raise HTTPException(status_code=400, detail="Invalid email format")
     product_key, redirect_uri = resolve_zitadel_redirect_uri(data.product, data.redirect_uri)
+    product_redirect_url = resolve_product_auth_return_url(product_key)
 
     email = data.email.lower().strip()
     email_domain = "@" + email.split("@")[1]
@@ -9369,7 +9407,7 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
     if data.state:
         zitadel_params["state"] = data.state
     else:
-        zitadel_params["state"] = encode_product_oauth_state(product_key)
+        zitadel_params["state"] = encode_product_oauth_state(product_key, product_redirect_url)
 
     authorize_url = f"{zitadel_mgmt.base_url}/oauth/v2/authorize?{urlencode(zitadel_params)}"
 
@@ -9387,6 +9425,8 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
         "domain": email_domain,
         "product": product_key,
         "redirect_uri": redirect_uri,
+        "product_redirect_url": product_redirect_url,
+        "return_to": product_redirect_url,
     }
 
 def extract_zitadel_roles(decoded_token: dict) -> list[str]:
@@ -9417,8 +9457,12 @@ def extract_zitadel_resource_owner(zitadel_user: dict) -> Optional[str]:
         or zitadel_user.get("organizationId")
     )
 
-def encode_product_oauth_state(product: str) -> str:
-    payload = json.dumps({"product": product}, separators=(",", ":")).encode("utf-8")
+def encode_product_oauth_state(product: str, return_to: Optional[str] = None) -> str:
+    state = {"product": product}
+    if return_to:
+        state["returnTo"] = return_to
+        state["return_to"] = return_to
+    payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 def token_hash(token: Optional[str]) -> Optional[str]:
@@ -9703,6 +9747,7 @@ async def zitadel_callback(
     if not ZITADEL_CLIENT_ID or not ZITADEL_CLIENT_SECRET or not zitadel_mgmt.base_url:
         raise HTTPException(status_code=500, detail="Zitadel login is not configured")
     product_key, redirect_uri = resolve_zitadel_redirect_uri(data.product, data.redirect_uri)
+    product_redirect_url = resolve_product_auth_return_url(product_key)
 
     token_payload = {
         "grant_type": "authorization_code",
@@ -9961,6 +10006,8 @@ async def zitadel_callback(
         "user": user_info,
         "product": product_key,
         "redirect_uri": redirect_uri,
+        "product_redirect_url": product_redirect_url,
+        "return_to": product_redirect_url,
         "organization": {
             "id": org.id if org else None,
             "name": org.name if org else None,
