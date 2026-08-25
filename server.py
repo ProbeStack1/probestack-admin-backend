@@ -9588,7 +9588,7 @@ def set_product_auth_cookies(response: Response, token: Optional[str], expires_i
             path="/",
             domain=".probestack.io",
             secure=True,
-            httponly=False,
+            httponly=True,
             samesite="lax",
         )
 
@@ -9599,14 +9599,14 @@ def clear_product_auth_cookies(response: Response) -> None:
             path="/",
             domain=".probestack.io",
             secure=True,
-            httponly=False,
+            httponly=True,
             samesite="lax",
         )
         response.delete_cookie(
             key=cookie_name,
             path="/",
             secure=True,
-            httponly=False,
+            httponly=True,
             samesite="lax",
         )
 
