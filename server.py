@@ -7234,6 +7234,75 @@ async def remove_user_from_my_organization(user_id: str, payload: dict = Depends
     
     return {"message": f"User {user.name} removed from organization"}
 
+class UserRoleUpdate(BaseModel):
+    """Schema for updating a user's product role."""
+    role_id: str
+
+async def update_user_role_assignment(
+    db: AsyncSession,
+    user_id: str,
+    role_id: str,
+    payload: dict,
+) -> dict:
+    result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    requester_role = payload.get("role")
+    requester_org_id = payload.get("organization_id")
+    if requester_role == "org_admin":
+        if not requester_org_id:
+            raise HTTPException(status_code=403, detail="Organization admin is not linked to an organization")
+        if user.organization_id != requester_org_id:
+            raise HTTPException(status_code=403, detail="Organization admins can only update users in their organization")
+    elif requester_role != "super_admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    await ensure_standard_roles_for_organization(db, user.organization_id)
+    role_result = await db.execute(
+        select(RoleModel).where(
+            RoleModel.id == role_id,
+            RoleModel.organization_id.is_(None),
+        )
+    )
+    role = role_result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=404, detail="Standard role not found")
+
+    previous_role_name = await get_role_name(db, user.role_id)
+    user.role_id = role.id
+    await db.flush()
+
+    metadata_sync = None
+    if user.zitadel_user_id:
+        org = await get_user_organization(db, user)
+        user_metadata = await build_probestack_user_metadata(db, user, user.email, org, role.name)
+        metadata_sync = await zitadel_mgmt.set_user_metadata(user.zitadel_user_id, user_metadata)
+
+    await db.commit()
+    await db.refresh(user)
+
+    return {
+        "message": "User role updated successfully",
+        "user": await user_to_dict(db, user),
+        "previous_role_name": previous_role_name,
+        "role": model_to_dict(role, ["permissions"]),
+        "metadata_sync": metadata_sync,
+    }
+
+@api_router.put("/my-organization/users/{user_id}/role", tags=["Org Admin"])
+async def update_my_organization_user_role(
+    user_id: str,
+    data: UserRoleUpdate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a user role within the current org admin's organization."""
+    if payload.get("role") == "super_admin":
+        raise HTTPException(status_code=400, detail="Super admins should use /users/{id}/role")
+    return await update_user_role_assignment(db, user_id, data.role_id, payload)
+
 @api_router.post("/my-organization/user-requests/{request_id}/approve", tags=["Org Admin"])
 async def approve_user_request_org_admin(
     request_id: str,
@@ -11276,6 +11345,17 @@ async def update_user_full(user_id: str, data: UserFullUpdate, payload: dict = D
     await db.commit()
     
     return {"message": "User updated successfully", "user": model_to_dict(user)}
+
+
+@api_router.put("/users/{user_id}/role")
+async def update_user_role(
+    user_id: str,
+    data: UserRoleUpdate,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a user's product role. Super admins can update any user; org admins can update users in their organization."""
+    return await update_user_role_assignment(db, user_id, data.role_id, payload)
 
 
 @api_router.put("/users/{user_id}/subscription")
