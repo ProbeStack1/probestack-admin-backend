@@ -9162,7 +9162,6 @@ async def auth0_callback(
     await db.commit()
 
     product_token = id_token or tokens.get("access_token")
-    set_product_auth_cookies(fastapi_response, product_token, expires_in)
 
     return {
         "success": True,
@@ -9637,7 +9636,86 @@ def infer_identity_provider_from_token(token: Optional[str], requested_provider:
     issuer = (decoded.get("iss") or "").strip()
     if not issuer:
         return None
+    if normalized_issuer_url(issuer) == normalized_issuer_url(PROBESTACK_TOKEN_ISSUER):
+        return None
     return infer_identity_provider_from_issuer(issuer)
+
+def is_probestack_context_token_claims(decoded: dict) -> bool:
+    if not decoded:
+        return False
+    return (
+        decoded.get("token_type") == "probestack_user_context"
+        or normalized_issuer_url(decoded.get("iss") or "") == normalized_issuer_url(PROBESTACK_TOKEN_ISSUER)
+    )
+
+def verify_context_token_claims(token: Optional[str]) -> dict:
+    if not token:
+        return {}
+    unverified = decode_unverified_jwt_claims(token)
+    if not is_probestack_context_token_claims(unverified):
+        return {}
+    try:
+        return jwt.decode(
+            token,
+            get_context_token_public_key(),
+            algorithms=[PROBESTACK_CONTEXT_TOKEN_ALGORITHM],
+            issuer=PROBESTACK_TOKEN_ISSUER,
+            options={"verify_aud": False},
+        )
+    except Exception:
+        return {}
+
+async def get_latest_logout_record_for_context(
+    db: AsyncSession,
+    provider: str,
+    context_claims: dict,
+):
+    model = ZitadelLoginRecordModel if provider == "zitadel" else Auth0LoginRecordModel
+    email = (context_claims.get("email") or context_claims.get("userEmail") or "").strip().lower()
+    organization_id = context_claims.get("organization_id") or context_claims.get("userOrgId")
+    if not email:
+        return None
+
+    query = select(model).where(func.lower(model.email) == email)
+    if organization_id:
+        query = query.where(model.organization_id == organization_id)
+    result = await db.execute(query.order_by(model.login_at.desc()).limit(1))
+    record = result.scalar_one_or_none()
+    if record:
+        return record
+
+    result = await db.execute(
+        select(model)
+        .where(func.lower(model.email) == email)
+        .order_by(model.login_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+async def get_logout_login_record_from_context(
+    db: AsyncSession,
+    provider: Optional[str],
+    context_claims: dict,
+) -> tuple[Optional[str], Any]:
+    providers = [provider] if provider in SUPPORTED_IDENTITY_PROVIDERS else ["zitadel", "auth0"]
+    best_provider = None
+    best_record = None
+    best_login_at = 0.0
+
+    for candidate_provider in providers:
+        record = await get_latest_logout_record_for_context(db, candidate_provider, context_claims)
+        if not record:
+            continue
+        try:
+            login_at = record.login_at.timestamp() if record.login_at else 0.0
+        except Exception:
+            login_at = 0.0
+        if not best_record or login_at >= best_login_at:
+            best_provider = candidate_provider
+            best_record = record
+            best_login_at = login_at
+
+    return best_provider, best_record
 
 def infer_logout_product(
     provider: str,
@@ -9993,7 +10071,6 @@ async def zitadel_callback(
 
     product_token = id_token or tokens.get("access_token")
     admin_token = admin_login["token"] if admin_login else None
-    set_product_auth_cookies(fastapi_response, product_token, expires_in)
 
     return {
         "success": True,
@@ -10142,6 +10219,36 @@ async def validate_identity_provider_session(
     if not token:
         return {"success": True, "active": False, "reason": "missing_token"}
 
+    context_claims = verify_context_token_claims(token)
+    if context_claims:
+        requested_provider = normalize_identity_provider(data.identity_provider) if data.identity_provider else None
+        provider, login_record = await get_logout_login_record_from_context(db, requested_provider, context_claims)
+        provider = provider or requested_provider or await get_active_identity_provider(db)
+        revocation = await get_identity_session_revocation(db, provider, context_claims, token)
+        if revocation:
+            return {
+                "success": True,
+                "active": False,
+                "reason": "revoked",
+                "identity_provider": provider,
+                "token_type": "probestack_user_context",
+                "revoked_at": revocation.revoked_at.isoformat() if revocation.revoked_at else None,
+                "revocation_id": revocation.id,
+            }
+
+        return {
+            "success": True,
+            "active": True,
+            "identity_provider": provider,
+            "token_type": "probestack_user_context",
+            "issuer": context_claims.get("iss"),
+            "subject": context_claims.get("sub"),
+            "session_id": context_claims.get("jti"),
+            "email": context_claims.get("email"),
+            "expires_at": context_claims.get("exp"),
+            "login_record_id": login_record.id if login_record else None,
+        }
+
     decoded, provider = verify_provider_id_token(token, data.identity_provider)
     revocation = await get_identity_session_revocation(db, provider, decoded, token)
     if revocation:
@@ -10211,8 +10318,15 @@ async def logout_identity_provider_session(
     clear_product_auth_cookies(fastapi_response)
 
     token = data.id_token or data.token or request.cookies.get("ps_auth_token")
+    context_claims = verify_context_token_claims(token)
     provider = infer_identity_provider_from_token(token, data.identity_provider)
     login_record = None
+
+    if context_claims:
+        context_provider, context_record = await get_logout_login_record_from_context(db, provider, context_claims)
+        if context_record:
+            provider = context_provider
+            login_record = context_record
 
     if not provider and data.login_record_id:
         for candidate_provider in ("zitadel", "auth0"):
@@ -10230,12 +10344,12 @@ async def logout_identity_provider_session(
 
     id_token_hint = data.id_token
     token_claims = decode_unverified_jwt_claims(token)
-    if not id_token_hint and token_claims.get("iss"):
+    if not id_token_hint and token_claims.get("iss") and not is_probestack_context_token_claims(token_claims):
         id_token_hint = token
     if not id_token_hint and login_record:
         id_token_hint = login_record.id_token
 
-    logout_hint = data.logout_hint or (login_record.email if login_record else None)
+    logout_hint = data.logout_hint or (login_record.email if login_record else None) or context_claims.get("email")
     product = infer_logout_product(provider, data.product, data.post_logout_redirect_uri)
 
     refresh_token = data.refresh_token
@@ -10250,13 +10364,21 @@ async def logout_identity_provider_session(
     session_revocation = await record_identity_session_revocation(
         db,
         provider,
-        id_token_hint or token,
+        id_token_hint or (None if context_claims else token),
         login_record,
     )
+    context_session_revocation = None
+    if context_claims and token:
+        context_session_revocation = await record_identity_session_revocation(
+            db,
+            provider,
+            token,
+            login_record,
+        )
 
     if login_record:
         clear_login_record_tokens(login_record)
-    if login_record or session_revocation:
+    if login_record or session_revocation or context_session_revocation:
         await db.commit()
 
     if provider == "zitadel":
@@ -10293,10 +10415,11 @@ async def logout_identity_provider_session(
         "cleared_cookies": True,
         "revocation": provider_revocation,
         "session_revocation": {
-            "id": session_revocation.id if session_revocation else None,
-            "subject": session_revocation.subject if session_revocation else None,
-            "revoked_at": session_revocation.revoked_at.isoformat() if session_revocation else None,
-        } if session_revocation else None,
+            "id": (session_revocation or context_session_revocation).id,
+            "subject": (session_revocation or context_session_revocation).subject,
+            "revoked_at": (session_revocation or context_session_revocation).revoked_at.isoformat()
+            if (session_revocation or context_session_revocation).revoked_at else None,
+        } if (session_revocation or context_session_revocation) else None,
         "product": product_key,
         "post_logout_redirect_uri": post_logout_uri,
         "login_record_id": login_record.id if login_record else None,
@@ -10320,8 +10443,15 @@ async def logout_identity_provider_session_redirect(
     and then be redirected through the upstream provider logout endpoint.
     """
     token = request.cookies.get("ps_auth_token")
+    context_claims = verify_context_token_claims(token)
     provider = infer_identity_provider_from_token(token, identity_provider)
     login_record = None
+
+    if context_claims:
+        context_provider, context_record = await get_logout_login_record_from_context(db, provider, context_claims)
+        if context_record:
+            provider = context_provider
+            login_record = context_record
 
     if not provider and login_record_id:
         for candidate_provider in ("zitadel", "auth0"):
@@ -10338,11 +10468,11 @@ async def logout_identity_provider_session_redirect(
         login_record = await get_logout_login_record(db, provider, login_record_id, token)
 
     token_claims = decode_unverified_jwt_claims(token)
-    id_token_hint = token if token_claims.get("iss") else None
+    id_token_hint = token if token_claims.get("iss") and not is_probestack_context_token_claims(token_claims) else None
     if not id_token_hint and login_record:
         id_token_hint = login_record.id_token
 
-    selected_logout_hint = logout_hint or (login_record.email if login_record else None)
+    selected_logout_hint = logout_hint or (login_record.email if login_record else None) or context_claims.get("email")
     selected_product = infer_logout_product(provider, product, post_logout_redirect_uri)
 
     revoke_token = None
@@ -10354,13 +10484,21 @@ async def logout_identity_provider_session_redirect(
     session_revocation = await record_identity_session_revocation(
         db,
         provider,
-        id_token_hint or token,
+        id_token_hint or (None if context_claims else token),
         login_record,
     )
+    context_session_revocation = None
+    if context_claims and token:
+        context_session_revocation = await record_identity_session_revocation(
+            db,
+            provider,
+            token,
+            login_record,
+        )
 
     if login_record:
         clear_login_record_tokens(login_record)
-    if login_record or session_revocation:
+    if login_record or session_revocation or context_session_revocation:
         await db.commit()
 
     if provider == "zitadel":
@@ -12957,7 +13095,11 @@ async def get_user_context_token_jwks():
     return build_context_token_jwks()
 
 @api_router.post("/public/users/context-token", tags=["Public API"])
-async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSession = Depends(get_db)):
+async def issue_user_context_token(
+    data: UserContextTokenRequest,
+    fastapi_response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Issue a signed ProbeStack context token after probestack.io login.
 
@@ -12993,6 +13135,8 @@ async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSessi
         zitadel_user_id=zitadel_user_id,
     )
     token, expires_at = create_user_context_token(user_context)
+    cookie_max_age = max(1, expires_at - int(datetime.now(timezone.utc).timestamp()))
+    set_product_auth_cookies(fastapi_response, token, cookie_max_age)
     await db.commit()
 
     return {
@@ -13006,6 +13150,7 @@ async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSessi
         "jwks_uri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
         "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+        "cookie_set": True,
         "user": user_context,
     }
 
