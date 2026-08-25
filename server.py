@@ -173,6 +173,11 @@ AsyncSessionLocal = async_sessionmaker(
 # JWT Config
 JWT_SECRET = os.environ.get('JWT_SECRET', 'admin-dashboard-secret-key-2024')
 JWT_ALGORITHM = "HS256"
+ADMIN_BACKEND_PUBLIC_URL = (
+    os.environ.get("ADMIN_BACKEND_PUBLIC_URL")
+    or os.environ.get("PROBESTACK_ADMIN_BACKEND_HOST")
+    or "https://probestack.io/admin-backend"
+).rstrip("/")
 PROBESTACK_TOKEN_ISSUER = os.environ.get("PROBESTACK_TOKEN_ISSUER", "https://auth.probestack.io")
 _PROBESTACK_TOKEN_AUDIENCE_RAW = os.environ.get("PROBESTACK_TOKEN_AUDIENCE", '["probestack-api", "probestack-ui"]')
 try:
@@ -187,7 +192,7 @@ PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY = os.environ.get("PROBESTACK_CONTEXT_TOKEN_
 PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY_PASSPHRASE = os.environ.get("PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY_PASSPHRASE")
 PROBESTACK_CONTEXT_TOKEN_JWKS_URI = os.environ.get(
     "PROBESTACK_CONTEXT_TOKEN_JWKS_URI",
-    "https://probestack.io/admin-backend/api/public/users/context-token/jwks",
+    f"{ADMIN_BACKEND_PUBLIC_URL}/api/public/users/context-token/jwks",
 )
 _context_token_private_key = None
 
@@ -12999,6 +13004,7 @@ async def issue_user_context_token(data: UserContextTokenRequest, db: AsyncSessi
         "issuer": PROBESTACK_TOKEN_ISSUER,
         "audience": PROBESTACK_TOKEN_AUDIENCE,
         "jwks_uri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
+        "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
         "user": user_context,
     }
