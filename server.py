@@ -2441,7 +2441,7 @@ async def sync_user_role_from_mongodb(
     user: Optional[UserModel],
     org: Optional[OrganizationModel] = None,
 ) -> Optional[dict]:
-    """Refresh a local user's role from the onboarding MongoDB developer record."""
+    """Look up the onboarding MongoDB developer role without mutating local RBAC."""
     if not user or not user.email:
         return None
 
@@ -2451,17 +2451,14 @@ async def sync_user_role_from_mongodb(
         return None
 
     role = await get_standard_role(db, org.id if org else (user.organization_id or "unknown"), lookup["standard_role"])
-    changed = user.role_id != role.id
-    if changed:
-        user.role_id = role.id
-        await db.commit()
-        await db.refresh(user)
+    would_change = user.role_id != role.id
 
     return {
         **lookup,
         "role_id": role.id,
         "role_name": role.name,
-        "changed": changed,
+        "changed": False,
+        "would_change": would_change,
     }
 
 async def ensure_standard_roles_for_organization(db: AsyncSession, organization_id: Optional[str] = None) -> List[RoleModel]:
@@ -9131,12 +9128,14 @@ async def auth0_callback(
         if existing_user:
             # Update existing user
             existing_user.name = user_info.get("name") or existing_user.name
-            if primary_role:
-                existing_user.role_id = primary_role["id"]
             if auth0_user_id and not existing_user.auth0_user_id:
                 existing_user.auth0_user_id = auth0_user_id
             existing_user.last_login = datetime.now(timezone.utc)
             synced_user = existing_user
+            primary_role = {
+                "id": existing_user.role_id,
+                "name": await get_role_name(db, existing_user.role_id, "API/Agent Consumer"),
+            }
         else:
             # Create new user with a standard role.
             if not primary_role:
@@ -9997,12 +9996,14 @@ async def zitadel_callback(
         primary_role = synced_roles[0] if synced_roles else None
         if existing_user:
             existing_user.name = user_info.get("name") or existing_user.name
-            if primary_role:
-                existing_user.role_id = primary_role["id"]
             if zitadel_user_id and not existing_user.zitadel_user_id:
                 existing_user.zitadel_user_id = zitadel_user_id
             existing_user.last_login = datetime.now(timezone.utc)
             synced_user = existing_user
+            primary_role = {
+                "id": existing_user.role_id,
+                "name": await get_role_name(db, existing_user.role_id, "API/Agent Consumer"),
+            }
         else:
             if not primary_role:
                 default_role = await get_standard_role(db, org.id)
