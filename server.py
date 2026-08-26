@@ -10374,9 +10374,9 @@ async def active_identity_provider_logout_url(
 
 @api_router.post("/public/auth/logout", tags=["Public API - Identity"])
 async def logout_identity_provider_session(
-    data: IdentityLogoutRequest,
     request: Request,
     fastapi_response: Response,
+    data: Optional[IdentityLogoutRequest] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -10385,11 +10385,25 @@ async def logout_identity_provider_session(
     The caller must redirect the browser to logout_url so Auth0/Zitadel can
     clear its own SSO cookie. JWT access/id tokens remain valid until exp.
     """
+    data = data or IdentityLogoutRequest()
     clear_product_auth_cookies(fastapi_response)
 
-    token = data.id_token or data.token or request.cookies.get("ps_auth_token")
-    context_claims = verify_context_token_claims(token)
-    provider = infer_identity_provider_from_token(token, data.identity_provider)
+    cookie_context_token = request.cookies.get("ps_auth_token")
+    context_token = cookie_context_token
+    context_claims = verify_context_token_claims(context_token)
+    if not context_claims:
+        for candidate_token in (data.token, data.id_token):
+            candidate_claims = verify_context_token_claims(candidate_token)
+            if candidate_claims:
+                context_token = candidate_token
+                context_claims = candidate_claims
+                break
+
+    provider_token = data.id_token
+    if not provider_token and (not context_claims or data.token != context_token):
+        provider_token = data.token
+    token = provider_token or context_token
+    provider = infer_identity_provider_from_token(provider_token, data.identity_provider)
     login_record = None
 
     if context_claims:
@@ -10410,12 +10424,12 @@ async def logout_identity_provider_session(
         provider = await get_active_identity_provider(db)
 
     if not login_record:
-        login_record = await get_logout_login_record(db, provider, data.login_record_id, token)
+        login_record = await get_logout_login_record(db, provider, data.login_record_id, provider_token or context_token)
 
     id_token_hint = data.id_token
-    token_claims = decode_unverified_jwt_claims(token)
+    token_claims = decode_unverified_jwt_claims(provider_token)
     if not id_token_hint and token_claims.get("iss") and not is_probestack_context_token_claims(token_claims):
-        id_token_hint = token
+        id_token_hint = provider_token
     if not id_token_hint and login_record:
         id_token_hint = login_record.id_token
 
@@ -10438,11 +10452,11 @@ async def logout_identity_provider_session(
         login_record,
     )
     context_session_revocation = None
-    if context_claims and token:
+    if context_claims and context_token:
         context_session_revocation = await record_identity_session_revocation(
             db,
             provider,
-            token,
+            context_token,
             login_record,
         )
 
