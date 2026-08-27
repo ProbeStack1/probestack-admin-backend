@@ -207,15 +207,21 @@ SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or SMTP_USERNAME
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "ProbeStack")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ["1", "true", "yes"]
 DEFAULT_ADMIN_NOTIFICATION_EMAILS = "admin@forgecrux.com,admin@probestack.io,saili.jaguste@probestack.io"
-ORG_REQUEST_NOTIFICATION_EMAILS = (
-    os.environ.get("ORG_REQUEST_NOTIFICATION_EMAILS")
-    or os.environ.get("ORG_REQUEST_NOTIFICATION_EMAIL")
-    or DEFAULT_ADMIN_NOTIFICATION_EMAILS
+ORG_REQUEST_NOTIFICATION_EMAILS = ",".join(
+    value for value in [
+        DEFAULT_ADMIN_NOTIFICATION_EMAILS,
+        os.environ.get("ORG_REQUEST_NOTIFICATION_EMAILS"),
+        os.environ.get("ORG_REQUEST_NOTIFICATION_EMAIL"),
+    ]
+    if value
 )
-ORG_APPROVAL_CC_EMAILS = (
-    os.environ.get("ORG_APPROVAL_CC_EMAILS")
-    or os.environ.get("ORG_APPROVAL_CC_EMAIL")
-    or ORG_REQUEST_NOTIFICATION_EMAILS
+ORG_APPROVAL_CC_EMAILS = ",".join(
+    value for value in [
+        ORG_REQUEST_NOTIFICATION_EMAILS,
+        os.environ.get("ORG_APPROVAL_CC_EMAILS"),
+        os.environ.get("ORG_APPROVAL_CC_EMAIL"),
+    ]
+    if value
 )
 ZITADEL_PASSWORD_RESET_URL_TEMPLATE = os.environ.get(
     "ZITADEL_PASSWORD_RESET_URL_TEMPLATE",
