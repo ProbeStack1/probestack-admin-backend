@@ -1192,6 +1192,16 @@ class RoleModel(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+class UserRoleAssignmentModel(Base):
+    __tablename__ = "user_role_assignments"
+    __table_args__ = (
+        UniqueConstraint("user_id", "role_id", name="uq_user_role_assignments_user_role"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    role_id: Mapped[str] = mapped_column(String(36), ForeignKey("roles.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 class BillingModel(Base):
     __tablename__ = "billing"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -2291,6 +2301,80 @@ async def get_role_name(db: AsyncSession, role_id: Optional[str], fallback: Opti
     result = await db.execute(select(RoleModel.name).where(RoleModel.id == role_id))
     return result.scalar_one_or_none() or fallback
 
+def normalize_role_ids(role_ids: Optional[List[str]]) -> List[str]:
+    seen = set()
+    normalized = []
+    for role_id in role_ids or []:
+        if not role_id or role_id in seen:
+            continue
+        seen.add(role_id)
+        normalized.append(role_id)
+    return normalized
+
+async def get_standard_roles_by_ids(db: AsyncSession, role_ids: List[str]) -> List[RoleModel]:
+    normalized_ids = normalize_role_ids(role_ids)
+    if not normalized_ids:
+        raise HTTPException(status_code=400, detail="At least one role is required")
+    result = await db.execute(
+        select(RoleModel).where(
+            RoleModel.id.in_(normalized_ids),
+            RoleModel.organization_id.is_(None),
+        )
+    )
+    role_by_id = {role.id: role for role in result.scalars().all()}
+    missing_ids = [role_id for role_id in normalized_ids if role_id not in role_by_id]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail="Standard role not found")
+    return [role_by_id[role_id] for role_id in normalized_ids]
+
+async def get_user_assigned_roles(db: AsyncSession, user: UserModel) -> List[RoleModel]:
+    result = await db.execute(
+        select(RoleModel)
+        .join(UserRoleAssignmentModel, UserRoleAssignmentModel.role_id == RoleModel.id)
+        .where(UserRoleAssignmentModel.user_id == user.id)
+        .where(RoleModel.organization_id.is_(None))
+        .order_by(RoleModel.name.asc())
+    )
+    assigned_roles = result.scalars().all()
+    roles_by_id = {role.id: role for role in assigned_roles}
+    ordered_roles = []
+    seen = set()
+
+    if user.role_id:
+        primary_role = roles_by_id.get(user.role_id)
+        if not primary_role:
+            primary_result = await db.execute(
+                select(RoleModel).where(
+                    RoleModel.id == user.role_id,
+                    RoleModel.organization_id.is_(None),
+                )
+            )
+            primary_role = primary_result.scalar_one_or_none()
+        if primary_role:
+            ordered_roles.append(primary_role)
+            seen.add(primary_role.id)
+
+    for role in assigned_roles:
+        if role.id not in seen:
+            ordered_roles.append(role)
+            seen.add(role.id)
+
+    return ordered_roles
+
+def roles_to_dict_list(roles: List[RoleModel]) -> List[dict]:
+    return [model_to_dict(role, ["permissions"]) for role in roles]
+
+async def replace_user_role_assignments(db: AsyncSession, user: UserModel, roles: List[RoleModel]) -> None:
+    if not roles:
+        raise HTTPException(status_code=400, detail="At least one role is required")
+    user.role_id = roles[0].id
+    await db.execute(
+        delete(UserRoleAssignmentModel).where(UserRoleAssignmentModel.user_id == user.id)
+    )
+    await db.flush()
+    for role in roles:
+        db.add(UserRoleAssignmentModel(user_id=user.id, role_id=role.id))
+
 async def get_plan_name(db: AsyncSession, plan_id: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
     if not plan_id:
         return fallback
@@ -3354,9 +3438,14 @@ async def admin_to_dict(db: AsyncSession, admin: AdminModel) -> dict:
 
 async def user_to_dict(db: AsyncSession, user: UserModel) -> dict:
     mongodb_role_lookup = await sync_user_role_from_mongodb(db, user)
+    roles = await get_user_assigned_roles(db, user)
     data = model_to_dict(user)
     data["organization_name"] = await get_organization_name(db, user.organization_id)
-    data["role_name"] = await get_role_name(db, user.role_id)
+    data["roles"] = roles_to_dict_list(roles)
+    data["role_ids"] = [role.id for role in roles]
+    data["role_names"] = [role.name for role in roles]
+    data["role_name"] = data["role_names"][0] if data["role_names"] else await get_role_name(db, user.role_id)
+    data["role_id"] = data["role_ids"][0] if data["role_ids"] else user.role_id
     if mongodb_role_lookup:
         data["mongodb_role_lookup"] = mongodb_role_lookup
     return data
@@ -5765,6 +5854,7 @@ async def create_invited_org_user(db: AsyncSession, org: OrganizationModel, emai
     )
     db.add(user)
     await db.flush()
+    await replace_user_role_assignments(db, user, [role])
 
     active_provider = await get_active_identity_provider(db)
     if active_provider == "auth0" and not org.auth0_org_id and org.status == "approved":
@@ -7579,12 +7669,13 @@ async def remove_user_from_my_organization(user_id: str, payload: dict = Depends
 
 class UserRoleUpdate(BaseModel):
     """Schema for updating a user's product role."""
-    role_id: str
+    role_id: Optional[str] = None
+    role_ids: Optional[List[str]] = None
 
 async def update_user_role_assignment(
     db: AsyncSession,
     user_id: str,
-    role_id: str,
+    role_ids: List[str],
     payload: dict,
 ) -> dict:
     result = await db.execute(select(UserModel).where(UserModel.id == user_id))
@@ -7603,34 +7694,29 @@ async def update_user_role_assignment(
         raise HTTPException(status_code=403, detail="Admin access required")
 
     await ensure_standard_roles_for_organization(db, user.organization_id)
-    role_result = await db.execute(
-        select(RoleModel).where(
-            RoleModel.id == role_id,
-            RoleModel.organization_id.is_(None),
-        )
-    )
-    role = role_result.scalar_one_or_none()
-    if not role:
-        raise HTTPException(status_code=404, detail="Standard role not found")
+    roles = await get_standard_roles_by_ids(db, role_ids)
 
-    previous_role_name = await get_role_name(db, user.role_id)
-    user.role_id = role.id
+    previous_roles = await get_user_assigned_roles(db, user)
+    previous_role_names = [role.name for role in previous_roles]
+    await replace_user_role_assignments(db, user, roles)
     await db.flush()
 
     metadata_sync = None
     if user.zitadel_user_id:
         org = await get_user_organization(db, user)
-        user_metadata = await build_probestack_user_metadata(db, user, user.email, org, role.name)
+        user_metadata = await build_probestack_user_metadata(db, user, user.email, org, roles[0].name)
         metadata_sync = await zitadel_mgmt.set_user_metadata(user.zitadel_user_id, user_metadata)
 
     await db.commit()
     await db.refresh(user)
 
     return {
-        "message": "User role updated successfully",
+        "message": "User roles updated successfully",
         "user": await user_to_dict(db, user),
-        "previous_role_name": previous_role_name,
-        "role": model_to_dict(role, ["permissions"]),
+        "previous_role_name": previous_role_names[0] if previous_role_names else None,
+        "previous_role_names": previous_role_names,
+        "role": model_to_dict(roles[0], ["permissions"]),
+        "roles": roles_to_dict_list(roles),
         "metadata_sync": metadata_sync,
     }
 
@@ -7644,7 +7730,8 @@ async def update_my_organization_user_role(
     """Update a user role within the current org admin's organization."""
     if payload.get("role") == "super_admin":
         raise HTTPException(status_code=400, detail="Super admins should use /users/{id}/role")
-    return await update_user_role_assignment(db, user_id, data.role_id, payload)
+    role_ids = data.role_ids if data.role_ids is not None else [data.role_id]
+    return await update_user_role_assignment(db, user_id, role_ids, payload)
 
 @api_router.post("/my-organization/user-requests/{request_id}/approve", tags=["Org Admin"])
 async def approve_user_request_org_admin(
@@ -7730,6 +7817,7 @@ async def approve_user_request_org_admin(
     )
     db.add(user)
     await db.flush()
+    await replace_user_role_assignments(db, user, [role])
     team_member = None
     if project:
         team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
@@ -11245,6 +11333,7 @@ async def approve_individual_user_request(
     )
     db.add(user)
     await db.flush()
+    await replace_user_role_assignments(db, user, [role])
     
     active_provider = await get_active_identity_provider(db)
     provider_user_result = await provision_user_for_active_provider(
@@ -11706,20 +11795,13 @@ async def update_user_full(user_id: str, data: UserFullUpdate, payload: dict = D
     if data.role_id is not None:
         await ensure_standard_roles_for_organization(db, user.organization_id)
         # Validate role exists in user's organization and belongs to the standard role catalog.
-        role_result = await db.execute(
-            select(RoleModel).where(
-                RoleModel.id == data.role_id,
-                RoleModel.organization_id.is_(None),
-            )
-        )
-        role = role_result.scalar_one_or_none()
-        if not role:
-            raise HTTPException(status_code=404, detail="Standard role not found")
-        user.role_id = role.id
+        roles = await get_standard_roles_by_ids(db, [data.role_id])
+        await replace_user_role_assignments(db, user, roles)
     
     await db.commit()
     
-    return {"message": "User updated successfully", "user": model_to_dict(user)}
+    await db.refresh(user)
+    return {"message": "User updated successfully", "user": await user_to_dict(db, user)}
 
 
 @api_router.put("/users/{user_id}/role")
@@ -11730,7 +11812,8 @@ async def update_user_role(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a user's product role. Super admins can update any user; org admins can update users in their organization."""
-    return await update_user_role_assignment(db, user_id, data.role_id, payload)
+    role_ids = data.role_ids if data.role_ids is not None else [data.role_id]
+    return await update_user_role_assignment(db, user_id, role_ids, payload)
 
 
 @api_router.put("/users/{user_id}/subscription")
@@ -12363,6 +12446,7 @@ async def create_user(data: UserCreate, payload: dict = Depends(require_super_ad
     )
     db.add(user)
     await db.flush()
+    await replace_user_role_assignments(db, user, [role])
 
     if await is_individual_users_org(db, org):
         plan = await get_default_individual_plan(db)
@@ -12558,11 +12642,13 @@ async def delete_role(role_id: str, payload: dict = Depends(require_super_admin)
     role = result.scalar_one_or_none()
     if not role:
         raise HTTPException(status_code=404, detail="Global role not found")
-    users_count = await db.scalar(
-        select(func.count()).select_from(UserModel).where(UserModel.role_id == role_id)
+    primary_user_result = await db.execute(select(UserModel.id).where(UserModel.role_id == role_id))
+    assigned_user_result = await db.execute(
+        select(UserRoleAssignmentModel.user_id).where(UserRoleAssignmentModel.role_id == role_id)
     )
-    if users_count:
-        raise HTTPException(status_code=409, detail=f"Role is assigned to {users_count} user(s)")
+    assigned_user_count = len(set(primary_user_result.scalars().all()) | set(assigned_user_result.scalars().all()))
+    if assigned_user_count:
+        raise HTTPException(status_code=409, detail=f"Role is assigned to {assigned_user_count} user(s)")
     await db.execute(delete(RoleModel).where(RoleModel.id == role_id))
     await db.commit()
     return {"message": "Role deleted successfully"}
@@ -14349,6 +14435,7 @@ async def approve_user_request(
     )
     db.add(user)
     await db.flush()
+    await replace_user_role_assignments(db, user, [role])
     team_member = None
     if project:
         team_member = await assign_user_to_project_team(db, user, project, project_role, payload.get("sub"))
