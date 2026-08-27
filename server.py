@@ -5986,12 +5986,24 @@ def send_new_organization_request_email(
     selected_tools: str
 ) -> dict:
     review_url = f"{APP_URL.rstrip('/')}/admin/pending-organizations"
-    subject = f"New organization request: {organization_name}"
+    subject = f"New ProbeStack organization request: {organization_name}"
     plan_text = plans or "No plan selected"
     tools_text = selected_tools or "No tools selected"
     notes_text = additional_notes or "None"
+    safe_review_url = escape(review_url, quote=True)
+    safe_organization_name = escape(organization_name)
+    safe_request_id = escape(request_id)
+    safe_organization_email = escape(organization_email)
+    safe_domain = escape(domain)
+    safe_contact_person = escape(contact_person)
+    safe_contact_phone = escape(contact_phone)
+    safe_company_address = escape(company_address)
+    safe_plan_text = escape(plan_text)
+    safe_tools_text = escape(tools_text)
+    safe_description = escape(description)
+    safe_notes_text = escape(notes_text)
     text_body = "\n".join([
-        "A new organization onboarding request was submitted.",
+        "A new organization request is waiting in the ProbeStack admin panel.",
         "",
         f"Organization: {organization_name}",
         f"Request ID: {request_id}",
@@ -6014,22 +6026,71 @@ def send_new_organization_request_email(
         "ProbeStack"
     ])
     html_body = f"""
-    <p>A new organization onboarding request was submitted.</p>
-    <ul>
-      <li><strong>Organization:</strong> {escape(organization_name)}</li>
-      <li><strong>Request ID:</strong> {escape(request_id)}</li>
-      <li><strong>Email:</strong> {escape(organization_email)}</li>
-      <li><strong>Domain:</strong> {escape(domain)}</li>
-      <li><strong>Contact:</strong> {escape(contact_person)}</li>
-      <li><strong>Phone:</strong> {escape(contact_phone)}</li>
-      <li><strong>Address:</strong> {escape(company_address)}</li>
-      <li><strong>Plans:</strong> {escape(plan_text)}</li>
-      <li><strong>Tools:</strong> {escape(tools_text)}</li>
-    </ul>
-    <p><strong>Description:</strong><br>{escape(description)}</p>
-    <p><strong>Additional notes:</strong><br>{escape(notes_text)}</p>
-    <p><a href="{escape(review_url, quote=True)}">Review pending organization requests</a></p>
-    <p>ProbeStack</p>
+    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
+      <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
+        <div style="background:#0f172a;padding:26px 30px;color:#ffffff;">
+          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#93c5fd;font-weight:700;">ProbeStack Admin</div>
+          <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">New organization request received</h1>
+          <p style="margin:10px 0 0;color:#cbd5e1;font-size:15px;">{safe_organization_name} is waiting for review in the admin panel.</p>
+        </div>
+
+        <div style="padding:28px 30px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-size:14px;">
+            <tr>
+              <td style="padding:10px 0;color:#64748b;width:155px;">Organization</td>
+              <td style="padding:10px 0;font-weight:700;color:#172033;">{safe_organization_name}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#64748b;">Request ID</td>
+              <td style="padding:10px 0;font-family:Consolas,Monaco,monospace;color:#172033;">{safe_request_id}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#64748b;">Contact</td>
+              <td style="padding:10px 0;color:#172033;">{safe_contact_person} &lt;{safe_organization_email}&gt;</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#64748b;">Phone</td>
+              <td style="padding:10px 0;color:#172033;">{safe_contact_phone}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#64748b;">Domain</td>
+              <td style="padding:10px 0;color:#172033;">{safe_domain}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#64748b;">Plans</td>
+              <td style="padding:10px 0;color:#172033;">{safe_plan_text}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#64748b;">Tools</td>
+              <td style="padding:10px 0;color:#172033;">{safe_tools_text}</td>
+            </tr>
+          </table>
+
+          <div style="margin-top:18px;padding:16px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;">
+            <div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;font-weight:700;">Company address</div>
+            <p style="margin:8px 0 0;font-size:14px;line-height:1.6;color:#172033;">{safe_company_address}</p>
+          </div>
+
+          <div style="margin-top:14px;padding:16px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;">
+            <div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;font-weight:700;">Description</div>
+            <p style="margin:8px 0 0;font-size:14px;line-height:1.6;color:#172033;">{safe_description}</p>
+          </div>
+
+          <div style="margin-top:14px;padding:16px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;">
+            <div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;font-weight:700;">Additional notes</div>
+            <p style="margin:8px 0 0;font-size:14px;line-height:1.6;color:#172033;">{safe_notes_text}</p>
+          </div>
+
+          <div style="margin-top:26px;">
+            <a href="{safe_review_url}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:8px;font-size:14px;">Review in admin panel</a>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid #e6ebf2;padding:18px 30px;color:#64748b;font-size:12px;background:#fbfdff;">
+          This notification was sent to the ProbeStack admin email group.
+        </div>
+      </div>
+    </div>
     """
     return send_email(ORG_REQUEST_NOTIFICATION_EMAILS, subject, text_body, html_body)
 
@@ -6039,22 +6100,48 @@ def send_organization_approval_email(
     organization_email: str,
     contact_person: str
 ) -> dict:
-    subject = f"Organization request approved: {organization_name}"
+    subject = f"Your ProbeStack organization request has been approved"
     greeting_name = contact_person or organization_name
+    safe_greeting_name = escape(greeting_name)
+    safe_organization_name = escape(organization_name)
     text_body = "\n".join([
         f"Hi {greeting_name},",
         "",
-        f"Your organization request for {organization_name} has been approved.",
+        f"Good news - your organization request for {organization_name} has been approved.",
         "",
-        "We would like to schedule a call for further discussion and next steps. Please reply all with a few suitable time slots, and our team will coordinate with you.",
+        "We would like to schedule a meeting to discuss your requirements, onboarding details, and next steps.",
+        "",
+        "Please reply all with a few suitable time slots, and our team will coordinate the meeting.",
         "",
         "ProbeStack"
     ])
     html_body = f"""
-    <p>Hi {escape(greeting_name)},</p>
-    <p>Your organization request for <strong>{escape(organization_name)}</strong> has been approved.</p>
-    <p>We would like to schedule a call for further discussion and next steps. Please reply all with a few suitable time slots, and our team will coordinate with you.</p>
-    <p>ProbeStack</p>
+    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
+      <div style="max-width:640px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
+        <div style="background:#064e3b;padding:28px 30px;color:#ffffff;">
+          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#a7f3d0;font-weight:700;">ProbeStack</div>
+          <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Your organization request is approved</h1>
+          <p style="margin:10px 0 0;color:#d1fae5;font-size:15px;">We are ready to move forward with {safe_organization_name}.</p>
+        </div>
+
+        <div style="padding:30px;">
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Hi {safe_greeting_name},</p>
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Good news - your organization request for <strong>{safe_organization_name}</strong> has been approved.</p>
+          <p style="margin:0 0 18px;font-size:16px;line-height:1.6;">We would like to schedule a meeting to discuss your requirements, onboarding details, and next steps.</p>
+
+          <div style="padding:16px 18px;border-radius:10px;background:#ecfdf5;border:1px solid #bbf7d0;margin:22px 0;">
+            <div style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#047857;font-weight:700;">Next step</div>
+            <p style="margin:8px 0 0;font-size:15px;line-height:1.6;color:#172033;">Please reply all with a few suitable time slots, and our team will coordinate the meeting.</p>
+          </div>
+
+          <p style="margin:22px 0 0;font-size:15px;line-height:1.6;color:#475569;">Thank you,<br><strong>ProbeStack Team</strong></p>
+        </div>
+
+        <div style="border-top:1px solid #e6ebf2;padding:18px 30px;color:#64748b;font-size:12px;background:#fbfdff;">
+          ProbeStack will coordinate the follow-up meeting with your team.
+        </div>
+      </div>
+    </div>
     """
     return send_email(
         organization_email,
