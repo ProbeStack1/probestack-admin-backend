@@ -5826,21 +5826,25 @@ def send_email(
     subject: str,
     text_body: str,
     html_body: Optional[str] = None,
-    cc_email: Optional[Any] = None
+    cc_email: Optional[Any] = None,
+    bcc_email: Optional[Any] = None
 ) -> dict:
     to_emails = normalize_email_recipients(to_email)
     cc_emails = normalize_email_recipients(cc_email)
+    bcc_emails = normalize_email_recipients(bcc_email)
     if not to_emails:
         logger.warning("Skipped email with no recipients. Subject: %s", subject)
         return {
             "sent": False,
             "reason": "No recipients",
             "to": [],
-            "cc": []
+            "cc": [],
+            "bcc": []
         }
 
     to_header = ", ".join(to_emails)
     cc_header = ", ".join(cc_emails)
+    bcc_header = ", ".join(bcc_emails)
 
     if SENDGRID_API_KEY and SENDGRID_FROM_EMAIL:
         payload = {
@@ -5859,6 +5863,8 @@ def send_email(
         }
         if cc_emails:
             payload["personalizations"][0]["cc"] = [{"email": email} for email in cc_emails]
+        if bcc_emails:
+            payload["personalizations"][0]["bcc"] = [{"email": email} for email in bcc_emails]
         if html_body:
             payload["content"].append({
                 "type": "text/html",
@@ -5876,12 +5882,13 @@ def send_email(
                 timeout=15,
             )
             if 200 <= response.status_code < 300:
-                logger.info("SendGrid email sent to %s. Cc: %s. Subject: %s", to_header, cc_header or "-", subject)
-                return {"sent": True, "provider": "sendgrid", "to": to_emails, "cc": cc_emails}
+                logger.info("SendGrid email sent to %s. Cc: %s. Bcc: %s. Subject: %s", to_header, cc_header or "-", bcc_header or "-", subject)
+                return {"sent": True, "provider": "sendgrid", "to": to_emails, "cc": cc_emails, "bcc": bcc_emails}
             logger.error(
-                "SendGrid email failed to %s. Cc: %s. Subject: %s. Status: %s. Response: %s",
+                "SendGrid email failed to %s. Cc: %s. Bcc: %s. Subject: %s. Status: %s. Response: %s",
                 to_header,
                 cc_header or "-",
+                bcc_header or "-",
                 subject,
                 response.status_code,
                 response.text[:500],
@@ -5892,15 +5899,17 @@ def send_email(
                 "reason": f"SendGrid returned {response.status_code}: {response.text[:500]}",
                 "to": to_emails,
                 "cc": cc_emails,
+                "bcc": bcc_emails,
             }
         except Exception as exc:
-            logger.error("SendGrid email error to %s. Cc: %s. Subject: %s. Error: %s", to_header, cc_header or "-", subject, exc)
+            logger.error("SendGrid email error to %s. Cc: %s. Bcc: %s. Subject: %s. Error: %s", to_header, cc_header or "-", bcc_header or "-", subject, exc)
             return {
                 "sent": False,
                 "provider": "sendgrid",
                 "reason": str(exc),
                 "to": to_emails,
                 "cc": cc_emails,
+                "bcc": bcc_emails,
             }
 
     if not SMTP_HOST or not SMTP_FROM_EMAIL:
@@ -5913,7 +5922,8 @@ def send_email(
             "sent": False,
             "reason": "SMTP not configured",
             "to": to_emails,
-            "cc": cc_emails
+            "cc": cc_emails,
+            "bcc": bcc_emails
         }
 
     message = EmailMessage()
@@ -5922,6 +5932,8 @@ def send_email(
     message["To"] = to_header
     if cc_header:
         message["Cc"] = cc_header
+    if bcc_header:
+        message["Bcc"] = bcc_header
     message.set_content(text_body)
     if html_body:
         message.add_alternative(html_body, subtype="html")
@@ -5933,15 +5945,16 @@ def send_email(
             if SMTP_USERNAME and SMTP_PASSWORD:
                 smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(message)
-        logger.info("Email sent to %s. Cc: %s. Subject: %s", to_header, cc_header or "-", subject)
-        return {"sent": True, "to": to_emails, "cc": cc_emails}
+        logger.info("Email sent to %s. Cc: %s. Bcc: %s. Subject: %s", to_header, cc_header or "-", bcc_header or "-", subject)
+        return {"sent": True, "to": to_emails, "cc": cc_emails, "bcc": bcc_emails}
     except Exception as exc:
-        logger.error("Failed to send email to %s. Cc: %s. Subject: %s. Error: %s", to_header, cc_header or "-", subject, exc)
+        logger.error("Failed to send email to %s. Cc: %s. Bcc: %s. Subject: %s. Error: %s", to_header, cc_header or "-", bcc_header or "-", subject, exc)
         return {
             "sent": False,
             "reason": str(exc),
             "to": to_emails,
-            "cc": cc_emails
+            "cc": cc_emails,
+            "bcc": bcc_emails
         }
 
 def send_project_invite_email(
@@ -6133,7 +6146,7 @@ def send_organization_approval_email(
         "",
         "We would like to schedule a meeting to discuss your requirements, onboarding details, and next steps.",
         "",
-        "Please reply all with a few suitable time slots, and our team will coordinate the meeting.",
+        "Please reply to this email with a few suitable time slots, and our team will coordinate the meeting.",
         "",
         "ProbeStack"
     ])
@@ -6153,7 +6166,7 @@ def send_organization_approval_email(
 
           <div style="padding:16px 18px;border-radius:10px;background:#ecfdf5;border:1px solid #bbf7d0;margin:22px 0;">
             <div style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#047857;font-weight:700;">Next step</div>
-            <p style="margin:8px 0 0;font-size:15px;line-height:1.6;color:#172033;">Please reply all with a few suitable time slots, and our team will coordinate the meeting.</p>
+            <p style="margin:8px 0 0;font-size:15px;line-height:1.6;color:#172033;">Please reply to this email with a few suitable time slots, and our team will coordinate the meeting.</p>
           </div>
 
           <p style="margin:22px 0 0;font-size:15px;line-height:1.6;color:#475569;">Thank you,<br><strong>ProbeStack Team</strong></p>
@@ -6170,7 +6183,7 @@ def send_organization_approval_email(
         subject,
         text_body,
         html_body,
-        cc_email=ORG_APPROVAL_CC_EMAILS
+        bcc_email=ORG_APPROVAL_CC_EMAILS
     )
 
 async def project_team_member_to_dict(db: AsyncSession, member: ProjectTeamMemberModel) -> dict:
@@ -11422,11 +11435,11 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
         )
         if not email_result.get("sent"):
             logger.warning(
-                "Organization approval email was not sent for %s: %s. To: %s. Cc: %s",
+                "Organization approval email was not sent for %s: %s. To: %s. Bcc: %s",
                 org.id,
                 email_result.get("reason", "unknown reason"),
                 email_result.get("to"),
-                email_result.get("cc")
+                email_result.get("bcc")
             )
     except Exception as exc:
         logger.error("Failed to build organization approval email for %s: %s", org.id, exc)
