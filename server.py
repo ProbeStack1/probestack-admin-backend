@@ -206,6 +206,10 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or SMTP_USERNAME
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "ProbeStack")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ["1", "true", "yes"]
+SENDGRID_API_URL = os.environ.get("SENDGRID_API_URL", "https://api.sendgrid.com/v3/mail/send")
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
+SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL") or SMTP_FROM_EMAIL or "info@probestack.io"
+SENDGRID_FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", SMTP_FROM_NAME)
 DEFAULT_ADMIN_NOTIFICATION_EMAILS = "admin@forgecrux.com,admin@probestack.io,saili.jaguste@probestack.io,saili.jaguste@gmail.com"
 ORG_REQUEST_NOTIFICATION_EMAILS = ",".join(
     value for value in [
@@ -5819,6 +5823,67 @@ def send_email(
 
     to_header = ", ".join(to_emails)
     cc_header = ", ".join(cc_emails)
+
+    if SENDGRID_API_KEY and SENDGRID_FROM_EMAIL:
+        payload = {
+            "personalizations": [{
+                "to": [{"email": email} for email in to_emails],
+            }],
+            "from": {
+                "email": SENDGRID_FROM_EMAIL,
+                "name": SENDGRID_FROM_NAME,
+            },
+            "subject": subject,
+            "content": [{
+                "type": "text/plain",
+                "value": text_body,
+            }],
+        }
+        if cc_emails:
+            payload["personalizations"][0]["cc"] = [{"email": email} for email in cc_emails]
+        if html_body:
+            payload["content"].append({
+                "type": "text/html",
+                "value": html_body,
+            })
+
+        try:
+            response = httpx.post(
+                SENDGRID_API_URL,
+                headers={
+                    "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=15,
+            )
+            if 200 <= response.status_code < 300:
+                logger.info("SendGrid email sent to %s. Cc: %s. Subject: %s", to_header, cc_header or "-", subject)
+                return {"sent": True, "provider": "sendgrid", "to": to_emails, "cc": cc_emails}
+            logger.error(
+                "SendGrid email failed to %s. Cc: %s. Subject: %s. Status: %s. Response: %s",
+                to_header,
+                cc_header or "-",
+                subject,
+                response.status_code,
+                response.text[:500],
+            )
+            return {
+                "sent": False,
+                "provider": "sendgrid",
+                "reason": f"SendGrid returned {response.status_code}: {response.text[:500]}",
+                "to": to_emails,
+                "cc": cc_emails,
+            }
+        except Exception as exc:
+            logger.error("SendGrid email error to %s. Cc: %s. Subject: %s. Error: %s", to_header, cc_header or "-", subject, exc)
+            return {
+                "sent": False,
+                "provider": "sendgrid",
+                "reason": str(exc),
+                "to": to_emails,
+                "cc": cc_emails,
+            }
 
     if not SMTP_HOST or not SMTP_FROM_EMAIL:
         logger.warning(
