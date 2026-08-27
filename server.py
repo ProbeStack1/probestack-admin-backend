@@ -7720,6 +7720,50 @@ async def update_user_role_assignment(
         "metadata_sync": metadata_sync,
     }
 
+async def add_user_role_assignment(
+    db: AsyncSession,
+    user_id: str,
+    role_id: str,
+    payload: dict,
+) -> dict:
+    result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    current_roles = await get_user_assigned_roles(db, user)
+    current_role_ids = [role.id for role in current_roles]
+    if role_id in current_role_ids:
+        raise HTTPException(status_code=409, detail="Role is already assigned to this user")
+
+    response = await update_user_role_assignment(db, user_id, current_role_ids + [role_id], payload)
+    response["message"] = "User role added successfully"
+    return response
+
+async def remove_user_role_assignment(
+    db: AsyncSession,
+    user_id: str,
+    role_id: str,
+    payload: dict,
+) -> dict:
+    result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    current_roles = await get_user_assigned_roles(db, user)
+    current_role_ids = [role.id for role in current_roles]
+    if role_id not in current_role_ids:
+        raise HTTPException(status_code=404, detail="Role is not assigned to this user")
+
+    next_role_ids = [current_role_id for current_role_id in current_role_ids if current_role_id != role_id]
+    if not next_role_ids:
+        raise HTTPException(status_code=400, detail="A user must have at least one role")
+
+    response = await update_user_role_assignment(db, user_id, next_role_ids, payload)
+    response["message"] = "User role removed successfully"
+    return response
+
 @api_router.put("/my-organization/users/{user_id}/role", tags=["Org Admin"])
 async def update_my_organization_user_role(
     user_id: str,
@@ -7732,6 +7776,30 @@ async def update_my_organization_user_role(
         raise HTTPException(status_code=400, detail="Super admins should use /users/{id}/role")
     role_ids = data.role_ids if data.role_ids is not None else [data.role_id]
     return await update_user_role_assignment(db, user_id, role_ids, payload)
+
+@api_router.post("/my-organization/users/{user_id}/roles/{role_id}", tags=["Org Admin"])
+async def add_my_organization_user_role(
+    user_id: str,
+    role_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Add one role to a user within the current org admin's organization."""
+    if payload.get("role") == "super_admin":
+        raise HTTPException(status_code=400, detail="Super admins should use /users/{id}/roles/{role_id}")
+    return await add_user_role_assignment(db, user_id, role_id, payload)
+
+@api_router.delete("/my-organization/users/{user_id}/roles/{role_id}", tags=["Org Admin"])
+async def delete_my_organization_user_role(
+    user_id: str,
+    role_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove one role from a user within the current org admin's organization."""
+    if payload.get("role") == "super_admin":
+        raise HTTPException(status_code=400, detail="Super admins should use /users/{id}/roles/{role_id}")
+    return await remove_user_role_assignment(db, user_id, role_id, payload)
 
 @api_router.post("/my-organization/user-requests/{request_id}/approve", tags=["Org Admin"])
 async def approve_user_request_org_admin(
@@ -11814,6 +11882,26 @@ async def update_user_role(
     """Update a user's product role. Super admins can update any user; org admins can update users in their organization."""
     role_ids = data.role_ids if data.role_ids is not None else [data.role_id]
     return await update_user_role_assignment(db, user_id, role_ids, payload)
+
+@api_router.post("/users/{user_id}/roles/{role_id}")
+async def add_user_role(
+    user_id: str,
+    role_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Add one product role to a user. Super admins can update any user; org admins can update users in their organization."""
+    return await add_user_role_assignment(db, user_id, role_id, payload)
+
+@api_router.delete("/users/{user_id}/roles/{role_id}")
+async def delete_user_role(
+    user_id: str,
+    role_id: str,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove one product role from a user. Super admins can update any user; org admins can update users in their organization."""
+    return await remove_user_role_assignment(db, user_id, role_id, payload)
 
 
 @api_router.put("/users/{user_id}/subscription")
