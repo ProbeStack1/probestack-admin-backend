@@ -3329,6 +3329,24 @@ async def get_organization_requested_plan_details(db: AsyncSession, org: Organiz
 
     return []
 
+async def format_selected_product_plan_lines(db: AsyncSession, plan_ids: List[str], plans: dict) -> str:
+    lines = []
+    for plan_id in plan_ids:
+        plan = plans.get(plan_id)
+        product = await get_plan_product(db, plan) if plan else None
+        product_label = (
+            product.name
+            if product and product.name
+            else product.key
+            if product and product.key
+            else getattr(plan, "tool", None)
+            or getattr(plan, "product_id", None)
+            or "Product"
+        )
+        plan_label = getattr(plan, "name", None) or plan_id
+        lines.append(f"{product_label}:{plan_label}")
+    return "\n".join(lines)
+
 async def admin_to_dict(db: AsyncSession, admin: AdminModel) -> dict:
     data = model_to_dict(admin)
     data["organization_name"] = await get_organization_name(db, admin.organization_id)
@@ -5988,7 +6006,7 @@ def send_new_organization_request_email(
     review_url = f"{APP_URL.rstrip('/')}/admin/pending-organizations"
     subject = f"New ProbeStack organization request: {organization_name}"
     plan_text = plans or "No plan selected"
-    tools_text = selected_tools or "No tools selected"
+    tools_text = selected_tools or ""
     notes_text = additional_notes or "None"
     safe_review_url = escape(review_url, quote=True)
     safe_organization_name = escape(organization_name)
@@ -5998,8 +6016,15 @@ def send_new_organization_request_email(
     safe_contact_person = escape(contact_person)
     safe_contact_phone = escape(contact_phone)
     safe_company_address = escape(company_address)
-    safe_plan_text = escape(plan_text)
+    safe_plan_html = "<br>".join(escape(line) for line in plan_text.splitlines() if line.strip()) or "No plan selected"
     safe_tools_text = escape(tools_text)
+    tools_text_line = f"Tools: {tools_text}" if tools_text else "Tools: None selected"
+    tools_row_html = f"""
+            <tr>
+              <td style="padding:10px 0;color:#64748b;">Tools</td>
+              <td style="padding:10px 0;color:#172033;">{safe_tools_text}</td>
+            </tr>
+    """ if tools_text else ""
     safe_description = escape(description)
     safe_notes_text = escape(notes_text)
     text_body = "\n".join([
@@ -6013,7 +6038,7 @@ def send_new_organization_request_email(
         f"Phone: {contact_phone}",
         f"Address: {company_address}",
         f"Plans: {plan_text}",
-        f"Tools: {tools_text}",
+        tools_text_line,
         "",
         "Description:",
         description,
@@ -6058,12 +6083,9 @@ def send_new_organization_request_email(
             </tr>
             <tr>
               <td style="padding:10px 0;color:#64748b;">Plans</td>
-              <td style="padding:10px 0;color:#172033;">{safe_plan_text}</td>
+              <td style="padding:10px 0;color:#172033;font-weight:700;line-height:1.6;">{safe_plan_html}</td>
             </tr>
-            <tr>
-              <td style="padding:10px 0;color:#64748b;">Tools</td>
-              <td style="padding:10px 0;color:#172033;">{safe_tools_text}</td>
-            </tr>
+            {tools_row_html}
           </table>
 
           <div style="margin-top:18px;padding:16px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;">
@@ -12908,10 +12930,11 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     tools_str = ', '.join(selected_tools[:3])
     if len(selected_tools) > 3:
         tools_str += f" +{len(selected_tools) - 3} more"
-    plans_str = ', '.join([plans[pid].name for pid in plan_ids])
+    plans_str = await format_selected_product_plan_lines(db, plan_ids, plans)
+    notification_plans_str = plans_str.replace("\n", ", ")
     notif = NotificationModel(
         title="New Organization Request",
-        message=f"{data.name} has requested organization onboarding" + (f" for {plans_str}" if plans_str else "") + (f" with tools: {tools_str}" if tools_str else ""),
+        message=f"{data.name} has requested organization onboarding" + (f" for {notification_plans_str}" if notification_plans_str else "") + (f" with tools: {tools_str}" if tools_str else ""),
         type="info",
         link=f"/pending-organizations"
     )
