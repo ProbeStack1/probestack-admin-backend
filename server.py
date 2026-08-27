@@ -206,7 +206,7 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or SMTP_USERNAME
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "ProbeStack")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ["1", "true", "yes"]
-DEFAULT_ADMIN_NOTIFICATION_EMAILS = "admin@forgecrux.com,admin@probestack.io,saili.jaguste@probestack.io"
+DEFAULT_ADMIN_NOTIFICATION_EMAILS = "admin@forgecrux.com,admin@probestack.io,saili.jaguste@probestack.io,saili.jaguste@gmail.com"
 ORG_REQUEST_NOTIFICATION_EMAILS = ",".join(
     value for value in [
         DEFAULT_ADMIN_NOTIFICATION_EMAILS,
@@ -5812,7 +5812,9 @@ def send_email(
         logger.warning("Skipped email with no recipients. Subject: %s", subject)
         return {
             "sent": False,
-            "reason": "No recipients"
+            "reason": "No recipients",
+            "to": [],
+            "cc": []
         }
 
     to_header = ", ".join(to_emails)
@@ -5826,7 +5828,9 @@ def send_email(
         )
         return {
             "sent": False,
-            "reason": "SMTP not configured"
+            "reason": "SMTP not configured",
+            "to": to_emails,
+            "cc": cc_emails
         }
 
     message = EmailMessage()
@@ -5847,12 +5851,14 @@ def send_email(
                 smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(message)
         logger.info("Email sent to %s. Cc: %s. Subject: %s", to_header, cc_header or "-", subject)
-        return {"sent": True}
+        return {"sent": True, "to": to_emails, "cc": cc_emails}
     except Exception as exc:
         logger.error("Failed to send email to %s. Cc: %s. Subject: %s. Error: %s", to_header, cc_header or "-", subject, exc)
         return {
             "sent": False,
-            "reason": str(exc)
+            "reason": str(exc),
+            "to": to_emails,
+            "cc": cc_emails
         }
 
 def send_project_invite_email(
@@ -11242,9 +11248,11 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
         )
         if not email_result.get("sent"):
             logger.warning(
-                "Organization approval email was not sent for %s: %s",
+                "Organization approval email was not sent for %s: %s. To: %s. Cc: %s",
                 org.id,
-                email_result.get("reason", "unknown reason")
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("cc")
             )
     except Exception as exc:
         logger.error("Failed to build organization approval email for %s: %s", org.id, exc)
@@ -12775,9 +12783,11 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
         )
         if not email_result.get("sent"):
             logger.warning(
-                "New organization request email was not sent for %s: %s",
+                "New organization request email was not sent for %s: %s. To: %s. Cc: %s",
                 org.id,
-                email_result.get("reason", "unknown reason")
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("cc")
             )
     except Exception as exc:
         logger.error("Failed to build new organization request email for %s: %s", org.id, exc)
