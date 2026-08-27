@@ -1893,7 +1893,7 @@ class UserCreate(BaseModel):
 
 class RoleCreate(BaseModel):
     name: str
-    organization_id: str
+    organization_id: Optional[str] = None
     permissions: List[str]
     description: Optional[str] = None
 
@@ -12495,15 +12495,77 @@ async def get_role(role_id: str, payload: dict = Depends(require_super_admin), d
 
 @api_router.post("/roles")
 async def create_role(data: RoleCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    raise HTTPException(status_code=400, detail="Roles are standardized and cannot be created per organization")
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Role name is required")
+    existing = await db.execute(
+        select(RoleModel).where(
+            RoleModel.organization_id.is_(None),
+            func.lower(RoleModel.name) == name.lower(),
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="A global role with this name already exists")
+    role = RoleModel(
+        name=name,
+        organization_id=None,
+        permissions=json.dumps(data.permissions or []),
+        description=data.description,
+    )
+    db.add(role)
+    await db.commit()
+    await db.refresh(role)
+    return model_to_dict(role, ["permissions"])
 
 @api_router.put("/roles/{role_id}")
 async def update_role(role_id: str, data: RoleCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    raise HTTPException(status_code=400, detail="Roles are standardized and cannot be edited per organization")
+    result = await db.execute(
+        select(RoleModel).where(
+            RoleModel.id == role_id,
+            RoleModel.organization_id.is_(None),
+        )
+    )
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=404, detail="Global role not found")
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Role name is required")
+    duplicate = await db.execute(
+        select(RoleModel).where(
+            RoleModel.id != role_id,
+            RoleModel.organization_id.is_(None),
+            func.lower(RoleModel.name) == name.lower(),
+        )
+    )
+    if duplicate.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="A global role with this name already exists")
+    role.name = name
+    role.permissions = json.dumps(data.permissions or [])
+    role.description = data.description
+    await db.commit()
+    await db.refresh(role)
+    return model_to_dict(role, ["permissions"])
 
 @api_router.delete("/roles/{role_id}")
 async def delete_role(role_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    raise HTTPException(status_code=400, detail="Roles are standardized and cannot be deleted per organization")
+    result = await db.execute(
+        select(RoleModel).where(
+            RoleModel.id == role_id,
+            RoleModel.organization_id.is_(None),
+        )
+    )
+    role = result.scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=404, detail="Global role not found")
+    users_count = await db.scalar(
+        select(func.count()).select_from(UserModel).where(UserModel.role_id == role_id)
+    )
+    if users_count:
+        raise HTTPException(status_code=409, detail=f"Role is assigned to {users_count} user(s)")
+    await db.execute(delete(RoleModel).where(RoleModel.id == role_id))
+    await db.commit()
+    return {"message": "Role deleted successfully"}
 
 # ==================== BILLING ROUTES (Super Admin Only) ====================
 
