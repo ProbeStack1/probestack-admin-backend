@@ -206,6 +206,17 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL") or SMTP_USERNAME
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "ProbeStack")
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ["1", "true", "yes"]
+DEFAULT_ADMIN_NOTIFICATION_EMAILS = "admin@forgecrux.com,admin@probestack.io,saili.jaguste@probestack.io"
+ORG_REQUEST_NOTIFICATION_EMAILS = (
+    os.environ.get("ORG_REQUEST_NOTIFICATION_EMAILS")
+    or os.environ.get("ORG_REQUEST_NOTIFICATION_EMAIL")
+    or DEFAULT_ADMIN_NOTIFICATION_EMAILS
+)
+ORG_APPROVAL_CC_EMAILS = (
+    os.environ.get("ORG_APPROVAL_CC_EMAILS")
+    or os.environ.get("ORG_APPROVAL_CC_EMAIL")
+    or ORG_REQUEST_NOTIFICATION_EMAILS
+)
 ZITADEL_PASSWORD_RESET_URL_TEMPLATE = os.environ.get(
     "ZITADEL_PASSWORD_RESET_URL_TEMPLATE",
     f"{APP_URL.rstrip('/')}/password-reset?userID={{.UserID}}&code={{.Code}}&orgID={{.OrgID}}",
@@ -5762,11 +5773,49 @@ def build_setup_account_url(email: str, token: Optional[str]) -> Optional[str]:
 def build_login_url() -> str:
     return f"{APP_URL.rstrip('/')}/admin/login"
 
-def send_email(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> dict:
+def normalize_email_recipients(recipients: Any) -> List[str]:
+    if not recipients:
+        return []
+    if isinstance(recipients, str):
+        raw_recipients = recipients.replace(";", ",").split(",")
+    else:
+        raw_recipients = []
+        for recipient in recipients:
+            if isinstance(recipient, str):
+                raw_recipients.extend(recipient.replace(";", ",").split(","))
+    normalized = []
+    seen = set()
+    for recipient in raw_recipients:
+        email = recipient.strip()
+        email_key = email.lower()
+        if email and email_key not in seen:
+            normalized.append(email)
+            seen.add(email_key)
+    return normalized
+
+def send_email(
+    to_email: Any,
+    subject: str,
+    text_body: str,
+    html_body: Optional[str] = None,
+    cc_email: Optional[Any] = None
+) -> dict:
+    to_emails = normalize_email_recipients(to_email)
+    cc_emails = normalize_email_recipients(cc_email)
+    if not to_emails:
+        logger.warning("Skipped email with no recipients. Subject: %s", subject)
+        return {
+            "sent": False,
+            "reason": "No recipients"
+        }
+
+    to_header = ", ".join(to_emails)
+    cc_header = ", ".join(cc_emails)
+
     if not SMTP_HOST or not SMTP_FROM_EMAIL:
         logger.warning(
             "SMTP not configured; skipped email to %s. Subject: %s",
-            to_email,
+            to_header,
             subject
         )
         return {
@@ -5777,7 +5826,9 @@ def send_email(to_email: str, subject: str, text_body: str, html_body: Optional[
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
-    message["To"] = to_email
+    message["To"] = to_header
+    if cc_header:
+        message["Cc"] = cc_header
     message.set_content(text_body)
     if html_body:
         message.add_alternative(html_body, subtype="html")
@@ -5789,10 +5840,10 @@ def send_email(to_email: str, subject: str, text_body: str, html_body: Optional[
             if SMTP_USERNAME and SMTP_PASSWORD:
                 smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(message)
-        logger.info("Project invite email sent to %s", to_email)
+        logger.info("Email sent to %s. Cc: %s. Subject: %s", to_header, cc_header or "-", subject)
         return {"sent": True}
     except Exception as exc:
-        logger.error("Failed to send project invite email to %s: %s", to_email, exc)
+        logger.error("Failed to send email to %s. Cc: %s. Subject: %s. Error: %s", to_header, cc_header or "-", subject, exc)
         return {
             "sent": False,
             "reason": str(exc)
@@ -5842,6 +5893,99 @@ def send_project_invite_email(
     if setup_url:
         result["setup_url"] = setup_url
     return result
+
+def send_new_organization_request_email(
+    *,
+    request_id: str,
+    organization_name: str,
+    organization_email: str,
+    domain: str,
+    contact_person: str,
+    contact_phone: str,
+    company_address: str,
+    description: str,
+    additional_notes: Optional[str],
+    plans: str,
+    selected_tools: str
+) -> dict:
+    review_url = f"{APP_URL.rstrip('/')}/admin/pending-organizations"
+    subject = f"New organization request: {organization_name}"
+    plan_text = plans or "No plan selected"
+    tools_text = selected_tools or "No tools selected"
+    notes_text = additional_notes or "None"
+    text_body = "\n".join([
+        "A new organization onboarding request was submitted.",
+        "",
+        f"Organization: {organization_name}",
+        f"Request ID: {request_id}",
+        f"Email: {organization_email}",
+        f"Domain: {domain}",
+        f"Contact: {contact_person}",
+        f"Phone: {contact_phone}",
+        f"Address: {company_address}",
+        f"Plans: {plan_text}",
+        f"Tools: {tools_text}",
+        "",
+        "Description:",
+        description,
+        "",
+        "Additional notes:",
+        notes_text,
+        "",
+        f"Review request: {review_url}",
+        "",
+        "ProbeStack"
+    ])
+    html_body = f"""
+    <p>A new organization onboarding request was submitted.</p>
+    <ul>
+      <li><strong>Organization:</strong> {escape(organization_name)}</li>
+      <li><strong>Request ID:</strong> {escape(request_id)}</li>
+      <li><strong>Email:</strong> {escape(organization_email)}</li>
+      <li><strong>Domain:</strong> {escape(domain)}</li>
+      <li><strong>Contact:</strong> {escape(contact_person)}</li>
+      <li><strong>Phone:</strong> {escape(contact_phone)}</li>
+      <li><strong>Address:</strong> {escape(company_address)}</li>
+      <li><strong>Plans:</strong> {escape(plan_text)}</li>
+      <li><strong>Tools:</strong> {escape(tools_text)}</li>
+    </ul>
+    <p><strong>Description:</strong><br>{escape(description)}</p>
+    <p><strong>Additional notes:</strong><br>{escape(notes_text)}</p>
+    <p><a href="{escape(review_url, quote=True)}">Review pending organization requests</a></p>
+    <p>ProbeStack</p>
+    """
+    return send_email(ORG_REQUEST_NOTIFICATION_EMAILS, subject, text_body, html_body)
+
+def send_organization_approval_email(
+    *,
+    organization_name: str,
+    organization_email: str,
+    contact_person: str
+) -> dict:
+    subject = f"Organization request approved: {organization_name}"
+    greeting_name = contact_person or organization_name
+    text_body = "\n".join([
+        f"Hi {greeting_name},",
+        "",
+        f"Your organization request for {organization_name} has been approved.",
+        "",
+        "We would like to schedule a call for further discussion and next steps. Please reply all with a few suitable time slots, and our team will coordinate with you.",
+        "",
+        "ProbeStack"
+    ])
+    html_body = f"""
+    <p>Hi {escape(greeting_name)},</p>
+    <p>Your organization request for <strong>{escape(organization_name)}</strong> has been approved.</p>
+    <p>We would like to schedule a call for further discussion and next steps. Please reply all with a few suitable time slots, and our team will coordinate with you.</p>
+    <p>ProbeStack</p>
+    """
+    return send_email(
+        organization_email,
+        subject,
+        text_body,
+        html_body,
+        cc_email=ORG_APPROVAL_CC_EMAILS
+    )
 
 async def project_team_member_to_dict(db: AsyncSession, member: ProjectTeamMemberModel) -> dict:
     data = model_to_dict(member)
@@ -11083,6 +11227,22 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     notif = NotificationModel(title="Organization Approved", message=f"{org.name} has been approved", type="success")
     db.add(notif)
     await db.commit()
+
+    try:
+        email_result = send_organization_approval_email(
+            organization_name=org.name,
+            organization_email=org.email,
+            contact_person=org.contact_person,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "Organization approval email was not sent for %s: %s",
+                org.id,
+                email_result.get("reason", "unknown reason")
+            )
+    except Exception as exc:
+        logger.error("Failed to build organization approval email for %s: %s", org.id, exc)
+
     return {
         "message": "Organization approved",
         "identity_provider": active_provider,
@@ -12592,6 +12752,29 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     db.add(notif)
     
     await db.commit()
+
+    try:
+        email_result = send_new_organization_request_email(
+            request_id=org.id,
+            organization_name=org.name,
+            organization_email=org.email,
+            domain=org.domain,
+            contact_person=org.contact_person,
+            contact_phone=org.phone,
+            company_address=org.address,
+            description=org.description,
+            additional_notes=data.additional_notes,
+            plans=plans_str,
+            selected_tools=tools_str,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "New organization request email was not sent for %s: %s",
+                org.id,
+                email_result.get("reason", "unknown reason")
+            )
+    except Exception as exc:
+        logger.error("Failed to build new organization request email for %s: %s", org.id, exc)
     
     # Build response with plan details
     plan_names = []
