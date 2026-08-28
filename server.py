@@ -6400,6 +6400,93 @@ def send_organization_approval_email(
         bcc_email=normalize_email_recipients(notification_emails) or normalize_email_recipients(ORG_APPROVAL_CC_EMAILS)
     )
 
+def send_request_decision_email(
+    *,
+    to_email: str,
+    recipient_name: str,
+    request_name: str,
+    status: str,
+    organization_name: Optional[str] = None,
+    reason: Optional[str] = None,
+    next_steps: Optional[str] = None,
+    action_url: Optional[str] = None,
+    notification_emails: Optional[List[str]] = None
+) -> dict:
+    normalized_status = (status or "").strip().lower()
+    is_approved = normalized_status == "approved"
+    status_label = "approved" if is_approved else "rejected"
+    subject = f"Your ProbeStack {request_name} has been {status_label}"
+    safe_recipient_name = escape(recipient_name or "there")
+    safe_request_name = escape(request_name)
+    safe_status_label = escape(status_label)
+    safe_organization_name = escape(organization_name or "ProbeStack")
+    safe_reason = escape(reason or "No reason was provided.")
+    safe_next_steps = escape(next_steps or ("We will follow up with next steps shortly." if is_approved else "You can reply to this email if you have questions or would like to discuss this decision."))
+    safe_action_url = escape(action_url or "", quote=True)
+    header_color = "#064e3b" if is_approved else "#7f1d1d"
+    accent_color = "#a7f3d0" if is_approved else "#fecaca"
+    panel_bg = "#ecfdf5" if is_approved else "#fef2f2"
+    panel_border = "#bbf7d0" if is_approved else "#fecaca"
+    panel_label = "Next step" if is_approved else "Reason"
+    panel_text = safe_next_steps if is_approved else safe_reason
+    status_sentence = (
+        f"Your {request_name} for {organization_name or 'ProbeStack'} has been approved."
+        if is_approved
+        else f"Your {request_name} for {organization_name or 'ProbeStack'} has been rejected."
+    )
+    action_line = f"Open ProbeStack: {action_url}" if action_url else ""
+    text_lines = [
+        f"Hi {recipient_name or 'there'},",
+        "",
+        status_sentence,
+        "",
+    ]
+    if is_approved:
+        text_lines.extend(["Next step:", next_steps or "We will follow up with next steps shortly."])
+    else:
+        text_lines.extend(["Reason:", reason or "No reason was provided."])
+        text_lines.extend(["", "You can reply to this email if you have questions or would like to discuss this decision."])
+    if action_line:
+        text_lines.extend(["", action_line])
+    text_lines.extend(["", "ProbeStack"])
+    action_html = f"""
+          <div style="margin-top:22px;">
+            <a href="{safe_action_url}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:8px;font-size:14px;">Open ProbeStack</a>
+          </div>
+    """ if action_url else ""
+    html_body = f"""
+    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
+      <div style="max-width:640px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
+        <div style="background:{header_color};padding:28px 30px;color:#ffffff;">
+          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:{accent_color};font-weight:700;">ProbeStack</div>
+          <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Request {safe_status_label}</h1>
+          <p style="margin:10px 0 0;color:{accent_color};font-size:15px;">Your {safe_request_name} for {safe_organization_name} has been {safe_status_label}.</p>
+        </div>
+
+        <div style="padding:30px;">
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Hi {safe_recipient_name},</p>
+          <p style="margin:0 0 18px;font-size:16px;line-height:1.6;">Your <strong>{safe_request_name}</strong> for <strong>{safe_organization_name}</strong> has been <strong>{safe_status_label}</strong>.</p>
+
+          <div style="padding:16px 18px;border-radius:10px;background:{panel_bg};border:1px solid {panel_border};margin:22px 0;">
+            <div style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#475569;font-weight:700;">{panel_label}</div>
+            <p style="margin:8px 0 0;font-size:15px;line-height:1.6;color:#172033;">{panel_text}</p>
+          </div>
+
+          {action_html}
+
+          <p style="margin:22px 0 0;font-size:15px;line-height:1.6;color:#475569;">Thank you,<br><strong>ProbeStack Team</strong></p>
+        </div>
+      </div>
+    </div>
+    """
+    return send_email(
+        to_email,
+        subject,
+        "\n".join(text_lines),
+        html_body,
+        bcc_email=notification_emails,
+    )
+
 def send_plan_upgrade_request_email(
     *,
     organization_name: str,
@@ -8261,11 +8348,34 @@ async def approve_user_request_org_admin(
             detail=f"Failed to create user in {active_provider.upper()}: {provider_user_result.get('error') or 'unknown error'}"
         )
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
     
     # Generate setup account URL
     base_url = os.environ.get("APP_URL", "")
     setup_url = f"{base_url}/setup-account?email={req.email}&token={user.first_login_token}" if base_url else None
+
+    try:
+        email_result = send_request_decision_email(
+            to_email=req.email,
+            recipient_name=req.name,
+            request_name="user access request",
+            status="approved",
+            organization_name=request_org.name,
+            next_steps="Your access has been approved. Please set up your account, verify your email, and then sign in to ProbeStack.",
+            action_url=setup_url,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "User request approval email was not sent for %s: %s. To: %s. Bcc: %s",
+                req.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build user request approval email for %s: %s", req.id, exc)
     
     return {
         "message": "User request approved",
@@ -8311,6 +8421,8 @@ async def reject_user_request_org_admin(request_id: str, reason: str = "", paylo
         raise HTTPException(status_code=404, detail="User request not found in your organization")
     if req.status != "pending":
         raise HTTPException(status_code=400, detail="Request is not pending")
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
+    request_org = org_result.scalar_one_or_none()
     
     now = datetime.now(timezone.utc)
     req.status = "rejected"
@@ -8318,7 +8430,30 @@ async def reject_user_request_org_admin(request_id: str, reason: str = "", paylo
     req.updated_at = now
     req.rejection_reason = reason
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    organization_name = request_org.name if request_org else "your organization"
+    try:
+        email_result = send_request_decision_email(
+            to_email=req.email,
+            recipient_name=req.name,
+            request_name="user access request",
+            status="rejected",
+            organization_name=organization_name,
+            reason=reason,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "User request rejection email was not sent for %s: %s. To: %s. Bcc: %s",
+                req.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build user request rejection email for %s: %s", req.id, exc)
     
     return {"message": "User request rejected"}
 
@@ -8656,7 +8791,9 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
     
     # Create notification
     plan_names = [p.get("plan_name", p.get("plan_id", "Unknown")) for p in requested_plans]
-    organization_name = await get_organization_name(db, req.organization_id)
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == req.organization_id))
+    organization = org_result.scalar_one_or_none()
+    organization_name = organization.name if organization else await get_organization_name(db, req.organization_id)
     notif = NotificationModel(
         title="Upgrade Request Approved",
         message=f"{organization_name or req.organization_id} upgraded to: {', '.join(plan_names)}",
@@ -8664,7 +8801,31 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    if organization and organization.email:
+        try:
+            email_result = send_request_decision_email(
+                to_email=organization.email,
+                recipient_name=organization.contact_person or organization.name,
+                request_name="plan upgrade request",
+                status="approved",
+                organization_name=organization.name,
+                next_steps=f"Your plan upgrade has been approved for: {', '.join(plan_names)}. Our team will follow up with any onboarding or billing details.",
+                action_url=f"{APP_URL.rstrip('/')}/admin/my-subscription",
+                notification_emails=notification_emails,
+            )
+            if not email_result.get("sent"):
+                logger.warning(
+                    "Upgrade approval email was not sent for %s: %s. To: %s. Bcc: %s",
+                    req.id,
+                    email_result.get("reason", "unknown reason"),
+                    email_result.get("to"),
+                    email_result.get("bcc"),
+                )
+        except Exception as exc:
+            logger.error("Failed to build upgrade approval email for %s: %s", req.id, exc)
     
     return {"message": "Upgrade request approved", "new_plans": plan_names, "subscriptions": created_subs}
 
@@ -8685,7 +8846,9 @@ async def reject_upgrade_request(request_id: str, reason: str = "", payload: dic
     req.rejection_reason = reason
     
     # Create notification
-    organization_name = await get_organization_name(db, req.organization_id)
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == req.organization_id))
+    organization = org_result.scalar_one_or_none()
+    organization_name = organization.name if organization else await get_organization_name(db, req.organization_id)
     notif = NotificationModel(
         title="Upgrade Request Rejected",
         message=f"Upgrade request from {organization_name or req.organization_id} was rejected",
@@ -8693,7 +8856,30 @@ async def reject_upgrade_request(request_id: str, reason: str = "", payload: dic
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    if organization and organization.email:
+        try:
+            email_result = send_request_decision_email(
+                to_email=organization.email,
+                recipient_name=organization.contact_person or organization.name,
+                request_name="plan upgrade request",
+                status="rejected",
+                organization_name=organization.name,
+                reason=reason,
+                notification_emails=notification_emails,
+            )
+            if not email_result.get("sent"):
+                logger.warning(
+                    "Upgrade rejection email was not sent for %s: %s. To: %s. Bcc: %s",
+                    req.id,
+                    email_result.get("reason", "unknown reason"),
+                    email_result.get("to"),
+                    email_result.get("bcc"),
+                )
+        except Exception as exc:
+            logger.error("Failed to build upgrade rejection email for %s: %s", req.id, exc)
     
     return {"message": "Upgrade request rejected"}
 
@@ -8835,7 +9021,10 @@ async def approve_plan_upgrade_request(request_id: str, payload: dict = Depends(
     await sync_organization_requested_from_active_subscriptions(db, request.organization_id)
     
     # Create notification
-    organization_name = await get_organization_name(db, request.organization_id)
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == request.organization_id))
+    organization = org_result.scalar_one_or_none()
+    organization_name = organization.name if organization else await get_organization_name(db, request.organization_id)
+    plan_names = [item.get("plan_name", item.get("plan_id", "Unknown")) for item in request_items]
     notif = NotificationModel(
         title="Plan Upgrade Approved",
         message=f"{organization_name or request.organization_id} plan upgrade approved",
@@ -8843,7 +9032,31 @@ async def approve_plan_upgrade_request(request_id: str, payload: dict = Depends(
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    if organization and organization.email:
+        try:
+            email_result = send_request_decision_email(
+                to_email=organization.email,
+                recipient_name=organization.contact_person or organization.name,
+                request_name="plan upgrade request",
+                status="approved",
+                organization_name=organization.name,
+                next_steps=f"Your plan upgrade has been approved for: {', '.join(plan_names)}. Our team will follow up with any onboarding or billing details.",
+                action_url=f"{APP_URL.rstrip('/')}/admin/my-subscription",
+                notification_emails=notification_emails,
+            )
+            if not email_result.get("sent"):
+                logger.warning(
+                    "Plan upgrade approval email was not sent for %s: %s. To: %s. Bcc: %s",
+                    request.id,
+                    email_result.get("reason", "unknown reason"),
+                    email_result.get("to"),
+                    email_result.get("bcc"),
+                )
+        except Exception as exc:
+            logger.error("Failed to build plan upgrade approval email for %s: %s", request.id, exc)
     return {"message": "Plan upgrade request approved"}
 
 @api_router.post("/plan-upgrade-requests/{request_id}/reject", tags=["Plan Upgrade Requests"])
@@ -8863,7 +9076,9 @@ async def reject_plan_upgrade_request(request_id: str, reason: str = "", payload
     request.updated_at = now
     
     # Create notification
-    organization_name = await get_organization_name(db, request.organization_id)
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == request.organization_id))
+    organization = org_result.scalar_one_or_none()
+    organization_name = organization.name if organization else await get_organization_name(db, request.organization_id)
     notif = NotificationModel(
         title="Plan Upgrade Rejected",
         message=f"{organization_name or request.organization_id} plan upgrade rejected",
@@ -8871,7 +9086,30 @@ async def reject_plan_upgrade_request(request_id: str, reason: str = "", payload
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    if organization and organization.email:
+        try:
+            email_result = send_request_decision_email(
+                to_email=organization.email,
+                recipient_name=organization.contact_person or organization.name,
+                request_name="plan upgrade request",
+                status="rejected",
+                organization_name=organization.name,
+                reason=reason,
+                notification_emails=notification_emails,
+            )
+            if not email_result.get("sent"):
+                logger.warning(
+                    "Plan upgrade rejection email was not sent for %s: %s. To: %s. Bcc: %s",
+                    request.id,
+                    email_result.get("reason", "unknown reason"),
+                    email_result.get("to"),
+                    email_result.get("bcc"),
+                )
+        except Exception as exc:
+            logger.error("Failed to build plan upgrade rejection email for %s: %s", request.id, exc)
     return {"message": "Plan upgrade request rejected"}
 
 # ==================== DASHBOARD ROUTES (Super Admin Only) ====================
@@ -11844,10 +12082,33 @@ async def approve_individual_user_request(
     request.assigned_user_id = user.id
     request.updated_at = datetime.now(timezone.utc)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
     
     # Generate setup account URL for the user
-    setup_account_url = f"/setup-account?email={user.email}&token={user.first_login_token}"
+    setup_account_url = build_setup_account_url(user.email, user.first_login_token) or f"/setup-account?email={user.email}&token={user.first_login_token}"
+
+    try:
+        email_result = send_request_decision_email(
+            to_email=request.email,
+            recipient_name=request.name,
+            request_name="individual user request",
+            status="approved",
+            organization_name=no_org.name,
+            next_steps="Your access has been approved. Please set up your account, verify your email, and then sign in to ProbeStack.",
+            action_url=setup_account_url,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "Individual user approval email was not sent for %s: %s. To: %s. Bcc: %s",
+                request.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build individual user approval email for %s: %s", request.id, exc)
     
     return {
         "message": f"Individual user request approved for {request.name}",
@@ -11892,7 +12153,29 @@ async def reject_individual_user_request(
     request.rejection_reason = reason
     request.updated_at = datetime.now(timezone.utc)
 
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    try:
+        email_result = send_request_decision_email(
+            to_email=request.email,
+            recipient_name=request.name,
+            request_name="individual user request",
+            status="rejected",
+            organization_name="ProbeStack",
+            reason=reason,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "Individual user rejection email was not sent for %s: %s. To: %s. Bcc: %s",
+                request.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build individual user rejection email for %s: %s", request.id, exc)
 
     return {"message": f"Individual user request rejected for {request.name}"}
 
@@ -12041,7 +12324,30 @@ async def reject_organization(org_id: str, reason: str = "", payload: dict = Dep
     
     notif = NotificationModel(title="Organization Rejected", message=f"{org.name} has been rejected", type="warning")
     db.add(notif)
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    try:
+        email_result = send_request_decision_email(
+            to_email=org.email,
+            recipient_name=org.contact_person or org.name,
+            request_name="organization request",
+            status="rejected",
+            organization_name=org.name,
+            reason=reason,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "Organization rejection email was not sent for %s: %s. To: %s. Bcc: %s",
+                org.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build organization rejection email for %s: %s", org.id, exc)
+
     return {"message": "Organization rejected"}
 
 @api_router.delete("/organizations/{org_id}")
@@ -15141,11 +15447,34 @@ async def approve_user_request(
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
     
     # Generate setup account URL
     base_url = os.environ.get("APP_URL", "")
     setup_url = f"{base_url}/setup-account?email={req.email}&token={user.first_login_token}" if base_url else None
+
+    try:
+        email_result = send_request_decision_email(
+            to_email=req.email,
+            recipient_name=req.name,
+            request_name="user access request",
+            status="approved",
+            organization_name=request_org.name,
+            next_steps="Your access has been approved. Please set up your account, verify your email, and then sign in to ProbeStack.",
+            action_url=setup_url,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "User request approval email was not sent for %s: %s. To: %s. Bcc: %s",
+                req.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build user request approval email for %s: %s", req.id, exc)
     
     return {
         "message": "User request approved",
@@ -15204,7 +15533,29 @@ async def reject_user_request(
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    try:
+        email_result = send_request_decision_email(
+            to_email=req.email,
+            recipient_name=req.name,
+            request_name="user access request",
+            status="rejected",
+            organization_name=organization_name or "your organization",
+            reason=reason,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "User request rejection email was not sent for %s: %s. To: %s. Bcc: %s",
+                req.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build user request rejection email for %s: %s", req.id, exc)
     
     return {"message": "User request rejected"}
 
