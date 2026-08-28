@@ -1110,6 +1110,8 @@ class SubscriptionModel(Base):
     billing_cycle: Mapped[str] = mapped_column(String(50), default="monthly")
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     api_count: Mapped[Optional[int]] = mapped_column(nullable=True)
+    quota: Mapped[Optional[int]] = mapped_column(nullable=True)
+    used_quota: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class SubscriptionToolModel(Base):
@@ -1703,17 +1705,36 @@ class SubscriptionUpdateRequest(BaseModel):
 class SubscriptionApiCountUpdate(BaseModel):
     api_count: Optional[int] = None
 
+class SubscriptionQuotaUpdate(BaseModel):
+    quota: Optional[int] = None
+    used_quota: Optional[int] = None
+    usage_delta: Optional[int] = None
+    remaining_quota: Optional[int] = None
+
 class OrganizationSubscriptionApiCountUpdate(BaseModel):
     subscription_id: str
     api_count: Optional[int] = None
+
+class OrganizationSubscriptionQuotaUpdate(BaseModel):
+    subscription_id: str
+    quota: Optional[int] = None
+    used_quota: Optional[int] = None
 
 class OrganizationApiCountUpdate(BaseModel):
     api_count: Optional[int] = None
     subscription_id: Optional[str] = None
     subscriptions: Optional[List[OrganizationSubscriptionApiCountUpdate]] = None
 
+class OrganizationQuotaUpdate(BaseModel):
+    quota: Optional[int] = None
+    used_quota: Optional[int] = None
+    subscription_id: Optional[str] = None
+    subscriptions: Optional[List[OrganizationSubscriptionQuotaUpdate]] = None
+
 class SubscriptionBillingSettingsUpdate(BaseModel):
     api_count: Optional[int] = None
+    quota: Optional[int] = None
+    used_quota: Optional[int] = None
     amount: Optional[float] = None
 
 class NotificationGroupEmailCreate(BaseModel):
@@ -3609,19 +3630,80 @@ async def subscription_to_dict(db: AsyncSession, subscription: SubscriptionModel
         data["product_id"] = None
         data["product_key"] = None
         data["product_name"] = None
+    quota_limit = get_subscription_quota_limit(subscription, plan)
+    used_quota = get_subscription_used_quota(subscription)
+    data["quota"] = quota_limit
+    data["used_quota"] = used_quota
+    data["remaining_quota"] = None if quota_limit is None else max(quota_limit - used_quota, 0)
+    data["api_count"] = quota_limit
     data["tools"] = await get_subscription_tools(db, subscription)
     return data
 
+def get_subscription_quota_limit(subscription: SubscriptionModel, plan: Optional[PlanModel] = None) -> Optional[int]:
+    explicit_quota = getattr(subscription, "quota", None)
+    if explicit_quota is not None:
+        return int(explicit_quota)
+    legacy_api_count = getattr(subscription, "api_count", None)
+    if legacy_api_count is not None:
+        return int(legacy_api_count)
+    if plan:
+        return int(getattr(plan, "api_limit", 0) or 0)
+    return None
+
+def get_subscription_used_quota(subscription: SubscriptionModel) -> int:
+    return max(int(getattr(subscription, "used_quota", 0) or 0), 0)
+
+def apply_subscription_quota_update(
+    subscription: SubscriptionModel,
+    *,
+    quota: Optional[int] = None,
+    used_quota: Optional[int] = None,
+) -> None:
+    if quota is not None and quota < 0:
+        raise HTTPException(status_code=400, detail="quota cannot be negative")
+    if used_quota is not None and used_quota < 0:
+        raise HTTPException(status_code=400, detail="used_quota cannot be negative")
+    if quota is not None:
+        subscription.quota = quota
+        subscription.api_count = quota
+    if used_quota is not None:
+        subscription.used_quota = used_quota
+
+def apply_subscription_usage_update(subscription: SubscriptionModel, data: SubscriptionQuotaUpdate) -> None:
+    quota_limit = get_subscription_quota_limit(subscription)
+    provided = [data.used_quota is not None, data.usage_delta is not None, data.remaining_quota is not None]
+    if sum(provided) != 1:
+        raise HTTPException(status_code=400, detail="Pass exactly one of used_quota, usage_delta, or remaining_quota")
+    if data.used_quota is not None:
+        new_used_quota = data.used_quota
+    elif data.usage_delta is not None:
+        new_used_quota = get_subscription_used_quota(subscription) + data.usage_delta
+    else:
+        if quota_limit is None:
+            raise HTTPException(status_code=400, detail="Cannot set remaining_quota when quota is not configured")
+        new_used_quota = quota_limit - data.remaining_quota
+    if new_used_quota < 0:
+        raise HTTPException(status_code=400, detail="used_quota cannot be negative")
+    if quota_limit is not None and new_used_quota > quota_limit:
+        raise HTTPException(status_code=400, detail=f"used_quota cannot exceed quota ({quota_limit})")
+    subscription.used_quota = new_used_quota
+
 async def get_organization_api_capacity(db: AsyncSession, organization_id: str) -> Optional[int]:
     result = await db.execute(
-        select(SubscriptionModel.api_count).where(
+        select(SubscriptionModel, PlanModel)
+        .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(
             SubscriptionModel.organization_id == organization_id,
             SubscriptionModel.status == "active",
-            SubscriptionModel.api_count.is_not(None),
         )
     )
-    api_counts = [count for count in result.scalars().all() if count is not None]
-    return sum(api_counts) if api_counts else None
+    quota_limits = [
+        quota
+        for subscription, plan in result.all()
+        for quota in [get_subscription_quota_limit(subscription, plan)]
+        if quota is not None
+    ]
+    return sum(quota_limits) if quota_limits else None
 
 async def get_organization_api_usage(
     db: AsyncSession,
@@ -3648,16 +3730,21 @@ async def get_organization_api_count_summary(db: AsyncSession, organization: Org
         .order_by(ProductModel.display_order, ProductModel.name, PlanModel.created_at.desc())
     )
     subscriptions = []
-    total_assigned_api_count = 0
-    total_effective_api_count = 0
+    total_assigned_quota = 0
+    total_effective_quota = 0
+    total_used_quota = 0
 
     for subscription, plan, product in result.all():
-        assigned_api_count = subscription.api_count
-        plan_api_limit = int(getattr(plan, "api_limit", 0) or 0) if plan else 0
-        effective_api_count = int(assigned_api_count) if assigned_api_count is not None else plan_api_limit
-        if assigned_api_count is not None:
-            total_assigned_api_count += int(assigned_api_count)
-        total_effective_api_count += effective_api_count
+        assigned_quota = getattr(subscription, "quota", None)
+        legacy_api_count = getattr(subscription, "api_count", None)
+        plan_quota = int(getattr(plan, "api_limit", 0) or 0) if plan else 0
+        effective_quota = get_subscription_quota_limit(subscription, plan)
+        used_quota = get_subscription_used_quota(subscription)
+        remaining_quota = None if effective_quota is None else max(effective_quota - used_quota, 0)
+        if assigned_quota is not None:
+            total_assigned_quota += int(assigned_quota)
+        total_effective_quota += int(effective_quota or 0)
+        total_used_quota += used_quota
         subscriptions.append({
             "subscription_id": subscription.id,
             "plan_id": subscription.plan_id,
@@ -3666,28 +3753,132 @@ async def get_organization_api_count_summary(db: AsyncSession, organization: Org
             "product_key": product.key if product else None,
             "product_name": product.name if product else None,
             "status": subscription.status,
-            "assigned_api_count": assigned_api_count,
-            "plan_api_limit": plan_api_limit,
-            "effective_api_count": effective_api_count,
+            "quota": effective_quota,
+            "assigned_quota": assigned_quota,
+            "plan_quota": plan_quota,
+            "used_quota": used_quota,
+            "remaining_quota": remaining_quota,
+            "assigned_api_count": assigned_quota if assigned_quota is not None else legacy_api_count,
+            "plan_api_limit": plan_quota,
+            "effective_api_count": effective_quota,
             "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
             "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
         })
 
     enforced_capacity = await get_organization_api_capacity(db, organization.id)
-    used_api_count = await get_organization_api_usage(db, organization.id)
-    remaining_api_count = None if enforced_capacity is None else max(enforced_capacity - used_api_count, 0)
+    remaining_quota = None if enforced_capacity is None else max(enforced_capacity - total_used_quota, 0)
 
     return {
         "organization_id": organization.id,
         "organization_name": organization.name,
-        "api_count": total_assigned_api_count,
-        "total_assigned_api_count": total_assigned_api_count,
-        "total_effective_api_count": total_effective_api_count,
-        "used_api_count": used_api_count,
-        "remaining_api_count": remaining_api_count,
+        "quota": total_assigned_quota,
+        "total_assigned_quota": total_assigned_quota,
+        "total_effective_quota": total_effective_quota,
+        "used_quota": total_used_quota,
+        "remaining_quota": remaining_quota,
+        "api_count": total_assigned_quota,
+        "total_assigned_api_count": total_assigned_quota,
+        "total_effective_api_count": total_effective_quota,
+        "used_api_count": total_used_quota,
+        "remaining_api_count": remaining_quota,
         "capacity_enforced": enforced_capacity is not None,
         "subscriptions": subscriptions,
     }
+
+async def get_active_subscription_for_product_identifier(
+    db: AsyncSession,
+    organization_id: str,
+    product_identifier: str,
+) -> tuple[SubscriptionModel, Optional[PlanModel], Optional[ProductModel]]:
+    identifier = (product_identifier or "").strip()
+    identifier_lower = identifier.lower()
+    result = await db.execute(
+        select(SubscriptionModel, PlanModel, ProductModel)
+        .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .outerjoin(ProductModel, PlanModel.product_id == ProductModel.id)
+        .where(
+            SubscriptionModel.organization_id == organization_id,
+            SubscriptionModel.status == "active",
+            or_(
+                ProductModel.id == identifier,
+                func.lower(ProductModel.key) == identifier_lower,
+                func.lower(ProductModel.name) == identifier_lower,
+                SubscriptionModel.plan_id == identifier,
+            ),
+        )
+        .order_by(SubscriptionModel.created_at.desc())
+    )
+    row = result.first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Active product subscription quota not found")
+    return row
+
+def enforce_subscription_quota_bounds(subscription: SubscriptionModel, plan: Optional[PlanModel] = None) -> None:
+    quota_limit = get_subscription_quota_limit(subscription, plan)
+    used_quota = get_subscription_used_quota(subscription)
+    if quota_limit is not None and used_quota > quota_limit:
+        raise HTTPException(status_code=400, detail=f"used_quota cannot exceed quota ({quota_limit})")
+
+async def update_organization_subscription_quotas(
+    db: AsyncSession,
+    organization_id: str,
+    data: OrganizationQuotaUpdate,
+) -> List[str]:
+    if data.quota is not None and data.quota < 0:
+        raise HTTPException(status_code=400, detail="quota cannot be negative")
+    if data.used_quota is not None and data.used_quota < 0:
+        raise HTTPException(status_code=400, detail="used_quota cannot be negative")
+
+    if data.subscriptions:
+        seen_subscription_ids = set()
+        updated_subscription_ids = []
+        for item in data.subscriptions:
+            if item.subscription_id in seen_subscription_ids:
+                raise HTTPException(status_code=400, detail=f"Duplicate subscription_id: {item.subscription_id}")
+            seen_subscription_ids.add(item.subscription_id)
+            result = await db.execute(
+                select(SubscriptionModel, PlanModel)
+                .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+                .where(
+                    SubscriptionModel.id == item.subscription_id,
+                    SubscriptionModel.organization_id == organization_id,
+                    SubscriptionModel.status == "active",
+                )
+            )
+            row = result.first()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"Active subscription not found: {item.subscription_id}")
+            subscription, plan = row
+            apply_subscription_quota_update(subscription, quota=item.quota, used_quota=item.used_quota)
+            enforce_subscription_quota_bounds(subscription, plan)
+            updated_subscription_ids.append(subscription.id)
+        return updated_subscription_ids
+
+    query = (
+        select(SubscriptionModel, PlanModel)
+        .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(
+            SubscriptionModel.organization_id == organization_id,
+            SubscriptionModel.status == "active",
+        )
+    )
+    if data.subscription_id:
+        query = query.where(SubscriptionModel.id == data.subscription_id)
+
+    result = await db.execute(query.order_by(SubscriptionModel.created_at.desc()))
+    rows = list(result.all())
+    if not rows:
+        raise HTTPException(status_code=404, detail="Active subscription not found")
+    if not data.subscription_id and len(rows) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Multiple active subscriptions found. Pass subscription_id or subscriptions to update specific subscriptions.",
+        )
+
+    subscription, plan = rows[0]
+    apply_subscription_quota_update(subscription, quota=data.quota, used_quota=data.used_quota)
+    enforce_subscription_quota_bounds(subscription, plan)
+    return [subscription.id]
 
 async def ensure_organization_api_capacity(
     db: AsyncSession,
@@ -5302,6 +5493,8 @@ async def create_individual_user_subscription(
         end_date=datetime.now(timezone.utc) + timedelta(days=30),
         billing_cycle="monthly",
         amount=plan.price_monthly,
+        quota=int(getattr(plan, "api_limit", 0) or 0),
+        used_quota=0,
     )
     db.add(subscription)
     await db.flush()
@@ -8781,7 +8974,9 @@ async def approve_upgrade_request(request_id: str, payload: dict = Depends(requi
                 start_date=now,
                 end_date=now + timedelta(days=30),
                 billing_cycle="monthly",
-                amount=total_price
+                amount=total_price,
+                quota=int(getattr(plan, "api_limit", 0) or 0),
+                used_quota=0,
             )
             db.add(new_sub)
             await db.flush()
@@ -9013,7 +9208,9 @@ async def approve_plan_upgrade_request(request_id: str, payload: dict = Depends(
             start_date=now,
             end_date=now + timedelta(days=30),
             billing_cycle="monthly",
-            amount=total_price
+            amount=total_price,
+            quota=int(getattr(plan, "api_limit", 0) or 0),
+            used_quota=0,
         )
         db.add(subscription)
         await db.flush()
@@ -9491,6 +9688,87 @@ async def get_organization_api_counts(
 
     return await get_organization_api_count_summary(db, org)
 
+@api_router.get("/organizations/{org_id}/quotas")
+async def get_organization_quotas(
+    org_id: str,
+    payload: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    access_scope = await get_subscription_access_scope(db, payload)
+    if access_scope["scope"] != "all" and access_scope.get("organization_id") != org_id:
+        raise HTTPException(status_code=403, detail="Not allowed to access this organization")
+
+    org = await get_organization_by_id(db, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    return await get_organization_api_count_summary(db, org)
+
+@api_router.get("/organizations/{org_id}/quotas/{product_identifier}")
+async def get_organization_product_quota(
+    org_id: str,
+    product_identifier: str,
+    payload: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    access_scope = await get_subscription_access_scope(db, payload)
+    if access_scope["scope"] != "all" and access_scope.get("organization_id") != org_id:
+        raise HTTPException(status_code=403, detail="Not allowed to access this organization")
+
+    subscription, plan, product = await get_active_subscription_for_product_identifier(db, org_id, product_identifier)
+    data = await subscription_to_dict(db, subscription)
+    data["plan_quota"] = int(getattr(plan, "api_limit", 0) or 0) if plan else 0
+    data["quota"] = get_subscription_quota_limit(subscription, plan)
+    data["used_quota"] = get_subscription_used_quota(subscription)
+    data["remaining_quota"] = None if data["quota"] is None else max(data["quota"] - data["used_quota"], 0)
+    data["product_id"] = product.id if product else data.get("product_id")
+    data["product_key"] = product.key if product else data.get("product_key")
+    data["product_name"] = product.name if product else data.get("product_name")
+    return data
+
+@api_router.put("/organizations/{org_id}/quotas")
+async def update_organization_quotas(
+    org_id: str,
+    data: OrganizationQuotaUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    org = await get_organization_by_id(db, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    updated_subscription_ids = await update_organization_subscription_quotas(db, org_id, data)
+    await db.commit()
+    summary = await get_organization_api_count_summary(db, org)
+    return {
+        "message": "Organization quota updated",
+        "updated_subscription_ids": updated_subscription_ids,
+        **summary,
+    }
+
+@api_router.put("/organizations/{org_id}/quotas/{product_identifier}/usage")
+async def update_organization_product_usage_quota(
+    org_id: str,
+    product_identifier: str,
+    data: SubscriptionQuotaUpdate,
+    payload: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    access_scope = await get_subscription_access_scope(db, payload)
+    if access_scope["scope"] != "all" and access_scope.get("organization_id") != org_id:
+        raise HTTPException(status_code=403, detail="Not allowed to update this organization quota")
+
+    subscription, plan, product = await get_active_subscription_for_product_identifier(db, org_id, product_identifier)
+    apply_subscription_usage_update(subscription, data)
+    enforce_subscription_quota_bounds(subscription, plan)
+    await db.commit()
+    response = await subscription_to_dict(db, subscription)
+    response["message"] = "Usage quota updated"
+    response["product_id"] = product.id if product else response.get("product_id")
+    response["product_key"] = product.key if product else response.get("product_key")
+    response["product_name"] = product.name if product else response.get("product_name")
+    return response
+
 @api_router.put("/organizations/{org_id}/api-counts")
 async def update_organization_api_counts(
     org_id: str,
@@ -9505,53 +9783,19 @@ async def update_organization_api_counts(
     if data.api_count is not None and data.api_count < 0:
         raise HTTPException(status_code=400, detail="api_count cannot be negative")
 
-    if data.subscriptions:
-        seen_subscription_ids = set()
-        updated_subscription_ids = []
-        for item in data.subscriptions:
-            if item.subscription_id in seen_subscription_ids:
-                raise HTTPException(status_code=400, detail=f"Duplicate subscription_id: {item.subscription_id}")
-            seen_subscription_ids.add(item.subscription_id)
-            if item.api_count is not None and item.api_count < 0:
-                raise HTTPException(status_code=400, detail="api_count cannot be negative")
-
-            result = await db.execute(
-                select(SubscriptionModel).where(
-                    SubscriptionModel.id == item.subscription_id,
-                    SubscriptionModel.organization_id == org_id,
-                    SubscriptionModel.status == "active",
-                )
-            )
-            subscription = result.scalar_one_or_none()
-            if not subscription:
-                raise HTTPException(status_code=404, detail=f"Active subscription not found: {item.subscription_id}")
-            subscription.api_count = item.api_count
-            updated_subscription_ids.append(subscription.id)
-    else:
-        query = select(SubscriptionModel).where(
-            SubscriptionModel.organization_id == org_id,
-            SubscriptionModel.status == "active",
-        )
-        if data.subscription_id:
-            query = query.where(SubscriptionModel.id == data.subscription_id)
-
-        result = await db.execute(query.order_by(SubscriptionModel.created_at.desc()))
-        subscriptions = list(result.scalars().all())
-        if not subscriptions:
-            raise HTTPException(status_code=404, detail="Active subscription not found")
-        if not data.subscription_id and len(subscriptions) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail="Multiple active subscriptions found. Pass subscription_id or subscriptions to update specific subscriptions.",
-            )
-
-        subscriptions[0].api_count = data.api_count
-        updated_subscription_ids = [subscriptions[0].id]
-
+    quota_update = OrganizationQuotaUpdate(
+        quota=data.api_count,
+        subscription_id=data.subscription_id,
+        subscriptions=[
+            OrganizationSubscriptionQuotaUpdate(subscription_id=item.subscription_id, quota=item.api_count)
+            for item in data.subscriptions
+        ] if data.subscriptions else None,
+    )
+    updated_subscription_ids = await update_organization_subscription_quotas(db, org_id, quota_update)
     await db.commit()
     summary = await get_organization_api_count_summary(db, org)
     return {
-        "message": "Organization API count updated",
+        "message": "Organization quota updated",
         "updated_subscription_ids": updated_subscription_ids,
         **summary,
     }
@@ -12242,7 +12486,9 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
             status="active",
             start_date=now,
             end_date=now + timedelta(days=30),
-            amount=plan_amount
+            amount=plan_amount,
+            quota=int(getattr(plan, "api_limit", 0) or 0),
+            used_quota=0,
         )
         db.add(subscription)
         await db.flush()
@@ -12521,7 +12767,9 @@ async def update_organization_subscription(org_id: str, data: SubscriptionUpdate
             start_date=now,
             end_date=end_date,
             billing_cycle=data.billing_cycle,
-            amount=total_price
+            amount=total_price,
+            quota=int(getattr(plan, "api_limit", 0) or 0),
+            used_quota=0,
         )
         db.add(new_sub)
         await db.flush()
@@ -12686,7 +12934,9 @@ async def update_individual_user_subscription(user_id: str, data: SubscriptionUp
             start_date=now,
             end_date=end_date,
             billing_cycle=data.billing_cycle,
-            amount=total_price
+            amount=total_price,
+            quota=int(getattr(plan, "api_limit", 0) or 0),
+            used_quota=0,
         )
         db.add(new_sub)
         await db.flush()  # Get the ID
@@ -12776,18 +13026,91 @@ async def update_subscription_api_count(
     payload: dict = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(SubscriptionModel).where(SubscriptionModel.id == sub_id))
+    result = await db.execute(
+        select(SubscriptionModel, PlanModel)
+        .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(SubscriptionModel.id == sub_id)
+    )
+    row = result.first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    sub, plan = row
+    if data.api_count is not None and data.api_count < 0:
+        raise HTTPException(status_code=400, detail="api_count cannot be negative")
+    apply_subscription_quota_update(sub, quota=data.api_count)
+    enforce_subscription_quota_bounds(sub, plan)
+    await db.commit()
+    return {
+        "message": "Subscription quota updated",
+        "subscription": await subscription_to_dict(db, sub),
+    }
+
+@api_router.get("/subscriptions/{sub_id}/quota")
+async def get_subscription_quota(
+    sub_id: str,
+    payload: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    query = valid_subscription_query().where(SubscriptionModel.id == sub_id)
+    access_scope = await get_subscription_access_scope(db, payload)
+    if access_scope["scope"] != "all":
+        query = query.where(SubscriptionModel.organization_id == access_scope["organization_id"])
+    result = await db.execute(query)
     sub = result.scalar_one_or_none()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
-    if data.api_count is not None and data.api_count < 0:
-        raise HTTPException(status_code=400, detail="api_count cannot be negative")
-    sub.api_count = data.api_count
+    return await subscription_to_dict(db, sub)
+
+@api_router.put("/subscriptions/{sub_id}/quota")
+async def update_subscription_quota(
+    sub_id: str,
+    data: SubscriptionQuotaUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(SubscriptionModel, PlanModel)
+        .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(SubscriptionModel.id == sub_id)
+    )
+    row = result.first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    sub, plan = row
+    apply_subscription_quota_update(sub, quota=data.quota, used_quota=data.used_quota)
+    enforce_subscription_quota_bounds(sub, plan)
     await db.commit()
     return {
-        "message": "Subscription API count updated",
+        "message": "Subscription quota updated",
         "subscription": await subscription_to_dict(db, sub),
     }
+
+@api_router.put("/subscriptions/{sub_id}/usage-quota")
+async def update_subscription_usage_quota(
+    sub_id: str,
+    data: SubscriptionQuotaUpdate,
+    payload: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    query = (
+        select(SubscriptionModel, PlanModel)
+        .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(SubscriptionModel.id == sub_id)
+    )
+    access_scope = await get_subscription_access_scope(db, payload)
+    if access_scope["scope"] != "all":
+        query = query.where(SubscriptionModel.organization_id == access_scope["organization_id"])
+    result = await db.execute(query)
+    row = result.first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    sub, plan = row
+    apply_subscription_usage_update(sub, data)
+    enforce_subscription_quota_bounds(sub, plan)
+    await db.commit()
+    response = await subscription_to_dict(db, sub)
+    response["message"] = "Usage quota updated"
+    return response
 
 @api_router.put("/subscriptions/{sub_id}/billing-settings")
 async def update_subscription_billing_settings(
@@ -12796,16 +13119,25 @@ async def update_subscription_billing_settings(
     payload: dict = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(SubscriptionModel).where(SubscriptionModel.id == sub_id))
-    sub = result.scalar_one_or_none()
-    if not sub:
+    result = await db.execute(
+        select(SubscriptionModel, PlanModel)
+        .outerjoin(PlanModel, SubscriptionModel.plan_id == PlanModel.id)
+        .where(SubscriptionModel.id == sub_id)
+    )
+    row = result.first()
+    if not row:
         raise HTTPException(status_code=404, detail="Subscription not found")
-    if data.api_count is not None and data.api_count < 0:
-        raise HTTPException(status_code=400, detail="api_count cannot be negative")
+    sub, plan = row
+    quota = data.quota if data.quota is not None else data.api_count
+    if quota is not None and quota < 0:
+        raise HTTPException(status_code=400, detail="quota cannot be negative")
+    if data.used_quota is not None and data.used_quota < 0:
+        raise HTTPException(status_code=400, detail="used_quota cannot be negative")
     if data.amount is not None and data.amount < 0:
         raise HTTPException(status_code=400, detail="amount cannot be negative")
 
-    sub.api_count = data.api_count
+    apply_subscription_quota_update(sub, quota=quota, used_quota=data.used_quota)
+    enforce_subscription_quota_bounds(sub, plan)
     if data.amount is not None:
         sub.amount = float(data.amount)
     await db.commit()
@@ -15646,6 +15978,15 @@ async def ensure_runtime_schema(conn):
     if not await mysql_column_exists(conn, "plans", "is_popular"):
         await conn.execute(text("ALTER TABLE plans ADD COLUMN is_popular BOOL NOT NULL DEFAULT FALSE AFTER cost"))
     await ensure_mysql_column(conn, "subscriptions", "api_count", "INT NULL")
+    await ensure_mysql_column(conn, "subscriptions", "quota", "INT NULL")
+    await ensure_mysql_column(conn, "subscriptions", "used_quota", "INT NOT NULL DEFAULT 0")
+    await conn.execute(text("""
+        UPDATE subscriptions s
+        LEFT JOIN plans p ON s.plan_id = p.id
+        SET s.quota = COALESCE(s.quota, s.api_count, p.api_limit, 0),
+            s.used_quota = COALESCE(s.used_quota, 0)
+        WHERE s.quota IS NULL OR s.used_quota IS NULL
+    """))
     if await mysql_column_exists(conn, "plan_upgrade_requests", "current_plan_id"):
         await conn.execute(text("ALTER TABLE plan_upgrade_requests MODIFY COLUMN current_plan_id TEXT NOT NULL"))
 
