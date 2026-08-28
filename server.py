@@ -1226,6 +1226,15 @@ class NotificationModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     link: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
+class NotificationGroupEmailModel(Base):
+    __tablename__ = "notification_group_emails"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
 class UserRequestModel(Base):
     """Model for user addition requests from external applications"""
     __tablename__ = "user_requests"
@@ -1706,6 +1715,19 @@ class OrganizationApiCountUpdate(BaseModel):
 class SubscriptionBillingSettingsUpdate(BaseModel):
     api_count: Optional[int] = None
     amount: Optional[float] = None
+
+class NotificationGroupEmailCreate(BaseModel):
+    email: str
+    name: Optional[str] = None
+    is_active: Optional[bool] = True
+
+class NotificationGroupEmailUpdate(BaseModel):
+    email: Optional[str] = None
+    name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class BillingInvoiceEmailRequest(BaseModel):
+    emails: List[str]
 
 class OrganizationCreate(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -5911,17 +5933,92 @@ def normalize_email_recipients(recipients: Any) -> List[str]:
             seen.add(email_key)
     return normalized
 
+async def ensure_notification_group_seeded(db: AsyncSession) -> None:
+    setting_key = "notification_group_initialized"
+    setting_result = await db.execute(select(SystemSettingModel).where(SystemSettingModel.key == setting_key))
+    if setting_result.scalar_one_or_none():
+        return
+    for email in normalize_email_recipients(ORG_REQUEST_NOTIFICATION_EMAILS):
+        existing_result = await db.execute(
+            select(NotificationGroupEmailModel).where(func.lower(NotificationGroupEmailModel.email) == email.lower())
+        )
+        if not existing_result.scalar_one_or_none():
+            db.add(NotificationGroupEmailModel(email=email, is_active=True))
+    db.add(SystemSettingModel(key=setting_key, value="true"))
+    await db.flush()
+
+async def get_notification_group_emails(db: AsyncSession, *, active_only: bool = True) -> List[str]:
+    await ensure_notification_group_seeded(db)
+    query = select(NotificationGroupEmailModel)
+    if active_only:
+        query = query.where(NotificationGroupEmailModel.is_active == True)
+    result = await db.execute(query.order_by(NotificationGroupEmailModel.created_at.asc()))
+    return normalize_email_recipients([entry.email for entry in result.scalars().all()])
+
+async def get_org_admin_emails(db: AsyncSession, organization_id: str) -> List[str]:
+    result = await db.execute(
+        select(AdminModel.email)
+        .where(AdminModel.organization_id == organization_id)
+        .where(AdminModel.role == "org_admin")
+        .where(AdminModel.is_active == True)
+        .order_by(AdminModel.created_at.asc())
+    )
+    return normalize_email_recipients(result.scalars().all())
+
+async def get_billing_invoice_recipient_options(db: AsyncSession, organization_id: str) -> List[dict]:
+    recipients = {}
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == organization_id))
+    organization = org_result.scalar_one_or_none()
+    if organization and organization.email:
+        recipients[organization.email.lower()] = {
+            "email": organization.email,
+            "name": organization.name,
+            "type": "organization",
+            "label": f"{organization.name} ({organization.email}) - Organization",
+        }
+    admin_result = await db.execute(
+        select(AdminModel)
+        .where(AdminModel.organization_id == organization_id)
+        .where(AdminModel.is_active == True)
+        .order_by(AdminModel.name.asc(), AdminModel.email.asc())
+    )
+    for admin in admin_result.scalars().all():
+        recipients[admin.email.lower()] = {
+            "email": admin.email,
+            "name": admin.name,
+            "type": "org_admin",
+            "label": f"{admin.name} ({admin.email}) - Org Admin",
+        }
+    user_result = await db.execute(
+        select(UserModel)
+        .where(UserModel.organization_id == organization_id)
+        .order_by(UserModel.name.asc(), UserModel.email.asc())
+    )
+    for user in user_result.scalars().all():
+        recipients.setdefault(user.email.lower(), {
+            "email": user.email,
+            "name": user.name,
+            "type": "user",
+            "label": f"{user.name} ({user.email}) - User",
+        })
+    return list(recipients.values())
+
 def send_email(
     to_email: Any,
     subject: str,
     text_body: str,
     html_body: Optional[str] = None,
     cc_email: Optional[Any] = None,
-    bcc_email: Optional[Any] = None
+    bcc_email: Optional[Any] = None,
+    attachments: Optional[List[dict]] = None
 ) -> dict:
     to_emails = normalize_email_recipients(to_email)
     cc_emails = normalize_email_recipients(cc_email)
     bcc_emails = normalize_email_recipients(bcc_email)
+    to_keys = {email.lower() for email in to_emails}
+    cc_emails = [email for email in cc_emails if email.lower() not in to_keys]
+    cc_keys = {email.lower() for email in cc_emails}
+    bcc_emails = [email for email in bcc_emails if email.lower() not in to_keys and email.lower() not in cc_keys]
     if not to_emails:
         logger.warning("Skipped email with no recipients. Subject: %s", subject)
         return {
@@ -5960,6 +6057,17 @@ def send_email(
                 "type": "text/html",
                 "value": html_body,
             })
+        if attachments:
+            payload["attachments"] = [
+                {
+                    "content": base64.b64encode(attachment["content"]).decode("ascii"),
+                    "filename": attachment["filename"],
+                    "type": attachment.get("type", "application/octet-stream"),
+                    "disposition": attachment.get("disposition", "attachment"),
+                }
+                for attachment in attachments
+                if attachment.get("content") and attachment.get("filename")
+            ]
 
         try:
             response = httpx.post(
@@ -6027,6 +6135,19 @@ def send_email(
     message.set_content(text_body)
     if html_body:
         message.add_alternative(html_body, subtype="html")
+    for attachment in attachments or []:
+        content = attachment.get("content")
+        filename = attachment.get("filename")
+        if not content or not filename:
+            continue
+        content_type = attachment.get("type", "application/octet-stream")
+        maintype, _, subtype = content_type.partition("/")
+        message.add_attachment(
+            content,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=filename,
+        )
 
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
@@ -6104,7 +6225,8 @@ def send_new_organization_request_email(
     description: str,
     additional_notes: Optional[str],
     plans: str,
-    selected_tools: str
+    selected_tools: str,
+    notification_emails: Optional[List[str]] = None
 ) -> dict:
     review_url = f"{APP_URL.rstrip('/')}/admin/pending-organizations"
     subject = f"New ProbeStack organization request: {organization_name}"
@@ -6217,13 +6339,15 @@ def send_new_organization_request_email(
       </div>
     </div>
     """
-    return send_email(ORG_REQUEST_NOTIFICATION_EMAILS, subject, text_body, html_body)
+    recipients = normalize_email_recipients(notification_emails) or normalize_email_recipients(ORG_REQUEST_NOTIFICATION_EMAILS)
+    return send_email(recipients, subject, text_body, html_body)
 
 def send_organization_approval_email(
     *,
     organization_name: str,
     organization_email: str,
-    contact_person: str
+    contact_person: str,
+    notification_emails: Optional[List[str]] = None
 ) -> dict:
     subject = f"Your ProbeStack organization request has been approved"
     greeting_name = contact_person or organization_name
@@ -6273,7 +6397,217 @@ def send_organization_approval_email(
         subject,
         text_body,
         html_body,
-        bcc_email=ORG_APPROVAL_CC_EMAILS
+        bcc_email=normalize_email_recipients(notification_emails) or normalize_email_recipients(ORG_APPROVAL_CC_EMAILS)
+    )
+
+def send_plan_upgrade_request_email(
+    *,
+    organization_name: str,
+    request_id: str,
+    requested_by_email: Optional[str],
+    requested_details: List[dict],
+    reason: Optional[str],
+    notification_emails: List[str]
+) -> dict:
+    review_url = f"{APP_URL.rstrip('/')}/admin/upgrade-requests"
+    subject = f"Plan upgrade request: {organization_name}"
+    plan_lines = [
+        f"{detail.get('product').name if detail.get('product') else 'Product'}:{detail.get('plan').name if detail.get('plan') else detail.get('selection').plan_id}"
+        for detail in requested_details
+    ]
+    requested_text = "\n".join(plan_lines) or "No plan details available"
+    tools_lines = []
+    for detail in requested_details:
+        tools = detail.get("tools") or []
+        tools_lines.append(f"{detail.get('product').name if detail.get('product') else 'Product'} tools: {', '.join(tools) if tools else 'No tools selected'}")
+    tools_text = "\n".join(tools_lines)
+    safe_organization_name = escape(organization_name)
+    safe_request_id = escape(request_id)
+    safe_requested_by = escape(requested_by_email or "Org admin")
+    safe_requested_html = "<br>".join(escape(line) for line in requested_text.splitlines())
+    safe_tools_html = "<br>".join(escape(line) for line in tools_text.splitlines())
+    safe_reason = escape(reason or "No reason provided")
+    safe_review_url = escape(review_url, quote=True)
+    text_body = "\n".join([
+        "A plan upgrade request is waiting for review.",
+        "",
+        f"Organization: {organization_name}",
+        f"Request ID: {request_id}",
+        f"Requested by: {requested_by_email or 'Org admin'}",
+        "",
+        "Requested plans:",
+        requested_text,
+        "",
+        "Selected tools:",
+        tools_text or "No tools selected",
+        "",
+        "Reason:",
+        reason or "No reason provided",
+        "",
+        f"Review request: {review_url}",
+        "",
+        "ProbeStack"
+    ])
+    html_body = f"""
+    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
+      <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
+        <div style="background:#1e293b;padding:26px 30px;color:#ffffff;">
+          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#bae6fd;font-weight:700;">ProbeStack Admin</div>
+          <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Plan upgrade request received</h1>
+          <p style="margin:10px 0 0;color:#dbeafe;font-size:15px;">{safe_organization_name} requested a subscription change.</p>
+        </div>
+        <div style="padding:28px 30px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:10px 0;color:#64748b;width:150px;">Organization</td><td style="padding:10px 0;font-weight:700;color:#172033;">{safe_organization_name}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Request ID</td><td style="padding:10px 0;font-family:Consolas,Monaco,monospace;color:#172033;">{safe_request_id}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Requested by</td><td style="padding:10px 0;color:#172033;">{safe_requested_by}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Plans</td><td style="padding:10px 0;color:#172033;font-weight:700;line-height:1.6;">{safe_requested_html}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Tools</td><td style="padding:10px 0;color:#172033;line-height:1.6;">{safe_tools_html or 'No tools selected'}</td></tr>
+          </table>
+          <div style="margin-top:16px;padding:16px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;">
+            <div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;font-weight:700;">Reason</div>
+            <p style="margin:8px 0 0;font-size:14px;line-height:1.6;color:#172033;">{safe_reason}</p>
+          </div>
+          <div style="margin-top:24px;">
+            <a href="{safe_review_url}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:8px;font-size:14px;">Review upgrade request</a>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+    return send_email(notification_emails, subject, text_body, html_body)
+
+def send_user_request_admin_email(
+    *,
+    organization_name: str,
+    request_id: str,
+    requester_name: str,
+    requester_email: str,
+    requested_role: str,
+    job_title: Optional[str],
+    department: Optional[str],
+    phone: Optional[str],
+    notes: Optional[str],
+    to_emails: List[str],
+    notification_emails: List[str]
+) -> dict:
+    review_url = f"{APP_URL.rstrip('/')}/admin/my-user-requests"
+    subject = f"New user request for {organization_name}: {requester_name}"
+    safe_organization_name = escape(organization_name)
+    safe_requester_name = escape(requester_name)
+    safe_requester_email = escape(requester_email)
+    safe_requested_role = escape(requested_role)
+    safe_request_id = escape(request_id)
+    safe_job_title = escape(job_title or "Not provided")
+    safe_department = escape(department or "Not provided")
+    safe_phone = escape(phone or "Not provided")
+    safe_notes = escape(notes or "None")
+    safe_review_url = escape(review_url, quote=True)
+    text_body = "\n".join([
+        f"A user request is waiting for approval in {organization_name}.",
+        "",
+        f"Name: {requester_name}",
+        f"Email: {requester_email}",
+        f"Requested role: {requested_role}",
+        f"Job title: {job_title or 'Not provided'}",
+        f"Department: {department or 'Not provided'}",
+        f"Phone: {phone or 'Not provided'}",
+        "",
+        "Notes:",
+        notes or "None",
+        "",
+        f"Review request: {review_url}",
+        "",
+        "ProbeStack"
+    ])
+    html_body = f"""
+    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
+      <div style="max-width:660px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
+        <div style="background:#0f766e;padding:26px 30px;color:#ffffff;">
+          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#ccfbf1;font-weight:700;">ProbeStack Approval</div>
+          <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">New user request</h1>
+          <p style="margin:10px 0 0;color:#ccfbf1;font-size:15px;">{safe_requester_name} requested access to {safe_organization_name}.</p>
+        </div>
+        <div style="padding:28px 30px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:10px 0;color:#64748b;width:150px;">Request ID</td><td style="padding:10px 0;font-family:Consolas,Monaco,monospace;color:#172033;">{safe_request_id}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Name</td><td style="padding:10px 0;font-weight:700;color:#172033;">{safe_requester_name}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Email</td><td style="padding:10px 0;color:#172033;">{safe_requester_email}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Requested role</td><td style="padding:10px 0;color:#172033;font-weight:700;">{safe_requested_role}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Job title</td><td style="padding:10px 0;color:#172033;">{safe_job_title}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Department</td><td style="padding:10px 0;color:#172033;">{safe_department}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Phone</td><td style="padding:10px 0;color:#172033;">{safe_phone}</td></tr>
+          </table>
+          <div style="margin-top:16px;padding:16px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;">
+            <div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;font-weight:700;">Notes</div>
+            <p style="margin:8px 0 0;font-size:14px;line-height:1.6;color:#172033;">{safe_notes}</p>
+          </div>
+          <div style="margin-top:24px;">
+            <a href="{safe_review_url}" style="display:inline-block;background:#0f766e;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:8px;font-size:14px;">Review user request</a>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+    to_recipients = normalize_email_recipients(to_emails) or normalize_email_recipients(notification_emails)
+    return send_email(to_recipients, subject, text_body, html_body, bcc_email=notification_emails)
+
+def send_billing_invoice_email(
+    *,
+    organization_name: str,
+    invoice_number: str,
+    amount: float,
+    due_date: datetime,
+    to_emails: List[str],
+    notification_emails: List[str],
+    pdf_contents: bytes
+) -> dict:
+    subject = f"ProbeStack invoice {invoice_number}"
+    safe_organization_name = escape(organization_name)
+    safe_invoice_number = escape(invoice_number)
+    due_date_text = due_date.strftime("%Y-%m-%d")
+    amount_text = f"${amount:,.2f}"
+    text_body = "\n".join([
+        f"Hi {organization_name},",
+        "",
+        f"Please find attached ProbeStack invoice {invoice_number}.",
+        f"Amount due: {amount_text}",
+        f"Due date: {due_date_text}",
+        "",
+        "If you have questions about this invoice, please reply to this email.",
+        "",
+        "ProbeStack"
+    ])
+    html_body = f"""
+    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
+      <div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
+        <div style="background:#0f172a;padding:26px 30px;color:#ffffff;">
+          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#fde68a;font-weight:700;">ProbeStack Billing</div>
+          <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Invoice {safe_invoice_number}</h1>
+          <p style="margin:10px 0 0;color:#e2e8f0;font-size:15px;">Billing document for {safe_organization_name}</p>
+        </div>
+        <div style="padding:28px 30px;">
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Please find the invoice attached as a PDF.</p>
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:10px 0;color:#64748b;width:130px;">Amount due</td><td style="padding:10px 0;font-weight:700;color:#172033;">{amount_text}</td></tr>
+            <tr><td style="padding:10px 0;color:#64748b;">Due date</td><td style="padding:10px 0;color:#172033;">{due_date_text}</td></tr>
+          </table>
+          <p style="margin:18px 0 0;font-size:15px;line-height:1.6;color:#475569;">If you have questions about this invoice, please reply to this email.</p>
+        </div>
+      </div>
+    </div>
+    """
+    return send_email(
+        to_emails,
+        subject,
+        text_body,
+        html_body,
+        bcc_email=notification_emails,
+        attachments=[{
+            "filename": f"{invoice_number}.pdf",
+            "type": "application/pdf",
+            "content": pdf_contents,
+        }],
     )
 
 async def project_team_member_to_dict(db: AsyncSession, member: ProjectTeamMemberModel) -> dict:
@@ -8200,7 +8534,29 @@ async def request_plan_upgrade(data: PlanUpgradeCreate, payload: dict = Depends(
         requested_by=payload["sub"],
     )
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    try:
+        email_result = send_plan_upgrade_request_email(
+            organization_name=org.name,
+            request_id=created_requests[0].id,
+            requested_by_email=payload.get("email"),
+            requested_details=requested_plans_details,
+            reason=data.reason,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "Plan upgrade request email was not sent for %s: %s. To: %s. Bcc: %s",
+                created_requests[0].id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build plan upgrade request email for %s: %s", created_requests[0].id, exc)
+
     request_dicts = [await upgrade_request_to_dict(db, request) for request in created_requests]
     all_tools = []
     from_plan_names = []
@@ -8394,7 +8750,7 @@ async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = D
     requested_selections = normalize_plan_selections(data)
     if not requested_selections:
         raise HTTPException(status_code=400, detail="At least one plan must be selected")
-    created_requests, _ = await create_product_upgrade_requests(
+    created_requests, requested_plans_details = await create_product_upgrade_requests(
         db,
         org=org,
         organization_id=org_id,
@@ -8403,7 +8759,29 @@ async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = D
         requested_by=payload["sub"],
     )
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
+
+    try:
+        email_result = send_plan_upgrade_request_email(
+            organization_name=org.name,
+            request_id=created_requests[0].id,
+            requested_by_email=payload.get("email"),
+            requested_details=requested_plans_details,
+            reason=data.reason,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "Plan upgrade request email was not sent for %s: %s. To: %s. Bcc: %s",
+                created_requests[0].id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build plan upgrade request email for %s: %s", created_requests[0].id, exc)
+
     request_dicts = [await upgrade_request_to_dict(db, request) for request in created_requests]
     if len(request_dicts) == 1:
         return request_dicts[0]
@@ -9272,7 +9650,34 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
     )
     db.add(notification)
 
+    notification_emails = await get_notification_group_emails(db)
+    org_admin_emails = await get_org_admin_emails(db, matched_org.id)
     await db.commit()
+
+    try:
+        email_result = send_user_request_admin_email(
+            organization_name=matched_org.name,
+            request_id=user_request.id,
+            requester_name=user_request.name,
+            requester_email=email,
+            requested_role=default_role.name,
+            job_title=None,
+            department=None,
+            phone=None,
+            notes=None,
+            to_emails=org_admin_emails,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "User request email was not sent for %s: %s. To: %s. Bcc: %s",
+                user_request.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build user request email for %s: %s", user_request.id, exc)
 
     return {
         "success": True,
@@ -11582,6 +11987,7 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
     
     notif = NotificationModel(title="Organization Approved", message=f"{org.name} has been approved", type="success")
     db.add(notif)
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
 
     try:
@@ -11589,6 +11995,7 @@ async def approve_organization(org_id: str, payload: dict = Depends(require_supe
             organization_name=org.name,
             organization_email=org.email,
             contact_person=org.contact_person,
+            notification_emails=notification_emails,
         )
         if not email_result.get("sent"):
             logger.warning(
@@ -12836,6 +13243,72 @@ async def download_billing_invoice_pdf(billing_id: str, payload: dict = Depends(
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
+@api_router.get("/billing/{billing_id}/email-recipients")
+async def get_billing_invoice_email_recipients(billing_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(BillingModel).where(BillingModel.id == billing_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Billing record not found")
+    return await get_billing_invoice_recipient_options(db, record.organization_id)
+
+@api_router.post("/billing/{billing_id}/send-email")
+async def send_billing_invoice_by_email(
+    billing_id: str,
+    data: BillingInvoiceEmailRequest,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    to_emails = normalize_email_recipients(data.emails)
+    if not to_emails:
+        raise HTTPException(status_code=400, detail="At least one recipient email is required")
+
+    result = await db.execute(select(BillingModel).where(BillingModel.id == billing_id))
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="Billing record not found")
+
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == record.organization_id))
+    organization = org_result.scalar_one_or_none()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    line_items = await build_invoice_line_items(db, record.organization_id)
+    if not line_items:
+        raise HTTPException(status_code=400, detail="No active subscriptions found for this organization")
+
+    billing_date = record.billing_date
+    if billing_date.tzinfo is None:
+        billing_date = billing_date.replace(tzinfo=timezone.utc)
+    due_date = record.due_date if record.due_date.tzinfo else record.due_date.replace(tzinfo=timezone.utc)
+    invoice = {
+        "invoice_number": record.invoice_number,
+        "billing_date": billing_date,
+        "due_date": due_date,
+        "period_start": datetime(billing_date.year, 1, 1, tzinfo=timezone.utc),
+        "period_end": datetime(billing_date.year, 12, 31, tzinfo=timezone.utc),
+        "status": record.status,
+        "organization": model_to_dict(organization, ["requested_tools", "supported_domains", "gateway_environments", "compliance_standards"]),
+    }
+    pdf_contents = build_invoice_pdf(invoice, line_items)
+    notification_emails = await get_notification_group_emails(db)
+    await db.commit()
+
+    email_result = send_billing_invoice_email(
+        organization_name=organization.name,
+        invoice_number=record.invoice_number,
+        amount=float(record.amount or 0),
+        due_date=due_date,
+        to_emails=to_emails,
+        notification_emails=notification_emails,
+        pdf_contents=pdf_contents,
+    )
+    if not email_result.get("sent"):
+        raise HTTPException(status_code=502, detail=email_result.get("reason", "Failed to send invoice email"))
+    return {
+        "message": "Invoice email sent successfully",
+        "email": email_result,
+    }
+
 @api_router.post("/billing/{billing_id}/mark-paid")
 async def mark_billing_paid(billing_id: str, payment_method: str = "card", payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
@@ -12948,6 +13421,72 @@ async def generate_monthly_bills(payload: dict = Depends(require_super_admin), d
     return await generate_annual_billing_records(db)
 
 # ==================== NOTIFICATIONS ROUTES (Super Admin Only) ====================
+
+@api_router.get("/notifications/group-emails")
+async def get_notification_group_email_records(payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    await ensure_notification_group_seeded(db)
+    await db.commit()
+    result = await db.execute(select(NotificationGroupEmailModel).order_by(NotificationGroupEmailModel.created_at.asc()))
+    return [model_to_dict(email_record) for email_record in result.scalars().all()]
+
+@api_router.post("/notifications/group-emails")
+async def create_notification_group_email(data: NotificationGroupEmailCreate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    email = (data.email or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    await ensure_notification_group_seeded(db)
+    existing = await db.execute(
+        select(NotificationGroupEmailModel).where(func.lower(NotificationGroupEmailModel.email) == email.lower())
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Email already exists in notification group")
+    email_record = NotificationGroupEmailModel(
+        email=email,
+        name=(data.name or "").strip() or None,
+        is_active=data.is_active if data.is_active is not None else True,
+    )
+    db.add(email_record)
+    await db.commit()
+    await db.refresh(email_record)
+    return model_to_dict(email_record)
+
+@api_router.put("/notifications/group-emails/{email_id}")
+async def update_notification_group_email(email_id: str, data: NotificationGroupEmailUpdate, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    await ensure_notification_group_seeded(db)
+    result = await db.execute(select(NotificationGroupEmailModel).where(NotificationGroupEmailModel.id == email_id))
+    email_record = result.scalar_one_or_none()
+    if not email_record:
+        raise HTTPException(status_code=404, detail="Notification group email not found")
+    if data.email is not None:
+        email = data.email.strip()
+        if not email:
+            raise HTTPException(status_code=400, detail="Email is required")
+        duplicate = await db.execute(
+            select(NotificationGroupEmailModel).where(
+                NotificationGroupEmailModel.id != email_id,
+                func.lower(NotificationGroupEmailModel.email) == email.lower(),
+            )
+        )
+        if duplicate.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Email already exists in notification group")
+        email_record.email = email
+    if data.name is not None:
+        email_record.name = data.name.strip() or None
+    if data.is_active is not None:
+        email_record.is_active = data.is_active
+    email_record.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(email_record)
+    return model_to_dict(email_record)
+
+@api_router.delete("/notifications/group-emails/{email_id}")
+async def delete_notification_group_email(email_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    await ensure_notification_group_seeded(db)
+    result = await db.execute(delete(NotificationGroupEmailModel).where(NotificationGroupEmailModel.id == email_id))
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Notification group email not found")
+    await db.commit()
+    return {"message": "Notification group email deleted"}
 
 @api_router.get("/notifications")
 async def get_notifications(unread_only: bool = False, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
@@ -13189,6 +13728,7 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
     await db.commit()
 
     try:
@@ -13204,6 +13744,7 @@ async def request_organization_subscription(data: OrganizationRequest, db: Async
             additional_notes=data.additional_notes,
             plans=plans_str,
             selected_tools=tools_str,
+            notification_emails=notification_emails,
         )
         if not email_result.get("sent"):
             logger.warning(
@@ -13749,7 +14290,34 @@ async def request_user_addition(data: UserRequestCreate, db: AsyncSession = Depe
     )
     db.add(notif)
     
+    notification_emails = await get_notification_group_emails(db)
+    org_admin_emails = await get_org_admin_emails(db, org.id)
     await db.commit()
+
+    try:
+        email_result = send_user_request_admin_email(
+            organization_name=org.name,
+            request_id=user_request.id,
+            requester_name=data.name,
+            requester_email=data.email,
+            requested_role=requested_role,
+            job_title=data.job_title,
+            department=data.department,
+            phone=data.phone,
+            notes=data.notes,
+            to_emails=org_admin_emails,
+            notification_emails=notification_emails,
+        )
+        if not email_result.get("sent"):
+            logger.warning(
+                "User request email was not sent for %s: %s. To: %s. Bcc: %s",
+                user_request.id,
+                email_result.get("reason", "unknown reason"),
+                email_result.get("to"),
+                email_result.get("bcc"),
+            )
+    except Exception as exc:
+        logger.error("Failed to build user request email for %s: %s", user_request.id, exc)
     
     return {
         "request_id": user_request.id,
