@@ -2459,6 +2459,16 @@ def standard_role_slug(name: str) -> str:
 def zitadel_role_key_for_role(role_name: Optional[str]) -> str:
     return standard_role_slug(role_name or "role")
 
+def is_org_admin_role_name(role_name: Optional[str]) -> bool:
+    role_slug = standard_role_slug(role_name or "")
+    return role_slug in {"org_admin", "org_admin_owner", "organization_admin", "organization_owner"}
+
+def is_org_admin_role(role: Optional["RoleModel"]) -> bool:
+    if not role:
+        return False
+    permissions = parse_json_list(getattr(role, "permissions", None))
+    return is_org_admin_role_name(getattr(role, "name", None)) or "platform_admin:admin" in permissions
+
 DEFAULT_CONSUMER_ROLE_SLUG = os.environ.get("DEFAULT_CONSUMER_ROLE_SLUG", "api_agent_consumer")
 DEFAULT_READ_ONLY_ROLE_SLUG = os.environ.get("DEFAULT_READ_ONLY_ROLE_SLUG", "read_only_auditor")
 
@@ -3988,11 +3998,12 @@ async def build_business_unit_context(
     user: Optional[UserModel],
     admin: Optional[AdminModel],
     organization_id: Optional[str],
+    role_is_org_admin: bool = False,
 ) -> dict:
     business_units_by_id = {}
     projects_without_business_unit = []
     project_memberships = []
-    is_org_admin = bool(admin and admin.role == "org_admin")
+    is_org_admin = bool(admin and admin.role == "org_admin") or role_is_org_admin
     is_super_admin = bool(admin and admin.role == "super_admin")
 
     if not organization_id or await is_individual_users_org_id(db, organization_id) or is_super_admin:
@@ -4115,15 +4126,38 @@ async def build_user_context(
     mongodb_role_lookup = await sync_user_role_from_mongodb(db, user, organization) if user else None
 
     role = None
+    assigned_roles = []
     role_permissions = []
     if user:
-        role_result = await db.execute(select(RoleModel).where(RoleModel.id == user.role_id))
-        role = role_result.scalar_one_or_none()
-        role_permissions = parse_json_list(role.permissions) if role and role.permissions else []
+        assigned_roles = await get_user_assigned_roles(db, user)
+        role = assigned_roles[0] if assigned_roles else None
+        for assigned_role in assigned_roles:
+            role_permissions.extend(parse_json_list(assigned_role.permissions))
 
     admin_permissions = []
     if admin:
         admin_permissions = ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"]
+
+    role_is_org_admin = any(is_org_admin_role(assigned_role) for assigned_role in assigned_roles)
+    is_org_admin = bool(admin and admin.role == "org_admin") or role_is_org_admin
+    is_super_admin = bool(admin and admin.role == "super_admin")
+    permissions = list(dict.fromkeys(role_permissions + admin_permissions))
+    admin_context = None
+    if admin:
+        admin_context = {
+            "id": admin.id,
+            "role": admin.role,
+            "is_active": admin.is_active,
+            "permissions": admin_permissions,
+        }
+    elif role_is_org_admin and user:
+        admin_context = {
+            "id": user.id,
+            "role": "org_admin",
+            "is_active": user.status == "active",
+            "permissions": permissions,
+            "source": "user_role",
+        }
 
     subscriptions = await get_active_subscriptions_for_identity(
         db,
@@ -4136,6 +4170,7 @@ async def build_user_context(
         user=user,
         admin=admin,
         organization_id=organization_id,
+        role_is_org_admin=role_is_org_admin,
     )
 
     now = datetime.now(timezone.utc)
@@ -4146,10 +4181,6 @@ async def build_user_context(
         if zitadel_user_id and not user.zitadel_user_id:
             user.zitadel_user_id = zitadel_user_id
         await db.flush()
-
-    is_org_admin = bool(admin and admin.role == "org_admin")
-    is_super_admin = bool(admin and admin.role == "super_admin")
-    permissions = list(dict.fromkeys(role_permissions + admin_permissions))
 
     return {
         "user": {
@@ -4179,13 +4210,9 @@ async def build_user_context(
             "permissions": role_permissions,
         },
         "org_role_name": role.name if role else (admin.role if admin else None),
-        "admin": {
-            "id": admin.id,
-            "role": admin.role,
-            "is_active": admin.is_active,
-            "permissions": admin_permissions,
-        } if admin else None,
-        "is_admin": bool(admin),
+        "roles": roles_to_dict_list(assigned_roles),
+        "admin": admin_context,
+        "is_admin": bool(admin_context),
         "is_org_admin": is_org_admin,
         "is_super_admin": is_super_admin,
         "account_type": "individual" if is_individual_identity else "enterprise",
@@ -5062,9 +5089,12 @@ def require_super_admin(payload: dict = Depends(verify_token)):
         raise HTTPException(status_code=403, detail="Super admin access required")
     return payload
 
+def payload_has_org_admin_role(payload: dict) -> bool:
+    return standard_role_slug(payload.get("role") or "") in {"org_admin", "org_admin_owner"}
+
 def require_any_admin(payload: dict = Depends(verify_token)):
     """Dependency to require any admin role"""
-    if payload.get("role") not in ["super_admin", "org_admin"]:
+    if payload.get("role") != "super_admin" and not payload_has_org_admin_role(payload):
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload
 
@@ -5073,7 +5103,7 @@ async def get_subscription_access_scope(db: AsyncSession, payload: dict) -> dict
     if payload.get("role") == "super_admin" and payload.get("token_type") != "probestack_user_context":
         return {"scope": "all"}
 
-    if payload.get("role") == "org_admin" and payload.get("organization_id"):
+    if payload_has_org_admin_role(payload) and payload.get("organization_id"):
         return {"scope": "organization", "organization_id": payload.get("organization_id")}
 
     subject = payload.get("sub")
@@ -5114,7 +5144,7 @@ async def get_authenticated_data_scope(db: AsyncSession, payload: dict) -> dict:
     if payload.get("role") == "super_admin" and payload.get("token_type") != "probestack_user_context":
         return {"scope": "all"}
 
-    if payload.get("role") == "org_admin" and payload.get("organization_id"):
+    if payload_has_org_admin_role(payload) and payload.get("organization_id"):
         return {"scope": "organization", "organization_id": payload.get("organization_id")}
 
     subject = payload.get("sub")
@@ -5266,7 +5296,7 @@ async def get_individual_default_plan_ids(db: AsyncSession) -> List[str]:
 
 async def get_approved_org_for_admin(payload: dict, db: AsyncSession) -> OrganizationModel:
     """Return the approved organization for the current org admin."""
-    if payload.get("role") != "org_admin":
+    if not payload_has_org_admin_role(payload):
         raise HTTPException(status_code=403, detail="Organization admin access required")
 
     org_id = payload.get("organization_id")
@@ -8332,14 +8362,13 @@ async def update_user_role_assignment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    requester_role = payload.get("role")
     requester_org_id = payload.get("organization_id")
-    if requester_role == "org_admin":
+    if payload_has_org_admin_role(payload):
         if not requester_org_id:
             raise HTTPException(status_code=403, detail="Organization admin is not linked to an organization")
         if user.organization_id != requester_org_id:
             raise HTTPException(status_code=403, detail="Organization admins can only update users in their organization")
-    elif requester_role != "super_admin":
+    elif payload.get("role") != "super_admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
     await ensure_standard_roles_for_organization(db, user.organization_id)
@@ -9139,7 +9168,7 @@ async def get_pending_plan_upgrade_requests(payload: dict = Depends(require_supe
 async def create_plan_upgrade_request(data: PlanUpgradeCreate, payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
     """Create a plan upgrade request (org admin only)"""
     # Only org_admin can request upgrades for their organization
-    if payload.get("role") != "org_admin":
+    if not payload_has_org_admin_role(payload):
         raise HTTPException(status_code=403, detail="Only organization admins can request plan upgrades")
     
     org_id = payload.get("organization_id")
@@ -9627,7 +9656,7 @@ async def get_organization_users_with_roles(
     db: AsyncSession = Depends(get_db)
 ):
     """Get organization users with compact org, Business unit, and team role details."""
-    if payload.get("role") == "org_admin" and payload.get("organization_id") != org_id:
+    if payload_has_org_admin_role(payload) and payload.get("organization_id") != org_id:
         raise HTTPException(status_code=403, detail="Organization admin access required for this organization")
 
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
