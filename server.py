@@ -4389,12 +4389,8 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "iss": PROBESTACK_TOKEN_ISSUER,
         "aud": PROBESTACK_TOKEN_AUDIENCE,
         "sub": user["id"],
-        "email": user["email"],
         "name": user.get("name") or user["email"],
         "type": "user",
-        "role": token_role,
-        "organization_id": organization.get("id"),
-        "organization_name": organization.get("name"),
         "userId": user["id"],
         "userEmail": user["email"],
         "userRole": token_role,
@@ -4408,7 +4404,6 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "is_super_admin": bool(user_context.get("is_super_admin")),
         "role_assignments": build_role_assignments_claim(user_context),
         "entitlements": build_entitlements_claim(user_context),
-        "token_type": "probestack_user_context",
         "jti": str(uuid.uuid4()),
         "iat": issued_at,
         "nbf": issued_at,
@@ -4426,6 +4421,29 @@ def create_user_context_token(user_context: dict) -> tuple[str, int]:
         algorithm=PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
         headers=headers,
     ), expires_at
+
+def strip_context_response_keys(value: Any, keys_to_remove: set[str]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_context_response_keys(item, keys_to_remove)
+            for key, item in value.items()
+            if key not in keys_to_remove
+        }
+    if isinstance(value, list):
+        return [strip_context_response_keys(item, keys_to_remove) for item in value]
+    return value
+
+def build_context_token_response_user_context(user_context: dict) -> dict:
+    response_context = strip_context_response_keys(user_context, {"api_count"})
+    organization = response_context.get("organization")
+    if isinstance(organization, dict):
+        organization.pop("id", None)
+        organization.pop("name", None)
+    for subscription in response_context.get("subscriptions") or []:
+        if isinstance(subscription, dict):
+            subscription.pop("organization_id", None)
+            subscription.pop("organization_name", None)
+    return response_context
 
 async def billing_to_dict(db: AsyncSession, billing: BillingModel) -> dict:
     data = model_to_dict(billing)
@@ -4986,6 +5004,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         header = jwt.get_unverified_header(token)
         algorithm = header.get("alg")
+        is_context_token = algorithm == PROBESTACK_CONTEXT_TOKEN_ALGORITHM
         if algorithm == PROBESTACK_CONTEXT_TOKEN_ALGORITHM:
             payload = jwt.decode(
                 token,
@@ -5001,6 +5020,12 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
                 algorithms=[JWT_ALGORITHM],
                 options={"verify_aud": False},
             )
+        if is_context_token:
+            payload.setdefault("email", payload.get("userEmail"))
+            payload.setdefault("role", payload.get("userRole"))
+            payload.setdefault("organization_id", payload.get("userOrgId"))
+            payload.setdefault("organization_name", payload.get("userOrgName"))
+            payload.setdefault("token_type", "probestack_user_context")
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -15098,8 +15123,8 @@ async def issue_user_context_token(
     """
     Issue a signed ProbeStack context token after probestack.io login.
 
-    The JWT payload contains user, organization, org role, Business unit/project roles,
-    admin flags, subscriptions, plans, and tools.
+    The JWT payload contains normalized user, organization, role, admin flag,
+    role assignment, and entitlement claims. Full context is returned separately.
     """
     email = data.email.lower().strip() if data.email else None
     auth0_user_id = data.auth0_user_id
@@ -15146,7 +15171,7 @@ async def issue_user_context_token(
         "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
         "cookie_set": True,
-        "user": user_context,
+        "user": build_context_token_response_user_context(user_context),
     }
 
 
