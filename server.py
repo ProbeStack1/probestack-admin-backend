@@ -15186,6 +15186,37 @@ async def issue_user_context_token(
         "user": build_context_token_response_user_context(user_context),
     }
 
+@api_router.get("/public/users/context-token/me", tags=["Public API"])
+async def get_user_context_from_signed_token(
+    payload: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return current user context using an existing signed ProbeStack context token.
+    """
+    if payload.get("token_type") != "probestack_user_context":
+        raise HTTPException(status_code=403, detail="ProbeStack context token required")
+
+    email = (payload.get("userEmail") or payload.get("email") or "").strip().lower() or None
+    user_id = payload.get("userId") or payload.get("sub")
+    auth0_user_id = payload.get("auth0_user_id")
+    zitadel_user_id = payload.get("zitadel_user_id")
+
+    user_context = await build_user_context(
+        db,
+        email=email,
+        auth0_user_id=auth0_user_id,
+        zitadel_user_id=zitadel_user_id,
+    )
+    if user_id and user_context.get("user", {}).get("id") != user_id:
+        raise HTTPException(status_code=403, detail="Token user does not match current user")
+
+    await db.commit()
+    return {
+        "success": True,
+        "user": build_context_token_response_user_context(user_context),
+    }
+
 
 @api_router.get("/public/users/{email}", tags=["Public API"])
 async def get_user_by_email(email: str, payload: dict = Depends(verify_token), db: AsyncSession = Depends(get_db)):
