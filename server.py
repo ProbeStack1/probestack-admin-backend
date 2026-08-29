@@ -212,6 +212,7 @@ SENDGRID_API_URL = os.environ.get("SENDGRID_API_URL", "https://api.sendgrid.com/
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL") or SMTP_FROM_EMAIL or "info@probestack.io"
 SENDGRID_FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", SMTP_FROM_NAME)
+PROBESTACK_LOGO_URL = os.environ.get("PROBESTACK_LOGO_URL", f"{APP_URL.rstrip('/')}/admin/assets/probestack-logo.png")
 DEFAULT_ADMIN_NOTIFICATION_EMAILS = "admin@forgecrux.com,admin@probestack.io,saili.jaguste@probestack.io,saili.jaguste@gmail.com"
 ORG_REQUEST_NOTIFICATION_EMAILS = ",".join(
     value for value in [
@@ -6363,6 +6364,28 @@ def send_email(
             "bcc": bcc_emails
         }
 
+def build_probestack_email_logo_html(
+    label: str = "ProbeStack",
+    *,
+    text_color: str = "#ffffff",
+    accent_color: str = "#cbd5e1",
+) -> str:
+    safe_logo_url = escape(PROBESTACK_LOGO_URL, quote=True)
+    safe_label = escape(label)
+    return f"""
+          <table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 0 18px;">
+            <tr>
+              <td style="vertical-align:middle;padding:0 12px 0 0;">
+                <img src="{safe_logo_url}" width="42" height="42" alt="ProbeStack logo" style="display:block;width:42px;height:42px;border:0;border-radius:10px;">
+              </td>
+              <td style="vertical-align:middle;">
+                <div style="font-size:18px;line-height:1.1;font-weight:800;color:{text_color};">ProbeStack</div>
+                <div style="margin-top:4px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:{accent_color};font-weight:700;">{safe_label}</div>
+              </td>
+            </tr>
+          </table>
+    """
+
 def send_project_invite_email(
     *,
     to_email: str,
@@ -6396,12 +6419,22 @@ def send_project_invite_email(
         "ProbeStack"
     ])
     html_body = f"""
-    <p>Hi {safe_invitee_name},</p>
-    <p>You have been invited to the <strong>{safe_project_name}</strong> project in <strong>{safe_organization_name}</strong> as <strong>{safe_project_role}</strong>.</p>
-    <p>Invited by: {safe_invited_by}</p>
-    <p><a href="{safe_action_url}">{safe_action_label}</a></p>
-    <p>If you were not expecting this invitation, you can ignore this email.</p>
-    <p>ProbeStack</p>
+    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
+      <div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
+        <div style="background:#0f172a;padding:24px 30px 20px;color:#ffffff;">
+          {build_probestack_email_logo_html("Project Invitation", accent_color="#cbd5e1")}
+          <h1 style="margin:0;font-size:24px;line-height:1.3;font-weight:700;">You have been invited to a project</h1>
+          <p style="margin:10px 0 0;color:#cbd5e1;font-size:15px;">{safe_project_name} in {safe_organization_name}</p>
+        </div>
+        <div style="padding:28px 30px;">
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Hi {safe_invitee_name},</p>
+          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">You have been invited to the <strong>{safe_project_name}</strong> project in <strong>{safe_organization_name}</strong> as <strong>{safe_project_role}</strong>.</p>
+          <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#475569;">Invited by: {safe_invited_by}</p>
+          <a href="{safe_action_url}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:8px;font-size:14px;">{safe_action_label}</a>
+          <p style="margin:22px 0 0;font-size:13px;line-height:1.6;color:#64748b;">If you were not expecting this invitation, you can ignore this email.</p>
+        </div>
+      </div>
+    </div>
     """
     result = send_email(to_email, subject, text_body, html_body)
     if setup_url:
@@ -6474,7 +6507,7 @@ def send_new_organization_request_email(
     <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
       <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
         <div style="background:#0f172a;padding:26px 30px;color:#ffffff;">
-          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#93c5fd;font-weight:700;">ProbeStack Admin</div>
+          {build_probestack_email_logo_html("Admin", accent_color="#93c5fd")}
           <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">New organization request received</h1>
           <p style="margin:10px 0 0;color:#cbd5e1;font-size:15px;">{safe_organization_name} is waiting for review in the admin panel.</p>
         </div>
@@ -6563,7 +6596,7 @@ def send_organization_approval_email(
     <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
       <div style="max-width:640px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
         <div style="background:#064e3b;padding:28px 30px;color:#ffffff;">
-          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#a7f3d0;font-weight:700;">ProbeStack</div>
+          {build_probestack_email_logo_html("Organization Approved", accent_color="#a7f3d0")}
           <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Your organization request is approved</h1>
           <p style="margin:10px 0 0;color:#d1fae5;font-size:15px;">We are ready to move forward with {safe_organization_name}.</p>
         </div>
@@ -6653,7 +6686,7 @@ def send_request_decision_email(
     <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
       <div style="max-width:640px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
         <div style="background:{header_color};padding:28px 30px;color:#ffffff;">
-          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:{accent_color};font-weight:700;">ProbeStack</div>
+          {build_probestack_email_logo_html(f"Request {status_label}", accent_color=accent_color)}
           <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Request {safe_status_label}</h1>
           <p style="margin:10px 0 0;color:{accent_color};font-size:15px;">Your {safe_request_name} for {safe_organization_name} has been {safe_status_label}.</p>
         </div>
@@ -6734,7 +6767,7 @@ def send_plan_upgrade_request_email(
     <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
       <div style="max-width:680px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
         <div style="background:#1e293b;padding:26px 30px;color:#ffffff;">
-          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#bae6fd;font-weight:700;">ProbeStack Admin</div>
+          {build_probestack_email_logo_html("Admin", accent_color="#bae6fd")}
           <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Plan upgrade request received</h1>
           <p style="margin:10px 0 0;color:#dbeafe;font-size:15px;">{safe_organization_name} requested a subscription change.</p>
         </div>
@@ -6806,7 +6839,7 @@ def send_user_request_admin_email(
     <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
       <div style="max-width:660px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
         <div style="background:#0f766e;padding:26px 30px;color:#ffffff;">
-          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#ccfbf1;font-weight:700;">ProbeStack Approval</div>
+          {build_probestack_email_logo_html("Approval", accent_color="#ccfbf1")}
           <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">New user request</h1>
           <p style="margin:10px 0 0;color:#ccfbf1;font-size:15px;">{safe_requester_name} requested access to {safe_organization_name}.</p>
         </div>
@@ -6864,7 +6897,7 @@ def send_billing_invoice_email(
     <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
       <div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
         <div style="background:#0f172a;padding:26px 30px;color:#ffffff;">
-          <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#fde68a;font-weight:700;">ProbeStack Billing</div>
+          {build_probestack_email_logo_html("Billing", accent_color="#fde68a")}
           <h1 style="margin:10px 0 0;font-size:24px;line-height:1.3;font-weight:700;">Invoice {safe_invoice_number}</h1>
           <p style="margin:10px 0 0;color:#e2e8f0;font-size:15px;">Billing document for {safe_organization_name}</p>
         </div>
