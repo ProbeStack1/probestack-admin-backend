@@ -5034,11 +5034,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
                 options={"verify_aud": False},
             )
         if is_context_token:
-            payload.setdefault("email", payload.get("userEmail"))
-            payload.setdefault("role", payload.get("userRole"))
-            payload.setdefault("organization_id", payload.get("userOrgId"))
-            payload.setdefault("organization_name", payload.get("userOrgName"))
-            payload.setdefault("token_type", "probestack_user_context")
+            payload = normalize_context_token_claim_aliases(payload)
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -5049,6 +5045,16 @@ def optional_verify_token(credentials: Optional[HTTPAuthorizationCredentials] = 
     if not credentials:
         return None
     return verify_token(credentials)
+
+def normalize_context_token_claim_aliases(payload: dict) -> dict:
+    if not payload:
+        return {}
+    payload.setdefault("email", payload.get("userEmail"))
+    payload.setdefault("role", payload.get("userRole"))
+    payload.setdefault("organization_id", payload.get("userOrgId"))
+    payload.setdefault("organization_name", payload.get("userOrgName"))
+    payload.setdefault("token_type", "probestack_user_context")
+    return payload
 
 def normalized_issuer_url(value: str) -> str:
     issuer = (value or "").strip().rstrip("/")
@@ -15188,14 +15194,19 @@ async def issue_user_context_token(
 
 @api_router.get("/public/users/context-token/me", tags=["Public API"])
 async def get_user_context_from_signed_token(
-    payload: dict = Depends(verify_token),
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Return current user context using an existing signed ProbeStack context token.
+    Return current user context using the signed ProbeStack context token cookie.
     """
+    token = request.cookies.get("ps_auth_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="ProbeStack context token cookie required")
+
+    payload = normalize_context_token_claim_aliases(verify_context_token_claims(token))
     if payload.get("token_type") != "probestack_user_context":
-        raise HTTPException(status_code=403, detail="ProbeStack context token required")
+        raise HTTPException(status_code=401, detail="Invalid ProbeStack context token cookie")
 
     email = (payload.get("userEmail") or payload.get("email") or "").strip().lower() or None
     user_id = payload.get("userId") or payload.get("sub")
