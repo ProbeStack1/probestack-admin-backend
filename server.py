@@ -143,6 +143,8 @@ DB_NAME = os.environ.get("DB_NAME")
 DB_HOST = os.environ.get("DB_HOST", "127.0.0.1")
 DB_PORT = os.environ.get("DB_PORT", "3306")
 INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME")
+RUN_RUNTIME_SCHEMA_MIGRATIONS = os.environ.get("RUN_RUNTIME_SCHEMA_MIGRATIONS", "true").lower() in ["1", "true", "yes"]
+REQUIRE_RUNTIME_SCHEMA_MIGRATIONS = os.environ.get("REQUIRE_RUNTIME_SCHEMA_MIGRATIONS", "false").lower() in ["1", "true", "yes"]
 
 if DB_USER is None or DB_PASSWORD is None or DB_NAME is None:
     raise RuntimeError("Database environment variables not set")
@@ -15937,6 +15939,27 @@ async def db_health_check(db: AsyncSession = Depends(get_db)):
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
+@api_router.post("/admin/schema/runtime/apply", tags=["Admin Schema"])
+async def apply_runtime_schema(payload: dict = Depends(require_super_admin)):
+    """
+    Apply runtime database schema updates.
+
+    This is useful after granting ALTER permission to the backend DB user when a
+    deployed instance is already running.
+    """
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await ensure_runtime_schema(conn)
+        return {
+            "message": "Runtime schema applied",
+            "database": DB_NAME,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as exc:
+        logger.exception("Runtime schema apply failed")
+        raise HTTPException(status_code=500, detail=f"Runtime schema apply failed: {exc}")
+
 # Include the router
 app.include_router(api_router)
 
@@ -16110,13 +16133,23 @@ async def ensure_runtime_schema(conn):
 
 @app.on_event("startup")
 async def startup():
+    if not RUN_RUNTIME_SCHEMA_MIGRATIONS:
+        logger.info("Runtime schema migrations are disabled by RUN_RUNTIME_SCHEMA_MIGRATIONS")
+        return
     try:
+        logger.info("Applying runtime database schema migrations")
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await ensure_runtime_schema(conn)
+        logger.info("Runtime database schema migrations applied")
     except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-        logger.warning("Server is starting without a successful database connection.")
+        logger.exception("Database initialization failed")
+        if REQUIRE_RUNTIME_SCHEMA_MIGRATIONS:
+            raise
+        logger.warning(
+            "Server is starting without successful runtime schema migration. "
+            "Set REQUIRE_RUNTIME_SCHEMA_MIGRATIONS=true to fail startup on this error."
+        )
 
 @app.on_event("shutdown")
 async def shutdown():
