@@ -4437,8 +4437,12 @@ def build_context_token_response_user_context(user_context: dict) -> dict:
     response_context = strip_context_response_keys(user_context, {"api_count"})
     organization = response_context.get("organization")
     if isinstance(organization, dict):
+        backend_org_id = organization.get("id")
         organization.pop("id", None)
         organization.pop("name", None)
+        organization.pop("auth0_org_id", None)
+        organization.pop("zitadel_org_id", None)
+        organization["backend_org_id"] = backend_org_id
     for subscription in response_context.get("subscriptions") or []:
         if isinstance(subscription, dict):
             subscription.pop("organization_id", None)
@@ -15166,7 +15170,6 @@ async def issue_user_context_token(
         "token_algorithm": PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
         "kid": PROBESTACK_CONTEXT_TOKEN_KID,
         "issuer": PROBESTACK_TOKEN_ISSUER,
-        "audience": PROBESTACK_TOKEN_AUDIENCE,
         "jwks_uri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
         "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
