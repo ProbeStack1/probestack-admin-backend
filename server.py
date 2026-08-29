@@ -2408,7 +2408,12 @@ async def get_user_assigned_roles(db: AsyncSession, user: UserModel) -> List[Rol
     return ordered_roles
 
 def roles_to_dict_list(roles: List[RoleModel]) -> List[dict]:
-    return [model_to_dict(role, ["permissions"]) for role in roles]
+    role_items = []
+    for role in roles:
+        item = model_to_dict(role, ["permissions"])
+        item["key"] = "org_admin" if is_org_admin_role(role) else standard_role_slug(role.name)
+        role_items.append(item)
+    return role_items
 
 async def replace_user_role_assignments(db: AsyncSession, user: UserModel, roles: List[RoleModel]) -> None:
     if not roles:
@@ -4371,13 +4376,14 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
     organization = user_context.get("organization") or {}
     admin = user_context.get("admin") or {}
     org_role = user_context.get("org_role") or {}
+    role_display_name = org_role.get("name") or admin.get("role") or "user"
 
     if user_context.get("is_super_admin"):
         token_role = "super_admin"
     elif user_context.get("is_org_admin"):
         token_role = "org_admin"
     else:
-        token_role = normalize_token_value(org_role.get("name"), "user")
+        token_role = normalize_token_value(role_display_name, "user")
 
     return {
         "iss": PROBESTACK_TOKEN_ISSUER,
@@ -4391,7 +4397,8 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "organization_name": organization.get("name"),
         "userId": user["id"],
         "userEmail": user["email"],
-        "userRole": org_role.get("name") or token_role,
+        "userRole": token_role,
+        "userRoleName": role_display_name,
         "userOrgId": organization.get("id"),
         "userOrgName": organization.get("name"),
         "tokenType": user_context.get("account_type", "enterprise"),
