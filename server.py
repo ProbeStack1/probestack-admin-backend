@@ -4395,6 +4395,7 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "role": token_role,
         "organization_id": organization.get("id"),
         "organization_name": organization.get("name"),
+        "org_name": organization.get("name"),
         "backendOrgId": organization.get("id"),
         "userId": user["id"],
         "userEmail": user["email"],
@@ -4447,11 +4448,17 @@ def build_context_token_response_user_context(user_context: dict) -> dict:
     organization = response_context.get("organization")
     if isinstance(organization, dict):
         backend_org_id = organization.get("id")
+        organization_name = organization.get("name")
+        response_context["organization_name"] = organization_name
+        response_context["org_name"] = organization_name
         organization.pop("id", None)
         organization.pop("name", None)
         organization.pop("auth0_org_id", None)
         organization.pop("zitadel_org_id", None)
         organization["backend_org_id"] = backend_org_id
+        organization["name"] = organization_name
+        organization["organization_name"] = organization_name
+        organization["org_name"] = organization_name
     for subscription in response_context.get("subscriptions") or []:
         if isinstance(subscription, dict):
             subscription.pop("organization_id", None)
@@ -5049,10 +5056,16 @@ def optional_verify_token(credentials: Optional[HTTPAuthorizationCredentials] = 
 def normalize_context_token_claim_aliases(payload: dict) -> dict:
     if not payload:
         return {}
+    organization_name = (
+        payload.get("organization_name")
+        or payload.get("userOrgName")
+        or payload.get("org_name")
+    )
     payload.setdefault("email", payload.get("userEmail"))
     payload.setdefault("role", payload.get("userRole"))
     payload.setdefault("organization_id", payload.get("userOrgId"))
-    payload.setdefault("organization_name", payload.get("userOrgName"))
+    payload.setdefault("organization_name", organization_name)
+    payload.setdefault("org_name", organization_name)
     payload.setdefault("token_type", "probestack_user_context")
     return payload
 
@@ -15177,6 +15190,8 @@ async def issue_user_context_token(
     cookie_max_age = max(1, expires_at - int(datetime.now(timezone.utc).timestamp()))
     set_product_auth_cookies(fastapi_response, token, cookie_max_age)
     await db.commit()
+    response_user_context = build_context_token_response_user_context(user_context)
+    organization_name = response_user_context.get("organization_name")
 
     return {
         "success": True,
@@ -15189,7 +15204,9 @@ async def issue_user_context_token(
         "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
         "cookie_set": True,
-        "user": build_context_token_response_user_context(user_context),
+        "organization_name": organization_name,
+        "org_name": organization_name,
+        "user": response_user_context,
     }
 
 @api_router.get("/public/users/context-token/me", tags=["Public API"])
@@ -15223,9 +15240,13 @@ async def get_user_context_from_signed_token(
         raise HTTPException(status_code=403, detail="Token user does not match current user")
 
     await db.commit()
+    response_user_context = build_context_token_response_user_context(user_context)
+    organization_name = response_user_context.get("organization_name")
     return {
         "success": True,
-        "user": build_context_token_response_user_context(user_context),
+        "organization_name": organization_name,
+        "org_name": organization_name,
+        "user": response_user_context,
     }
 
 
