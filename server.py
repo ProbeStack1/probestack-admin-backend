@@ -983,6 +983,68 @@ class ZitadelManagementAPI:
         logger.warning(f"Zitadel set organization metadata error: {response.text}")
         return {"success": False, "error": response.text, "status_code": response.status_code}
 
+    async def create_project_grant(
+        self,
+        organization_id: str,
+        role_keys: list[str],
+        project_id: Optional[str] = None,
+    ) -> dict:
+        """Grant the ProbeStack Zitadel project to a customer organization."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        target_project_id = (project_id or ZITADEL_PROJECT_ID or "").strip()
+        cleaned_role_keys = list(dict.fromkeys([key for key in role_keys if key]))
+        if not target_project_id:
+            return {"success": False, "skipped": True, "error": "ZITADEL_PROJECT_ID is not configured"}
+        if not organization_id:
+            return {"success": False, "skipped": True, "error": "organization_id is required"}
+
+        payload = {
+            "projectId": target_project_id,
+            "grantedOrganizationId": organization_id,
+        }
+        if cleaned_role_keys:
+            payload["roleKeys"] = cleaned_role_keys
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/zitadel.project.v2.ProjectService/CreateProjectGrant",
+                headers=self._connect_headers(),
+                json=payload,
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 201]:
+            data = response.json()
+            return {"success": True, "role_keys": cleaned_role_keys, "data": data}
+        if response.status_code == 409 or "already" in response.text.lower():
+            async with httpx.AsyncClient() as client:
+                update_response = await client.post(
+                    f"{self.base_url}/zitadel.project.v2.ProjectService/UpdateProjectGrant",
+                    headers=self._connect_headers(),
+                    json=payload,
+                    timeout=30.0,
+                )
+            if update_response.status_code in [200, 201]:
+                return {
+                    "success": True,
+                    "exists": True,
+                    "updated": True,
+                    "role_keys": cleaned_role_keys,
+                    "data": self._response_json_or_empty(update_response),
+                }
+            logger.warning(f"Zitadel project grant update error: {update_response.text}")
+            return {
+                "success": False,
+                "exists": True,
+                "error": update_response.text,
+                "status_code": update_response.status_code,
+                "role_keys": cleaned_role_keys,
+            }
+
+        logger.warning(f"Zitadel project grant error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code, "role_keys": cleaned_role_keys}
+
     async def assign_user_roles(
         self,
         user_id: str,
@@ -3025,6 +3087,11 @@ def standard_role_slug(name: str) -> str:
 
 def zitadel_role_key_for_role(role_name: Optional[str]) -> str:
     return standard_role_slug(role_name or "role")
+
+async def get_zitadel_project_role_keys(db: AsyncSession) -> List[str]:
+    roles = await get_global_standard_roles(db)
+    role_keys = [zitadel_role_key_for_role(role.name) for role in roles]
+    return list(dict.fromkeys([key for key in role_keys if key])) or [DEFAULT_CONSUMER_ROLE_SLUG]
 
 def is_org_admin_role_name(role_name: Optional[str]) -> bool:
     role_slug = standard_role_slug(role_name or "")
@@ -6457,7 +6524,13 @@ async def build_probestack_user_metadata(
         )
     return metadata
 
-async def provision_organization_in_zitadel(org: OrganizationModel) -> dict:
+async def ensure_zitadel_project_grant_for_org(db: AsyncSession, org: OrganizationModel) -> dict:
+    if not org.zitadel_org_id:
+        return {"success": False, "skipped": True, "error": "Zitadel organization ID is required"}
+    role_keys = await get_zitadel_project_role_keys(db)
+    return await zitadel_mgmt.create_project_grant(org.zitadel_org_id, role_keys)
+
+async def provision_organization_in_zitadel(db: AsyncSession, org: OrganizationModel) -> dict:
     """Create the matching Zitadel organization and persist its ID on the local organization row."""
     if not zitadel_mgmt.enabled:
         logger.info(f"Zitadel organization provisioning skipped for {org.name}: not configured")
@@ -6467,12 +6540,18 @@ async def provision_organization_in_zitadel(org: OrganizationModel) -> dict:
             org.zitadel_org_id,
             build_probestack_org_metadata(org),
         )
-        return {
+        project_grant_result = await ensure_zitadel_project_grant_for_org(db, org)
+        result = {
             "success": True,
             "exists": True,
             "zitadel_org_id": org.zitadel_org_id,
             "metadata": metadata_result,
+            "project_grant": project_grant_result,
         }
+        if not project_grant_result.get("success") and not project_grant_result.get("skipped"):
+            result["success"] = False
+            result["error"] = project_grant_result.get("error") or "Failed to create Zitadel project grant"
+        return result
 
     zitadel_result = await zitadel_mgmt.create_organization(org.name)
     if not zitadel_result.get("success"):
@@ -6493,6 +6572,15 @@ async def provision_organization_in_zitadel(org: OrganizationModel) -> dict:
         build_probestack_org_metadata(org),
     )
     zitadel_result["metadata"] = metadata_result
+
+    project_grant_result = await ensure_zitadel_project_grant_for_org(db, org)
+    zitadel_result["project_grant"] = project_grant_result
+    if not project_grant_result.get("success") and not project_grant_result.get("skipped"):
+        return {
+            **zitadel_result,
+            "success": False,
+            "error": project_grant_result.get("error") or "Failed to create Zitadel project grant",
+        }
 
     logger.info(f"Zitadel organization created for {org.name}: {org.zitadel_org_id}")
     return zitadel_result
@@ -6545,7 +6633,7 @@ async def provision_organization_for_active_provider(
     if active_provider == "auth0":
         result = await provision_organization_in_auth0(org)
     else:
-        result = await provision_organization_in_zitadel(org)
+        result = await provision_organization_in_zitadel(db, org)
     result["identity_provider"] = active_provider
     return result
 
@@ -6703,6 +6791,15 @@ async def provision_user_for_active_provider(
                 "error": result.get("error") or "Auth0 user ID was not stored",
             }
     else:
+        if org and org.zitadel_org_id:
+            project_grant_result = await ensure_zitadel_project_grant_for_org(db, org)
+            if not project_grant_result.get("success") and not project_grant_result.get("skipped"):
+                return {
+                    "success": False,
+                    "error": project_grant_result.get("error") or "Failed to create Zitadel project grant",
+                    "project_grant": project_grant_result,
+                    "identity_provider": active_provider,
+                }
         result = await provision_user_in_zitadel(
             user,
             email,
@@ -6743,7 +6840,7 @@ async def create_invited_org_user(db: AsyncSession, org: OrganizationModel, emai
         if not org_result.get("success"):
             logger.warning(f"Failed to provision Auth0 organization for {org.name}: {org_result.get('error')}")
     elif active_provider == "zitadel" and not org.zitadel_org_id and org.status == "approved":
-        org_result = await provision_organization_in_zitadel(org)
+        org_result = await provision_organization_in_zitadel(db, org)
         if not org_result.get("success"):
             logger.warning(f"Failed to provision Zitadel organization for {org.name}: {org_result.get('error')}")
 
