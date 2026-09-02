@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, List, Optional
 import uuid
 import calendar
+from types import SimpleNamespace
 from datetime import datetime, timezone, timedelta
 import jwt
 import bcrypt
@@ -798,6 +799,115 @@ class ZitadelManagementAPI:
 
         logger.error(f"Zitadel delete organization error: {response.text}")
         return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def search_organizations(
+        self,
+        *,
+        name: Optional[str] = None,
+        domain: Optional[str] = None,
+        limit: int = 10,
+    ) -> dict:
+        """Search Zitadel organizations by exact name or domain."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+
+        queries = []
+        cleaned_name = (name or "").strip()
+        cleaned_domain = (domain or "").strip().lower().lstrip("@")
+        if cleaned_name:
+            queries.append({"nameQuery": {"name": cleaned_name, "method": 1}})
+        if cleaned_domain:
+            queries.append({"domainQuery": {"domain": cleaned_domain, "method": 1}})
+        if not queries:
+            return {"success": False, "error": "Organization name or domain is required"}
+
+        payload = {
+            "query": {"offset": "0", "limit": limit, "asc": True},
+            "sortingColumn": "ORGANIZATION_FIELD_NAME_NAME",
+            "queries": queries,
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.base_url}/v2/organizations/_search",
+                headers=self._headers(),
+                json=payload,
+                timeout=30.0,
+            )
+
+        if response.status_code == 200:
+            data = response.json()
+            return {"success": True, "organizations": data.get("result", []), "data": data}
+
+        logger.error(f"Zitadel search organizations error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def resolve_organization_id(
+        self,
+        *,
+        name: Optional[str] = None,
+        domain: Optional[str] = None,
+    ) -> dict:
+        """Resolve exactly one Zitadel organization ID by exact name/domain match."""
+        cleaned_name = (name or "").strip()
+        cleaned_domain = (domain or "").strip().lower().lstrip("@")
+        searches = []
+        if cleaned_name:
+            searches.append({"name": cleaned_name})
+        if cleaned_domain:
+            searches.append({"domain": cleaned_domain})
+        if not searches:
+            return {"success": False, "error": "Organization name or domain is required"}
+
+        matches_by_id = {}
+        errors = []
+        for search in searches:
+            result = await self.search_organizations(**search)
+            if not result.get("success"):
+                errors.append(result.get("error") or "unknown error")
+                continue
+            for organization in result.get("organizations", []):
+                org_id = organization.get("id") or organization.get("organizationId") or organization.get("orgId")
+                org_name = (organization.get("name") or "").strip()
+                primary_domain = (organization.get("primaryDomain") or "").strip().lower()
+                exact_name = cleaned_name and org_name.lower() == cleaned_name.lower()
+                exact_domain = cleaned_domain and (primary_domain == cleaned_domain or search.get("domain"))
+                if org_id and (exact_name or exact_domain):
+                    matches_by_id[org_id] = organization
+
+        matches = list(matches_by_id.values())
+        if len(matches) == 1:
+            organization = matches[0]
+            return {
+                "success": True,
+                "organization_id": organization.get("id") or organization.get("organizationId") or organization.get("orgId"),
+                "organization": organization,
+            }
+        if len(matches) > 1:
+            return {"success": False, "ambiguous": True, "error": "Multiple matching Zitadel organizations found", "matches": matches}
+        if errors:
+            return {"success": False, "error": "; ".join(errors)}
+        return {"success": False, "missing": True, "error": "No matching Zitadel organization found"}
+
+    async def delete_organization_by_lookup(
+        self,
+        *,
+        organization_id: Optional[str] = None,
+        name: Optional[str] = None,
+        domain: Optional[str] = None,
+    ) -> dict:
+        """Delete a Zitadel organization by stored ID or an exact lookup fallback."""
+        if organization_id:
+            return await self.delete_organization(organization_id)
+
+        resolved = await self.resolve_organization_id(name=name, domain=domain)
+        if resolved.get("missing"):
+            return {"success": True, "skipped": True, "missing": True, "lookup": resolved}
+        if not resolved.get("success"):
+            return resolved
+
+        delete_result = await self.delete_organization(resolved["organization_id"])
+        delete_result["lookup"] = resolved
+        return delete_result
 
     async def add_organization_domain(self, organization_id: str, domain: str) -> dict:
         """Register an organization domain in Zitadel."""
@@ -2423,7 +2533,31 @@ async def archive_deleted_organization(db: AsyncSession, org: OrganizationModel,
     await db.flush()
     return archive
 
-async def delete_provider_records_for_organization(org: OrganizationModel, users: list[UserModel]) -> dict:
+def users_from_deleted_organization_archive(archive: DeletedOrganizationArchiveModel) -> list[SimpleNamespace]:
+    try:
+        snapshot = json.loads(archive.snapshot or "{}")
+    except json.JSONDecodeError:
+        snapshot = {}
+    archived_users = snapshot.get("related", {}).get("users", [])
+    users = []
+    for user in archived_users:
+        users.append(SimpleNamespace(
+            email=user.get("email"),
+            auth0_user_id=user.get("auth0_user_id"),
+            zitadel_user_id=user.get("zitadel_user_id"),
+        ))
+    return users
+
+def org_from_deleted_organization_archive(archive: DeletedOrganizationArchiveModel) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=archive.organization_id,
+        name=archive.organization_name,
+        domain=archive.organization_domain,
+        auth0_org_id=archive.auth0_org_id,
+        zitadel_org_id=archive.zitadel_org_id,
+    )
+
+async def delete_provider_records_for_organization(org: Any, users: list[Any]) -> dict:
     results = {
         "auth0": {"users": [], "organization": None},
         "zitadel": {"users": [], "organization": None},
@@ -2449,11 +2583,21 @@ async def delete_provider_records_for_organization(org: OrganizationModel, users
         if not result.get("success"):
             failures.append(f"Auth0 organization: {result.get('error') or 'unknown error'}")
 
-    if org.zitadel_org_id:
-        result = await zitadel_mgmt.delete_organization(org.zitadel_org_id)
+    if zitadel_mgmt.enabled and (org.zitadel_org_id or org.name or org.domain):
+        result = await zitadel_mgmt.delete_organization_by_lookup(
+            organization_id=org.zitadel_org_id,
+            name=org.name,
+            domain=org.domain,
+        )
         results["zitadel"]["organization"] = result
         if not result.get("success"):
             failures.append(f"Zitadel organization: {result.get('error') or 'unknown error'}")
+    elif not zitadel_mgmt.enabled:
+        results["zitadel"]["organization"] = {
+            "success": True,
+            "skipped": True,
+            "error": "Zitadel is not configured",
+        }
 
     if failures:
         raise HTTPException(status_code=502, detail={"message": "Identity provider cleanup failed", "failures": failures})
@@ -13156,6 +13300,61 @@ async def reject_organization(org_id: str, reason: str = "", payload: dict = Dep
         logger.error("Failed to build organization rejection email for %s: %s", org.id, exc)
 
     return {"message": "Organization rejected"}
+
+class ZitadelOrganizationCleanupRequest(BaseModel):
+    organization_id: Optional[str] = None
+    name: Optional[str] = None
+    domain: Optional[str] = None
+
+@api_router.post("/identity-providers/zitadel/organizations/delete")
+async def delete_zitadel_organization_by_lookup(
+    data: ZitadelOrganizationCleanupRequest,
+    payload: dict = Depends(require_super_admin),
+):
+    """Delete a stale Zitadel organization by ID or exact name/domain lookup."""
+    if not data.organization_id and not data.name and not data.domain:
+        raise HTTPException(status_code=400, detail="organization_id, name, or domain is required")
+
+    result = await zitadel_mgmt.delete_organization_by_lookup(
+        organization_id=data.organization_id,
+        name=data.name,
+        domain=data.domain,
+    )
+    if not result.get("success"):
+        status_code = 409 if result.get("ambiguous") else 502
+        raise HTTPException(status_code=status_code, detail=result)
+    return {"message": "Zitadel organization cleanup completed", "result": result}
+
+@api_router.post("/deleted-organizations/{archive_id}/identity-provider-cleanup/retry")
+async def retry_deleted_organization_identity_provider_cleanup(
+    archive_id: str,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry Auth0/Zitadel cleanup using a deleted organization archive."""
+    archive_result = await db.execute(
+        select(DeletedOrganizationArchiveModel)
+        .where(or_(
+            DeletedOrganizationArchiveModel.id == archive_id,
+            DeletedOrganizationArchiveModel.organization_id == archive_id,
+        ))
+        .order_by(DeletedOrganizationArchiveModel.deleted_at.desc())
+    )
+    archive = archive_result.scalars().first()
+    if not archive:
+        raise HTTPException(status_code=404, detail="Deleted organization archive not found")
+
+    org = org_from_deleted_organization_archive(archive)
+    users = users_from_deleted_organization_archive(archive)
+    provider_cleanup = await delete_provider_records_for_organization(org, users)
+    archive.deletion_results = json.dumps(provider_cleanup, default=str)
+    await db.commit()
+    return {
+        "message": "Deleted organization identity-provider cleanup retried",
+        "archive_id": archive.id,
+        "organization_id": archive.organization_id,
+        "identity_provider_cleanup": provider_cleanup,
+    }
 
 @api_router.delete("/organizations/{org_id}")
 async def delete_organization(org_id: str, payload: dict = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
