@@ -24,6 +24,7 @@ import json
 import httpx
 import base64
 import hashlib
+import re
 from urllib.parse import urlencode
 import secrets
 import smtplib
@@ -340,6 +341,28 @@ class Auth0ManagementAPI:
             else:
                 logger.error(f"Auth0 create user error: {response.text}")
                 return {"success": False, "error": response.text}
+
+    async def delete_user(self, user_id: str) -> dict:
+        """Delete an Auth0 user by ID."""
+        if not self.enabled:
+            return self._disabled_result("delete user")
+        if not user_id:
+            return {"success": True, "skipped": True}
+        token = await self._get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"https://{self.domain}/api/v2/users/{user_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 202, 204, 404]:
+            logger.info(f"Auth0 user deleted or already missing: {user_id}")
+            return {"success": True, "missing": response.status_code == 404}
+
+        logger.error(f"Auth0 delete user error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
 
     async def create_organization(self, name: str, metadata: dict = None) -> dict:
         """Create an Auth0 organization and return its generated organization ID."""
@@ -660,6 +683,15 @@ class ZitadelManagementAPI:
             return user_payload["human"]
         return user_payload.get("user", {}).get("human", {})
 
+    @staticmethod
+    def _response_json_or_empty(response: httpx.Response) -> dict:
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError:
+            return {"raw": response.text}
+
     async def create_user(
         self,
         email: str,
@@ -743,6 +775,28 @@ class ZitadelManagementAPI:
             }
 
         logger.error(f"Zitadel create organization error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def delete_organization(self, organization_id: str) -> dict:
+        """Delete a Zitadel organization and its resources."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        if not organization_id:
+            return {"success": True, "skipped": True}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{self.base_url}/v2/organizations/{organization_id}",
+                headers=self._headers(),
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 202, 204, 404]:
+            logger.info(f"Zitadel organization deleted or already missing: {organization_id}")
+            data = self._response_json_or_empty(response)
+            return {"success": True, "missing": response.status_code == 404, "data": data}
+
+        logger.error(f"Zitadel delete organization error: {response.text}")
         return {"success": False, "error": response.text, "status_code": response.status_code}
 
     async def add_organization_domain(self, organization_id: str, domain: str) -> dict:
@@ -910,6 +964,28 @@ class ZitadelManagementAPI:
         logger.error(f"Zitadel get user by ID error: {response.text}")
         return {"success": False, "error": response.text}
 
+    async def delete_user(self, user_id: str) -> dict:
+        """Delete a Zitadel user by ID."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+        if not user_id:
+            return {"success": True, "skipped": True}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{self.base_url}/v2/users/{user_id}",
+                headers=self._headers(),
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 202, 204, 404]:
+            logger.info(f"Zitadel user deleted or already missing: {user_id}")
+            data = self._response_json_or_empty(response)
+            return {"success": True, "missing": response.status_code == 404, "data": data}
+
+        logger.error(f"Zitadel delete user error: {response.text}")
+        return {"success": False, "error": response.text, "status_code": response.status_code}
+
     async def update_user_password(self, user_id: str, password: str) -> dict:
         """Set a user's password in Zitadel."""
         if not self.enabled:
@@ -1047,6 +1123,7 @@ class OrganizationModel(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    main_app_domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="pending")
     contact_person: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
@@ -1102,6 +1179,25 @@ class OrganizationModel(Base):
     gateway_environment_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     gateway_environments: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+class DeletedOrganizationArchiveModel(Base):
+    """Historical snapshot retained after an organization is deleted."""
+    __tablename__ = "deleted_organization_archives"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    organization_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    organization_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    organization_domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    external_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    auth0_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    zitadel_org_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    snapshot: Mapped[str] = mapped_column(LONGTEXT, nullable=False)
+    deletion_results: Mapped[Optional[str]] = mapped_column(LONGTEXT, nullable=True)
+    deleted_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    deleted_by_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 class SubscriptionModel(Base):
     __tablename__ = "subscriptions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -1115,6 +1211,8 @@ class SubscriptionModel(Base):
     api_count: Mapped[Optional[int]] = mapped_column(nullable=True)
     quota: Mapped[Optional[int]] = mapped_column(nullable=True)
     used_quota: Mapped[int] = mapped_column(default=0)
+    custom_domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    database: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class SubscriptionToolModel(Base):
@@ -1740,6 +1838,17 @@ class SubscriptionBillingSettingsUpdate(BaseModel):
     used_quota: Optional[int] = None
     amount: Optional[float] = None
 
+class OrganizationProductDomainUpdate(BaseModel):
+    subscription_id: Optional[str] = None
+    product_id: Optional[str] = None
+    product_key: Optional[str] = None
+    domain: Optional[str] = None
+    database: Optional[str] = None
+
+class OrganizationDomainUpdate(BaseModel):
+    main_app_domain: Optional[str] = None
+    product_domains: Optional[List[OrganizationProductDomainUpdate]] = None
+
 class NotificationGroupEmailCreate(BaseModel):
     email: str
     name: Optional[str] = None
@@ -1759,6 +1868,7 @@ class OrganizationCreate(BaseModel):
     name: str
     email: str
     domain: str
+    main_app_domain: Optional[str] = None
     requested_plans: Optional[List[Any]] = None
     requested_tools: Optional[List[str]] = None
     plans: Optional[List[Any]] = None
@@ -1800,6 +1910,7 @@ class OrganizationUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None
     domain: Optional[str] = None
+    main_app_domain: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
     external_org_id: Optional[str] = None
@@ -2157,6 +2268,313 @@ def model_to_dict(model, json_fields=None):
             value = value.isoformat()
         result[column.name] = value
     return result
+
+ARCHIVE_REDACTED_FIELDS = {
+    "password_hash",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "first_login_token",
+}
+
+def model_to_archive_dict(model, json_fields=None):
+    data = model_to_dict(model, json_fields)
+    for field in ARCHIVE_REDACTED_FIELDS:
+        if field in data:
+            data[field] = None
+    return data
+
+async def archive_rows(db: AsyncSession, statement, json_fields=None) -> list[dict]:
+    result = await db.execute(statement)
+    return [model_to_archive_dict(row, json_fields) for row in result.scalars().all()]
+
+async def build_deleted_organization_snapshot(db: AsyncSession, org: OrganizationModel) -> dict:
+    subscription_ids = select(SubscriptionModel.id).where(SubscriptionModel.organization_id == org.id)
+    org_request_ids = select(OrganizationSubscriptionRequestModel.id).where(
+        OrganizationSubscriptionRequestModel.organization_id == org.id
+    )
+    org_request_item_ids = select(OrganizationSubscriptionRequestItemModel.id).where(
+        OrganizationSubscriptionRequestItemModel.request_id.in_(org_request_ids)
+    )
+    upgrade_request_ids = select(PlanUpgradeRequestModel.id).where(PlanUpgradeRequestModel.organization_id == org.id)
+    upgrade_request_item_ids = select(PlanUpgradeRequestItemModel.id).where(
+        PlanUpgradeRequestItemModel.request_id.in_(upgrade_request_ids)
+    )
+    user_ids = select(UserModel.id).where(UserModel.organization_id == org.id)
+    business_unit_ids = select(BusinessUnitModel.id).where(BusinessUnitModel.organization_id == org.id)
+    project_ids = select(ProjectModel.id).where(ProjectModel.organization_id == org.id)
+    application_ids = select(ApplicationModel.id).where(ApplicationModel.organization_id == org.id)
+
+    related = {
+        "users": await archive_rows(db, select(UserModel).where(UserModel.organization_id == org.id)),
+        "admins": await archive_rows(db, select(AdminModel).where(AdminModel.organization_id == org.id)),
+        "roles": await archive_rows(db, select(RoleModel).where(RoleModel.organization_id == org.id), ["permissions"]),
+        "user_role_assignments": await archive_rows(
+            db,
+            select(UserRoleAssignmentModel).where(UserRoleAssignmentModel.user_id.in_(user_ids)),
+        ),
+        "user_requests": await archive_rows(db, select(UserRequestModel).where(UserRequestModel.organization_id == org.id)),
+        "subscriptions": await archive_rows(db, select(SubscriptionModel).where(SubscriptionModel.organization_id == org.id)),
+        "subscription_tools": await archive_rows(
+            db,
+            select(SubscriptionToolModel).where(SubscriptionToolModel.subscription_id.in_(subscription_ids)),
+        ),
+        "billing": await archive_rows(db, select(BillingModel).where(BillingModel.organization_id == org.id)),
+        "organization_subscription_requests": await archive_rows(
+            db,
+            select(OrganizationSubscriptionRequestModel).where(
+                OrganizationSubscriptionRequestModel.organization_id == org.id
+            ),
+        ),
+        "organization_subscription_request_items": await archive_rows(
+            db,
+            select(OrganizationSubscriptionRequestItemModel).where(
+                OrganizationSubscriptionRequestItemModel.request_id.in_(org_request_ids)
+            ),
+        ),
+        "organization_subscription_request_tools": await archive_rows(
+            db,
+            select(OrganizationSubscriptionRequestToolModel).where(
+                OrganizationSubscriptionRequestToolModel.request_item_id.in_(org_request_item_ids)
+            ),
+        ),
+        "plan_upgrade_requests": await archive_rows(
+            db,
+            select(PlanUpgradeRequestModel).where(PlanUpgradeRequestModel.organization_id == org.id),
+        ),
+        "plan_upgrade_request_items": await archive_rows(
+            db,
+            select(PlanUpgradeRequestItemModel).where(PlanUpgradeRequestItemModel.request_id.in_(upgrade_request_ids)),
+        ),
+        "plan_upgrade_request_tools": await archive_rows(
+            db,
+            select(PlanUpgradeRequestToolModel).where(
+                PlanUpgradeRequestToolModel.request_item_id.in_(upgrade_request_item_ids)
+            ),
+        ),
+        "business_units": await archive_rows(db, select(BusinessUnitModel).where(BusinessUnitModel.organization_id == org.id), ["tags"]),
+        "business_unit_quotas": await archive_rows(
+            db,
+            select(QuotaModel).where(
+                QuotaModel.entity_type == "business_unit",
+                QuotaModel.entity_id.in_(business_unit_ids),
+            ),
+        ),
+        "projects": await archive_rows(db, select(ProjectModel).where(ProjectModel.organization_id == org.id)),
+        "project_environments": await archive_rows(
+            db,
+            select(ProjectEnvironmentModel).where(ProjectEnvironmentModel.project_id.in_(project_ids)),
+        ),
+        "project_team_members": await archive_rows(
+            db,
+            select(ProjectTeamMemberModel).where(ProjectTeamMemberModel.organization_id == org.id),
+        ),
+        "applications": await archive_rows(db, select(ApplicationModel).where(ApplicationModel.organization_id == org.id)),
+        "application_agents": await archive_rows(
+            db,
+            select(ApplicationAgentModel).where(ApplicationAgentModel.application_id.in_(application_ids)),
+        ),
+        "application_monitoring": await archive_rows(
+            db,
+            select(ApplicationMonitoringModel).where(ApplicationMonitoringModel.application_id.in_(application_ids)),
+        ),
+        "application_security": await archive_rows(
+            db,
+            select(ApplicationSecurityModel).where(ApplicationSecurityModel.application_id.in_(application_ids)),
+        ),
+        "application_billing": await archive_rows(
+            db,
+            select(ApplicationBillingModel).where(ApplicationBillingModel.application_id.in_(application_ids)),
+        ),
+        "auth0_login_records": await archive_rows(
+            db,
+            select(Auth0LoginRecordModel).where(Auth0LoginRecordModel.organization_id == org.id),
+        ),
+        "zitadel_login_records": await archive_rows(
+            db,
+            select(ZitadelLoginRecordModel).where(ZitadelLoginRecordModel.organization_id == org.id),
+        ),
+    }
+
+    return {
+        "schema_version": 1,
+        "archived_at": datetime.now(timezone.utc).isoformat(),
+        "organization": model_to_archive_dict(org),
+        "counts": {key: len(value) for key, value in related.items()},
+        "related": related,
+    }
+
+async def archive_deleted_organization(db: AsyncSession, org: OrganizationModel, payload: dict) -> DeletedOrganizationArchiveModel:
+    snapshot = await build_deleted_organization_snapshot(db, org)
+    archive = DeletedOrganizationArchiveModel(
+        organization_id=org.id,
+        organization_name=org.name,
+        organization_email=org.email,
+        organization_domain=org.domain,
+        external_org_id=org.external_org_id,
+        auth0_org_id=org.auth0_org_id,
+        zitadel_org_id=org.zitadel_org_id,
+        status=org.status,
+        snapshot=json.dumps(snapshot, default=str),
+        deleted_by=payload.get("sub") or payload.get("userId"),
+        deleted_by_email=payload.get("email") or payload.get("userEmail"),
+    )
+    db.add(archive)
+    await db.flush()
+    return archive
+
+async def delete_provider_records_for_organization(org: OrganizationModel, users: list[UserModel]) -> dict:
+    results = {
+        "auth0": {"users": [], "organization": None},
+        "zitadel": {"users": [], "organization": None},
+    }
+    failures = []
+
+    for user in users:
+        if user.auth0_user_id:
+            result = await auth0_mgmt.delete_user(user.auth0_user_id)
+            results["auth0"]["users"].append({"email": user.email, "user_id": user.auth0_user_id, **result})
+            if not result.get("success"):
+                failures.append(f"Auth0 user {user.email}: {result.get('error') or 'unknown error'}")
+
+        if user.zitadel_user_id:
+            result = await zitadel_mgmt.delete_user(user.zitadel_user_id)
+            results["zitadel"]["users"].append({"email": user.email, "user_id": user.zitadel_user_id, **result})
+            if not result.get("success"):
+                failures.append(f"Zitadel user {user.email}: {result.get('error') or 'unknown error'}")
+
+    if org.auth0_org_id:
+        result = await auth0_mgmt.delete_organization(org.auth0_org_id)
+        results["auth0"]["organization"] = result
+        if not result.get("success"):
+            failures.append(f"Auth0 organization: {result.get('error') or 'unknown error'}")
+
+    if org.zitadel_org_id:
+        result = await zitadel_mgmt.delete_organization(org.zitadel_org_id)
+        results["zitadel"]["organization"] = result
+        if not result.get("success"):
+            failures.append(f"Zitadel organization: {result.get('error') or 'unknown error'}")
+
+    if failures:
+        raise HTTPException(status_code=502, detail={"message": "Identity provider cleanup failed", "failures": failures})
+
+    return results
+
+def normalize_custom_domain(value: Optional[str]) -> Optional[str]:
+    """Normalize optional custom domains to bare hostnames."""
+    if value is None:
+        return None
+    domain = str(value).strip().lower()
+    if not domain:
+        return None
+    domain = re.sub(r"^https?://", "", domain)
+    domain = domain.split("/", 1)[0].strip().strip(".")
+    if not domain:
+        return None
+    hostname_pattern = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+(:[0-9]{1,5})?$"
+    if not re.match(hostname_pattern, domain):
+        raise HTTPException(status_code=400, detail=f"Invalid custom domain: {value}")
+    if ":" in domain:
+        host, port = domain.rsplit(":", 1)
+        if int(port) > 65535:
+            raise HTTPException(status_code=400, detail=f"Invalid custom domain port: {value}")
+        domain = f"{host}:{int(port)}"
+    return domain
+
+async def assert_custom_domain_available(
+    db: AsyncSession,
+    domain: Optional[str],
+    *,
+    organization_id: str,
+    subscription_id: Optional[str] = None,
+):
+    if not domain:
+        return
+
+    org_result = await db.execute(
+        select(OrganizationModel).where(
+            OrganizationModel.main_app_domain == domain,
+            OrganizationModel.id != organization_id,
+        )
+    )
+    if org_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail=f"Custom domain '{domain}' is already assigned to another organization")
+
+    sub_query = (
+        select(SubscriptionModel)
+        .where(SubscriptionModel.custom_domain == domain)
+    )
+    if subscription_id:
+        sub_query = sub_query.where(SubscriptionModel.id != subscription_id)
+    sub_result = await db.execute(sub_query)
+    if sub_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail=f"Custom domain '{domain}' is already assigned to another subscription")
+
+async def get_org_product_domains(db: AsyncSession, organization_id: str) -> List[dict]:
+    result = await db.execute(
+        select(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == organization_id)
+        .where(SubscriptionModel.status == "active")
+        .order_by(SubscriptionModel.created_at.desc())
+    )
+    product_domains = []
+    for subscription in result.scalars().all():
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == subscription.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        product = await get_plan_product(db, plan) if plan else None
+        product_domains.append({
+            "subscription_id": subscription.id,
+            "plan_id": subscription.plan_id,
+            "plan_name": plan.name if plan else await get_plan_name(db, subscription.plan_id),
+            "product_id": product.id if product else (plan.product_id if plan else None),
+            "product_key": product.key if product else (plan.tool if plan else None),
+            "product_name": product.name if product else None,
+            "domain": subscription.custom_domain,
+            "database": subscription.database,
+        })
+    return product_domains
+
+async def find_active_subscription_for_domain_update(
+    db: AsyncSession,
+    organization_id: str,
+    item: OrganizationProductDomainUpdate,
+) -> SubscriptionModel:
+    if item.subscription_id:
+        result = await db.execute(
+            select(SubscriptionModel).where(
+                SubscriptionModel.id == item.subscription_id,
+                SubscriptionModel.organization_id == organization_id,
+                SubscriptionModel.status == "active",
+            )
+        )
+        subscription = result.scalar_one_or_none()
+        if not subscription:
+            raise HTTPException(status_code=404, detail=f"Active subscription not found: {item.subscription_id}")
+        return subscription
+
+    if not item.product_id and not item.product_key:
+        raise HTTPException(status_code=400, detail="Each product domain update needs subscription_id, product_id, or product_key")
+
+    result = await db.execute(
+        select(SubscriptionModel)
+        .where(SubscriptionModel.organization_id == organization_id)
+        .where(SubscriptionModel.status == "active")
+    )
+    matches = []
+    for subscription in result.scalars().all():
+        plan_result = await db.execute(select(PlanModel).where(PlanModel.id == subscription.plan_id))
+        plan = plan_result.scalar_one_or_none()
+        product = await get_plan_product(db, plan) if plan else None
+        if item.product_id and product and product.id == item.product_id:
+            matches.append(subscription)
+        elif item.product_key and product and product.key == item.product_key:
+            matches.append(subscription)
+
+    if not matches:
+        raise HTTPException(status_code=404, detail="Active subscription not found for product domain update")
+    if len(matches) > 1:
+        raise HTTPException(status_code=400, detail="Multiple active subscriptions matched. Use subscription_id.")
+    return matches[0]
 
 ORGANIZATION_ONBOARDING_FIELDS = [
     "organization_code", "legal_name", "industry", "business_type", "country", "region",
@@ -4910,6 +5328,9 @@ async def organization_to_dict(db: AsyncSession, org: OrganizationModel) -> dict
             "product_id": product.id if product else (plan.product_id if plan else None),
             "product_key": product.key if product else (plan.tool if plan else None),
             "product_name": product.name if product else None,
+            "custom_domain": subscription.custom_domain,
+            "domain": subscription.custom_domain,
+            "database": subscription.database,
             "amount": subscription.amount,
             "status": subscription.status,
         })
@@ -4940,6 +5361,7 @@ async def public_organization_to_dict(db: AsyncSession, org: OrganizationModel) 
         "name": data.get("name"),
         "external_org_id": data.get("external_org_id"),
         "domain": data.get("domain"),
+        "main_app_domain": data.get("main_app_domain"),
         "status": data.get("status"),
         "organization_code": data.get("organization_code"),
         "industry": data.get("industry"),
@@ -4956,6 +5378,9 @@ async def public_organization_to_dict(db: AsyncSession, org: OrganizationModel) 
                 "product_id": detail.get("product_id"),
                 "product_key": detail.get("product_key"),
                 "product_name": detail.get("product_name"),
+                "custom_domain": detail.get("custom_domain"),
+                "domain": detail.get("domain"),
+                "database": detail.get("database"),
                 "status": detail.get("status"),
             }
             for detail in data.get("active_plan_details") or []
@@ -7738,11 +8163,15 @@ async def update_my_organization(
 ):
     """Update onboarding fields for the current organization."""
     org = await get_approved_org_for_admin(payload, db)
-    update_data = {k: v for k, v in payload_dict(data, exclude_unset=True).items() if v is not None}
+    raw_update_data = payload_dict(data, exclude_unset=True)
+    update_data = {k: v for k, v in raw_update_data.items() if v is not None}
     if "supported_domains" in update_data and isinstance(update_data["supported_domains"], list):
         update_data["supported_domains"] = json.dumps(update_data["supported_domains"])
     if "gateway_environments" in update_data and isinstance(update_data["gateway_environments"], list):
         update_data["gateway_environments"] = json.dumps(update_data["gateway_environments"])
+    if "main_app_domain" in raw_update_data:
+        update_data["main_app_domain"] = normalize_custom_domain(raw_update_data.get("main_app_domain"))
+        await assert_custom_domain_available(db, update_data["main_app_domain"], organization_id=org.id)
     if "name" in update_data:
         update_data["name"] = update_data["name"].strip()
         if not update_data["name"]:
@@ -9950,6 +10379,9 @@ async def create_organization(data: OrganizationCreate, db: AsyncSession = Depen
     if invalid_plans:
         raise HTTPException(status_code=400, detail=f"Invalid requested plans: {invalid_plans}")
 
+    main_app_domain = normalize_custom_domain(data.main_app_domain)
+    await assert_custom_domain_available(db, main_app_domain, organization_id="")
+
     for tool in data.requested_tools or []:
         matched_selection = None
         for selection in plan_selections:
@@ -9971,6 +10403,7 @@ async def create_organization(data: OrganizationCreate, db: AsyncSession = Depen
 
     org = OrganizationModel(
         name=data.name, email=data.email, domain=data.domain,
+        main_app_domain=main_app_domain,
         contact_person=data.contact_person, phone=data.phone, address=data.address,
         description=data.description,
         supported_domains=supported_domains_from_domain(data.domain),
@@ -12731,14 +13164,11 @@ async def delete_organization(org_id: str, payload: dict = Depends(require_super
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
 
-    auth0_cleanup = None
-    if org.auth0_org_id:
-        auth0_cleanup = await auth0_mgmt.delete_organization(org.auth0_org_id)
-        if not auth0_cleanup.get("success"):
-            raise HTTPException(
-                status_code=502,
-                detail=f"Failed to delete organization in AUTH0: {auth0_cleanup.get('error') or 'unknown error'}"
-            )
+    users_result = await db.execute(select(UserModel).where(UserModel.organization_id == org_id))
+    users = users_result.scalars().all()
+    archive = await archive_deleted_organization(db, org, payload)
+    provider_cleanup = await delete_provider_records_for_organization(org, users)
+    archive.deletion_results = json.dumps(provider_cleanup, default=str)
 
     subscription_ids = select(SubscriptionModel.id).where(SubscriptionModel.organization_id == org_id)
     org_request_ids = select(OrganizationSubscriptionRequestModel.id).where(
@@ -12751,6 +13181,8 @@ async def delete_organization(org_id: str, payload: dict = Depends(require_super
     upgrade_request_item_ids = select(PlanUpgradeRequestItemModel.id).where(
         PlanUpgradeRequestItemModel.request_id.in_(upgrade_request_ids)
     )
+    user_ids = select(UserModel.id).where(UserModel.organization_id == org_id)
+    business_unit_ids = select(BusinessUnitModel.id).where(BusinessUnitModel.organization_id == org_id)
     project_ids = select(ProjectModel.id).where(ProjectModel.organization_id == org_id)
     application_ids = select(ApplicationModel.id).where(ApplicationModel.organization_id == org_id)
 
@@ -12785,9 +13217,14 @@ async def delete_organization(org_id: str, payload: dict = Depends(require_super
     await db.execute(delete(ApplicationBillingModel).where(ApplicationBillingModel.application_id.in_(application_ids)))
     await db.execute(delete(ApplicationModel).where(ApplicationModel.organization_id == org_id))
     await db.execute(delete(ProjectModel).where(ProjectModel.organization_id == org_id))
+    await db.execute(delete(QuotaModel).where(
+        QuotaModel.entity_type == "business_unit",
+        QuotaModel.entity_id.in_(business_unit_ids),
+    ))
     await db.execute(delete(BusinessUnitModel).where(BusinessUnitModel.organization_id == org_id))
 
     await db.execute(delete(UserRequestModel).where(UserRequestModel.organization_id == org_id))
+    await db.execute(delete(UserRoleAssignmentModel).where(UserRoleAssignmentModel.user_id.in_(user_ids)))
     await db.execute(delete(UserModel).where(UserModel.organization_id == org_id))
     await db.execute(delete(RoleModel).where(RoleModel.organization_id == org_id))
     await db.execute(delete(AdminModel).where(AdminModel.organization_id == org_id))
@@ -12799,8 +13236,8 @@ async def delete_organization(org_id: str, payload: dict = Depends(require_super
     return {
         "message": "Organization deleted",
         "organization_id": org_id,
-        "auth0_cleanup": auth0_cleanup,
-        "zitadel_cleanup": {"skipped": True, "reason": "Zitadel organization delete is not configured"},
+        "archive_id": archive.id,
+        "identity_provider_cleanup": provider_cleanup,
     }
 
 
@@ -12811,6 +13248,7 @@ class OrganizationFullUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None
     domain: Optional[str] = None
+    main_app_domain: Optional[str] = None
     contact_person: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
@@ -12833,11 +13271,15 @@ async def update_organization_full(org_id: str, data: OrganizationFullUpdate, pa
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     
-    update_data = {k: v for k, v in payload_dict(data, exclude_unset=True).items() if v is not None}
+    raw_update_data = payload_dict(data, exclude_unset=True)
+    update_data = {k: v for k, v in raw_update_data.items() if v is not None}
     if "supported_domains" in update_data and isinstance(update_data["supported_domains"], list):
         update_data["supported_domains"] = json.dumps(update_data["supported_domains"]) if update_data["supported_domains"] else None
     if "gateway_environments" in update_data and isinstance(update_data["gateway_environments"], list):
         update_data["gateway_environments"] = json.dumps(update_data["gateway_environments"]) if update_data["gateway_environments"] else None
+    if "main_app_domain" in raw_update_data:
+        update_data["main_app_domain"] = normalize_custom_domain(raw_update_data.get("main_app_domain"))
+        await assert_custom_domain_available(db, update_data["main_app_domain"], organization_id=org_id)
     if "name" in update_data:
         update_data["name"] = update_data["name"].strip()
         if not update_data["name"]:
@@ -12861,8 +13303,82 @@ async def update_organization_full(org_id: str, data: OrganizationFullUpdate, pa
     
     org.updated_at = datetime.now(timezone.utc)
     await db.commit()
-    
+
     return {"message": "Organization updated successfully", "organization": await organization_to_dict(db, org)}
+
+
+@api_router.get("/organizations/{org_id}/domains")
+async def get_organization_domains(
+    org_id: str,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get custom app domains and per-product database names for an organization."""
+    org = await get_organization_by_id(db, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    return {
+        "organization_id": org.id,
+        "organization_name": org.name,
+        "main_app_domain": org.main_app_domain,
+        "product_domains": await get_org_product_domains(db, org.id),
+    }
+
+
+@api_router.put("/organizations/{org_id}/domains")
+async def update_organization_domains(
+    org_id: str,
+    data: OrganizationDomainUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update optional custom app domains and per-product database names."""
+    org = await get_organization_by_id(db, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    raw_data = payload_dict(data, exclude_unset=True)
+    if "main_app_domain" in raw_data:
+        org.main_app_domain = normalize_custom_domain(raw_data.get("main_app_domain"))
+        await assert_custom_domain_available(db, org.main_app_domain, organization_id=org_id)
+
+    seen_domains = set()
+    if org.main_app_domain:
+        seen_domains.add(org.main_app_domain)
+
+    updated_products = []
+    if data.product_domains is not None:
+        for item in data.product_domains:
+            item_data = payload_dict(item, exclude_unset=True)
+            subscription = await find_active_subscription_for_domain_update(db, org_id, item)
+            if "domain" in item_data:
+                custom_domain = normalize_custom_domain(item.domain)
+                if custom_domain:
+                    if custom_domain in seen_domains:
+                        raise HTTPException(status_code=400, detail=f"Custom domain '{custom_domain}' is duplicated in this organization")
+                    seen_domains.add(custom_domain)
+                await assert_custom_domain_available(
+                    db,
+                    custom_domain,
+                    organization_id=org_id,
+                    subscription_id=subscription.id,
+                )
+                subscription.custom_domain = custom_domain
+            if "database" in item_data:
+                subscription.database = item.database.strip() if item.database else None
+            updated_products.append(subscription.id)
+
+    org.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(org)
+    return {
+        "message": "Organization domains updated",
+        "organization_id": org.id,
+        "main_app_domain": org.main_app_domain,
+        "updated_subscription_ids": updated_products,
+        "product_domains": await get_org_product_domains(db, org.id),
+    }
 
 
 @api_router.put("/organizations/{org_id}/subscription")
@@ -14324,6 +14840,43 @@ async def get_public_organizations(
     query = query.order_by(OrganizationModel.name.asc())
     result = await db.execute(query)
     return [await public_organization_to_dict(db, org) for org in result.scalars().all()]
+
+@api_router.get("/public/organizations/{org_id}/domains", tags=["Public API"])
+async def get_public_organization_domains(
+    org_id: str,
+    product_key: Optional[str] = None,
+    product_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get optional custom domains for an organization without requiring a token."""
+    org = await get_organization_by_id(db, org_id)
+    if not org or org.status != "approved":
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    product_domains = await get_org_product_domains(db, org.id)
+    selected_product_domain = None
+    if product_key or product_id:
+        for item in product_domains:
+            if product_key and item.get("product_key") == product_key:
+                selected_product_domain = item
+                break
+            if product_id and item.get("product_id") == product_id:
+                selected_product_domain = item
+                break
+        if not selected_product_domain:
+            raise HTTPException(status_code=404, detail="Product subscription domain not found")
+
+    return {
+        "organization_id": org.id,
+        "organization_name": org.name,
+        "main_app_domain": org.main_app_domain,
+        "domain": selected_product_domain.get("domain") if selected_product_domain else org.main_app_domain,
+        "product_domains": product_domains,
+        "domains": {
+            "main_app": org.main_app_domain,
+            "products": product_domains,
+        },
+    }
 
 @api_router.post("/public/organizations/request", tags=["Public API"])
 async def request_organization_subscription(data: OrganizationRequest, db: AsyncSession = Depends(get_db)):
@@ -16172,6 +16725,8 @@ async def ensure_runtime_schema(conn):
     await ensure_mysql_column(conn, "subscriptions", "api_count", "INT NULL")
     await ensure_mysql_column(conn, "subscriptions", "quota", "INT NULL")
     await ensure_mysql_column(conn, "subscriptions", "used_quota", "INT NOT NULL DEFAULT 0")
+    await ensure_mysql_column(conn, "subscriptions", "custom_domain", "VARCHAR(255) NULL")
+    await ensure_mysql_column(conn, "subscriptions", "database", "VARCHAR(255) NULL")
     await conn.execute(text("""
         UPDATE subscriptions s
         LEFT JOIN plans p ON s.plan_id = p.id
@@ -16219,6 +16774,7 @@ async def ensure_runtime_schema(conn):
         ("encryption_standard", "VARCHAR(255) NULL"),
         ("data_residency", "VARCHAR(255) NULL"),
         ("created_by", "VARCHAR(36) NULL"),
+        ("main_app_domain", "VARCHAR(255) NULL"),
     ]
     for column_name, column_definition in organization_columns:
         await ensure_mysql_column(conn, "organizations", column_name, column_definition)

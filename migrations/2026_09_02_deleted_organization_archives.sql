@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS `deleted_organization_archives` (
+  `id` varchar(36) NOT NULL,
+  `organization_id` varchar(36) NOT NULL,
+  `organization_name` varchar(255) NOT NULL,
+  `organization_email` varchar(255) DEFAULT NULL,
+  `organization_domain` varchar(255) DEFAULT NULL,
+  `external_org_id` varchar(100) DEFAULT NULL,
+  `auth0_org_id` varchar(100) DEFAULT NULL,
+  `zitadel_org_id` varchar(100) DEFAULT NULL,
+  `status` varchar(50) DEFAULT NULL,
+  `snapshot` longtext NOT NULL,
+  `deletion_results` longtext DEFAULT NULL,
+  `deleted_by` varchar(255) DEFAULT NULL,
+  `deleted_by_email` varchar(255) DEFAULT NULL,
+  `deleted_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_deleted_org_archives_org_id` (`organization_id`),
+  KEY `idx_deleted_org_archives_name` (`organization_name`),
+  KEY `idx_deleted_org_archives_deleted_at` (`deleted_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
