@@ -2191,6 +2191,7 @@ class IdentityLogoutRequest(BaseModel):
     post_logout_redirect_uri: Optional[str] = None
     state: Optional[str] = None
     logout_hint: Optional[str] = None
+    provider_logout: Optional[bool] = False
 
 class IdentitySessionValidateRequest(BaseModel):
     """Request to verify provider token and central logout status."""
@@ -14190,6 +14191,30 @@ async def logout_identity_provider_session(
     if login_record or session_revocation or context_session_revocation:
         await db.commit()
 
+    if data.provider_logout is False:
+        if provider == "zitadel":
+            product_key, post_logout_uri = resolve_zitadel_post_logout_uri(product, data.post_logout_redirect_uri)
+        else:
+            product_key, post_logout_uri = resolve_auth0_post_logout_uri(product, data.post_logout_redirect_uri)
+        return {
+            "success": True,
+            "identity_provider": provider,
+            "logout_url": post_logout_uri,
+            "redirect_required": True,
+            "provider_logout": False,
+            "cleared_cookies": True,
+            "revocation": provider_revocation,
+            "session_revocation": {
+                "id": (session_revocation or context_session_revocation).id,
+                "subject": (session_revocation or context_session_revocation).subject,
+                "revoked_at": (session_revocation or context_session_revocation).revoked_at.isoformat()
+                if (session_revocation or context_session_revocation).revoked_at else None,
+            } if (session_revocation or context_session_revocation) else None,
+            "product": product_key,
+            "post_logout_redirect_uri": post_logout_uri,
+            "login_record_id": login_record.id if login_record else None,
+        }
+
     if provider == "zitadel":
         if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
             raise HTTPException(status_code=500, detail="Zitadel logout is not configured")
@@ -14243,6 +14268,7 @@ async def logout_identity_provider_session_redirect(
     post_logout_redirect_uri: Optional[str] = None,
     state: Optional[str] = None,
     logout_hint: Optional[str] = None,
+    provider_logout: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -14309,6 +14335,15 @@ async def logout_identity_provider_session_redirect(
         clear_login_record_tokens(login_record)
     if login_record or session_revocation or context_session_revocation:
         await db.commit()
+
+    if provider_logout is False:
+        if provider == "zitadel":
+            _, post_logout_uri = resolve_zitadel_post_logout_uri(selected_product, post_logout_redirect_uri)
+        else:
+            _, post_logout_uri = resolve_auth0_post_logout_uri(selected_product, post_logout_redirect_uri)
+        redirect_response = RedirectResponse(url=post_logout_uri, status_code=302)
+        clear_product_auth_cookies(redirect_response)
+        return redirect_response
 
     if provider == "zitadel":
         if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
