@@ -17631,6 +17631,7 @@ async def issue_user_context_token(
         "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
         "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
         "cookie_set": True,
+        "user": build_context_token_response_user_context(user_context),
         "data": build_profile_response_data(user_context),
     }
 
