@@ -2191,7 +2191,7 @@ class IdentityLogoutRequest(BaseModel):
     post_logout_redirect_uri: Optional[str] = None
     state: Optional[str] = None
     logout_hint: Optional[str] = None
-    provider_logout: Optional[bool] = False
+    provider_logout: Optional[bool] = True
 
 class IdentitySessionValidateRequest(BaseModel):
     """Request to verify provider token and central logout status."""
@@ -14268,7 +14268,7 @@ async def logout_identity_provider_session_redirect(
     post_logout_redirect_uri: Optional[str] = None,
     state: Optional[str] = None,
     logout_hint: Optional[str] = None,
-    provider_logout: bool = False,
+    provider_logout: bool = True,
     db: AsyncSession = Depends(get_db),
 ):
     """
