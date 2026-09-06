@@ -89,6 +89,7 @@ DEFAULT_IDENTITY_PROVIDER = os.environ.get(
 if DEFAULT_IDENTITY_PROVIDER not in SUPPORTED_IDENTITY_PROVIDERS:
     DEFAULT_IDENTITY_PROVIDER = "zitadel"
 IDENTITY_PROVIDER_SETTING_KEY = "active_identity_provider"
+PROBESTACK_BILLING_DETAILS_SETTING_KEY = "probestack_billing_details"
 INDIVIDUAL_USERS_ORG_ID_SETTING_KEY = "individual_users_org_id"
 INDIVIDUAL_USERS_ORG_NAME_SETTING_KEY = "individual_users_org_name"
 INDIVIDUAL_USERS_ORG_EMAIL_SETTING_KEY = "individual_users_org_email"
@@ -98,6 +99,19 @@ INDIVIDUAL_USERS_ORG_ID_FALLBACK = os.environ.get("INDIVIDUAL_USERS_ORG_ID")
 INDIVIDUAL_USERS_ORG_NAME_FALLBACK = os.environ.get("INDIVIDUAL_USERS_ORG_NAME")
 INDIVIDUAL_USERS_ORG_EMAIL_FALLBACK = os.environ.get("INDIVIDUAL_USERS_ORG_EMAIL")
 INDIVIDUAL_USERS_CONTACT_PERSON_FALLBACK = os.environ.get("INDIVIDUAL_USERS_CONTACT_PERSON")
+DEFAULT_PROBESTACK_BILLING_DETAILS = {
+    "company_name": "ProbeStack Inc. (USA)",
+    "address_line_1": "415 Peachtree Pkwy",
+    "address_line_2": "Ste 250",
+    "city_state_zip": "Cumming, GA 30041",
+    "country": "",
+    "billing_email": "billing@probestack.com",
+    "phone": "",
+    "tax_id": "",
+    "payment_terms": "Net 15",
+    "payment_instructions": "Payment Method: ACH / Wire / Credit Card\nBank / Payment Portal: [Insert Details]\nPayment Frequency: Annually for all organizations\nReference: Please include the invoice number on payment.",
+    "footer_note": "Services are governed by the applicable ProbeStack agreement.",
+}
 
 # Zitadel Config
 ZITADEL_DOMAIN = os.environ.get('ZITADEL_DOMAIN', '')
@@ -182,6 +196,29 @@ ADMIN_BACKEND_PUBLIC_URL = (
     or os.environ.get("PROBESTACK_ADMIN_BACKEND_HOST")
     or "https://probestack.io/admin-backend"
 ).rstrip("/")
+ONBOARDING_API_BASE_URL = os.environ.get(
+    "ONBOARDING_API_BASE_URL",
+    "https://probestack.io/onboarding-api/api/v1/onboarding",
+).rstrip("/")
+ONBOARDING_API_TIMEOUT_SECONDS = float(os.environ.get("ONBOARDING_API_TIMEOUT_SECONDS", "8"))
+ONBOARDING_API_LOCAL_FALLBACK = os.environ.get("ONBOARDING_API_LOCAL_FALLBACK", "true").lower() in ["1", "true", "yes"]
+ONBOARDING_API_BEARER_TOKEN = os.environ.get("ONBOARDING_API_BEARER_TOKEN", "").strip()
+ONBOARDING_API_CONTEXT_HEADER = os.environ.get("ONBOARDING_API_CONTEXT_HEADER", "X-ProbeStack-Context-Token")
+ONBOARDING_API_FORWARD_AUTHORIZATION = os.environ.get("ONBOARDING_API_FORWARD_AUTHORIZATION", "true").lower() in ["1", "true", "yes"]
+ONBOARDING_SERVICE_TOKEN_URL = os.environ.get("ONBOARDING_SERVICE_TOKEN_URL", "https://auth.probestack.io/oauth2/token")
+ONBOARDING_SERVICE_CLIENT_ID = os.environ.get("ONBOARDING_SERVICE_CLIENT_ID", "probestack-admin-backend")
+ONBOARDING_SERVICE_CLIENT_SECRET = os.environ.get("ONBOARDING_SERVICE_CLIENT_SECRET", "").strip()
+ONBOARDING_SERVICE_AUDIENCE = os.environ.get("ONBOARDING_SERVICE_AUDIENCE", "probestack-api")
+ONBOARDING_SCOPE_MEMBERS_READ = "onboarding:members:read"
+ONBOARDING_SCOPE_ACCESS_READ = "onboarding:access:read"
+ONBOARDING_SCOPE_BOOTSTRAP_READ = "onboarding:bootstrap:read"
+ONBOARDING_SCOPE_ASSIGNMENTS_READ = "onboarding:assignments:read"
+ONBOARDING_SCOPE_ASSIGNMENTS_WRITE = "onboarding:assignments:write"
+ONBOARDING_SCOPE_BUSINESS_UNITS_READ = "onboarding:business-units:read"
+ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE = "onboarding:business-units:write"
+ONBOARDING_SCOPE_PROJECTS_READ = "onboarding:projects:read"
+ONBOARDING_SCOPE_PROJECTS_WRITE = "onboarding:projects:write"
+_onboarding_service_token_cache = {}
 PROBESTACK_TOKEN_ISSUER = os.environ.get("PROBESTACK_TOKEN_ISSUER", "https://auth.probestack.io")
 _PROBESTACK_TOKEN_AUDIENCE_RAW = os.environ.get("PROBESTACK_TOKEN_AUDIENCE", '["probestack-api", "probestack-ui"]')
 try:
@@ -2033,6 +2070,19 @@ class NotificationGroupEmailUpdate(BaseModel):
 
 class BillingInvoiceEmailRequest(BaseModel):
     emails: List[str]
+
+class ProbestackBillingDetailsUpdate(BaseModel):
+    company_name: Optional[str] = None
+    address_line_1: Optional[str] = None
+    address_line_2: Optional[str] = None
+    city_state_zip: Optional[str] = None
+    country: Optional[str] = None
+    billing_email: Optional[str] = None
+    phone: Optional[str] = None
+    tax_id: Optional[str] = None
+    payment_terms: Optional[str] = None
+    payment_instructions: Optional[str] = None
+    footer_note: Optional[str] = None
 
 class OrganizationCreate(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -4832,6 +4882,7 @@ async def build_user_context(
         "organization": {
             "id": organization.id if organization else organization_id,
             "name": organization.name if organization else await get_organization_name(db, organization_id, None),
+            "organization_code": organization.organization_code if organization else None,
             "external_org_id": organization.external_org_id if organization else None,
             "auth0_org_id": organization.auth0_org_id if organization else None,
             "zitadel_org_id": organization.zitadel_org_id if organization else None,
@@ -5094,6 +5145,251 @@ def build_context_token_response_user_context(user_context: dict) -> dict:
             subscription.pop("organization_name", None)
     return response_context
 
+def isoformat_utc(value: Optional[datetime]) -> Optional[str]:
+    if not value:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+def profile_organization_key(organization: Optional[dict]) -> Optional[str]:
+    if not organization:
+        return None
+    return (
+        organization.get("key")
+        or organization.get("organization_code")
+        or organization.get("external_org_id")
+        or organization.get("auth0_org_id")
+        or organization.get("zitadel_org_id")
+        or normalize_token_value(organization.get("name"), "organization")
+    )
+
+def build_profile_user(user_context: dict) -> dict:
+    user = user_context.get("user") or {}
+    return {
+        "id": user.get("id"),
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "type": user.get("type") or "user",
+        "status": user.get("status") or "active",
+        "email_verified": bool(user.get("email_verified")),
+        "created_at": user.get("created_at"),
+        "preferences": {
+            "theme": user.get("theme_preference") or user.get("preferences", {}).get("theme") or "system",
+        },
+    }
+
+def build_profile_organization(user_context: dict) -> Optional[dict]:
+    organization = user_context.get("organization") or {}
+    if not organization:
+        return None
+    return {
+        "id": organization.get("id"),
+        "key": profile_organization_key(organization),
+        "name": organization.get("name"),
+        "status": organization.get("status"),
+        "account_type": user_context.get("account_type") or "enterprise",
+        "supported_domains": organization.get("supported_domains") or [],
+    }
+
+def build_profile_business_roles(user_context: dict) -> List[dict]:
+    roles = []
+    for role in user_context.get("roles") or []:
+        role_name = role.get("name") or role.get("role_name") or role.get("key") or role.get("id")
+        permissions = role.get("permissions") or []
+        roles.append({
+            "id": role.get("id"),
+            "key": role.get("key") or role.get("code") or normalize_token_value(role_name, "role"),
+            "name": role_name,
+            "description": role.get("description"),
+            "permissions": permissions if isinstance(permissions, list) else parse_json_list(permissions),
+        })
+
+    if not roles and user_context.get("org_role"):
+        org_role = user_context.get("org_role") or {}
+        role_name = org_role.get("name")
+        if role_name:
+            permissions = org_role.get("permissions") or user_context.get("permissions") or []
+            roles.append({
+                "id": org_role.get("id"),
+                "key": normalize_token_value(role_name, "role"),
+                "name": role_name,
+                "description": org_role.get("description"),
+                "permissions": permissions if isinstance(permissions, list) else parse_json_list(permissions),
+            })
+    return roles
+
+def build_profile_applications(user_context: dict) -> List[dict]:
+    applications = []
+    for application in user_context.get("applications") or []:
+        if not isinstance(application, dict):
+            continue
+        project = application.get("project") if isinstance(application.get("project"), dict) else {}
+        business_unit = project.get("business_unit") if isinstance(project.get("business_unit"), dict) else {}
+        applications.append({
+            "id": application.get("id"),
+            "application_id": application.get("application_id") or application.get("applicationId"),
+            "name": application.get("name") or application.get("application_name"),
+            "description": application.get("description"),
+            "status": application.get("status"),
+            "project": {
+                "id": project.get("id") or application.get("project_id"),
+                "name": project.get("name") or application.get("project_name"),
+                "business_unit": {
+                    "id": business_unit.get("id") or application.get("business_unit_id"),
+                    "name": business_unit.get("name") or application.get("business_unit_name"),
+                },
+            },
+            "products": application.get("products") or [],
+        })
+    return applications
+
+def build_profile_subscription(subscription: dict) -> dict:
+    product_key = subscription.get("product_key") or subscription.get("tool") or subscription.get("product_id")
+    unit_price = subscription.get("billing_unit_price")
+    billable_users = subscription.get("billable_users")
+    total_amount = subscription.get("billing_amount")
+    return {
+        "id": subscription.get("id"),
+        "status": subscription.get("status"),
+        "product": {
+            "id": subscription.get("product_id") or product_key,
+            "key": product_key,
+            "name": subscription.get("product_name") or product_key,
+        },
+        "plan": {
+            "id": subscription.get("plan_id"),
+            "name": subscription.get("plan_name"),
+            "tier": subscription.get("plan_tier"),
+        },
+        "period": {
+            "starts_at": subscription.get("start_date"),
+            "ends_at": subscription.get("end_date"),
+        },
+        "billing": {
+            "cycle": subscription.get("billing_cycle"),
+            "amount": subscription.get("amount"),
+            "billable_users": billable_users,
+            "is_per_user": bool(subscription.get("is_per_user")),
+            "unit_price": unit_price,
+            "total_amount": total_amount if total_amount is not None else subscription.get("amount"),
+        },
+        "usage": {
+            "quota": subscription.get("quota"),
+            "used_quota": subscription.get("used_quota"),
+            "remaining_quota": subscription.get("remaining_quota"),
+        },
+        "configuration": {
+            "custom_domain": subscription.get("custom_domain"),
+            "database": subscription.get("database"),
+        },
+        "tools": subscription.get("tools") or [],
+        "created_at": subscription.get("created_at"),
+    }
+
+def build_profile_response_data(user_context: dict, session: Optional[dict] = None) -> dict:
+    data = {}
+    if session is not None:
+        data["session"] = session
+    data.update({
+        "user": build_profile_user(user_context),
+        "organization": build_profile_organization(user_context),
+        "business_roles": build_profile_business_roles(user_context),
+        "administration": {
+            "is_admin": bool(user_context.get("is_admin")),
+            "is_org_admin": bool(user_context.get("is_org_admin")),
+            "is_super_admin": bool(user_context.get("is_super_admin")),
+        },
+        "applications": build_profile_applications(user_context),
+        "subscriptions": [
+            build_profile_subscription(subscription)
+            for subscription in user_context.get("subscriptions") or []
+            if isinstance(subscription, dict)
+        ],
+    })
+    return data
+
+def build_profile_session_from_token_payload(payload: dict) -> dict:
+    now = int(datetime.now(timezone.utc).timestamp())
+    expires_at = int(payload.get("exp") or now)
+    return {
+        "authentication_method": "cookie",
+        "expires_in": max(0, expires_at - now),
+        "expires_at": isoformat_utc(datetime.fromtimestamp(expires_at, timezone.utc)),
+    }
+
+async def create_admin_onboarding_context_token(
+    db: AsyncSession,
+    admin: AdminModel,
+    organization_name: Optional[str],
+) -> tuple[Optional[str], Optional[int]]:
+    if not PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY:
+        logger.warning(
+            "PROBESTACK_CONTEXT_TOKEN_PRIVATE_KEY is not configured; "
+            "admin login will not issue an onboarding context token"
+        )
+        return None, None
+    if not admin.organization_id:
+        return None, None
+
+    org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == admin.organization_id))
+    organization = org_result.scalar_one_or_none()
+    if not organization:
+        return None, None
+
+    admin_permissions = ["all"] if admin.role == "super_admin" else ["read", "write", "manage_users"]
+    is_org_admin = admin.role == "org_admin"
+    user_context = {
+        "user": {
+            "id": admin.id,
+            "email": admin.email,
+            "name": admin.name,
+            "type": "admin",
+            "status": "active" if admin.is_active else "inactive",
+            "theme_preference": "system",
+            "email_verified": True,
+            "auth0_user_id": None,
+            "zitadel_user_id": None,
+            "created_at": admin.created_at.isoformat() if admin.created_at else None,
+        },
+        "organization": {
+            "id": organization.id,
+            "name": organization.name or organization_name,
+            "organization_code": organization.organization_code,
+            "external_org_id": organization.external_org_id,
+            "auth0_org_id": organization.auth0_org_id,
+            "zitadel_org_id": organization.zitadel_org_id,
+            "status": organization.status,
+            "supported_domains": parse_json_list(organization.supported_domains) if organization.supported_domains else [],
+        },
+        "org_role": {
+            "id": None,
+            "name": admin.role,
+            "permissions": admin_permissions,
+        },
+        "org_role_name": admin.role,
+        "roles": [],
+        "admin": {
+            "id": admin.id,
+            "role": admin.role,
+            "is_active": admin.is_active,
+            "permissions": admin_permissions,
+        },
+        "is_admin": True,
+        "is_org_admin": is_org_admin,
+        "is_super_admin": admin.role == "super_admin",
+        "account_type": "enterprise",
+        "permissions": admin_permissions,
+        "mongodb_role_lookup": None,
+        "business_units": [],
+        "projects": [],
+        "projects_without_business_unit": [],
+        "subscriptions": [],
+        "plans": [],
+        "tools": [],
+    }
+    return create_user_context_token(user_context)
+
 async def billing_to_dict(db: AsyncSession, billing: BillingModel) -> dict:
     data = model_to_dict(billing)
     data["organization_name"] = await get_organization_name(db, billing.organization_id)
@@ -5176,15 +5472,25 @@ def _invoice_sheet_xml(invoice: dict, line_items: list[dict]) -> str:
     billing_period = f"{invoice['period_start'].strftime('%Y-%m-%d')} - {invoice['period_end'].strftime('%Y-%m-%d')}"
     organization = invoice["organization"]
     customer_address = _organization_invoice_address(organization)
+    sender = _invoice_sender_details(invoice)
+    sender_address_lines = _invoice_sender_address_lines(sender)
+    sender_address_line_1 = ", ".join(sender_address_lines[:2])
+    sender_address_line_2_parts = sender_address_lines[2:]
+    sender_contact_line = _invoice_sender_contact_line(sender)
+    if sender.get("tax_id"):
+        sender_address_line_2_parts.append(f"Tax ID: {sender['tax_id']}")
+    if sender_contact_line:
+        sender_address_line_2_parts.append(sender_contact_line)
+    sender_address_line_2 = " | ".join(sender_address_line_2_parts)
     rows = [
         _xlsx_row(1, ["PROBESTACK", "", "", "", "", "", "", ""], 1, height=28),
         _xlsx_row(2, ["Annual Software Subscriptions & AI Platform", "", "", "", "", "", "", ""], 3),
         _xlsx_row(4, ["INVOICE", "", "", "", "Invoice Details", "", "", ""], 7),
         _xlsx_row(5, ["", "", "", "", "Invoice #", invoice["invoice_number"], "Invoice Date", invoice_date], 4),
         _xlsx_row(6, ["From", "", "", "", "Customer PO #", "", "Due Date", due_date], 4),
-        _xlsx_row(7, ["ProbeStack Inc. (USA)", "", "", "", "Payment Terms", "Net 15", "Currency", "USD"], 4),
-        _xlsx_row(8, ["415 Peachtree Pkwy, Ste 250", "", "", "", "Billing Period", billing_period, "Status", invoice["status"]], 4),
-        _xlsx_row(9, ["Cumming, GA 30041 | billing@probestack.com"], 4),
+        _xlsx_row(7, [sender["company_name"], "", "", "", "Payment Terms", sender["payment_terms"], "Currency", "USD"], 4),
+        _xlsx_row(8, [sender_address_line_1, "", "", "", "Billing Period", billing_period, "Status", invoice["status"]], 4),
+        _xlsx_row(9, [sender_address_line_2], 4),
         _xlsx_row(11, ["Bill To"], 7),
         _xlsx_row(12, [organization.get("legal_name") or organization.get("name") or "Customer"], 4),
         _xlsx_row(13, [customer_address], 4),
@@ -5209,10 +5515,10 @@ def _invoice_sheet_xml(invoice: dict, line_items: list[dict]) -> str:
     tax = 0.0
     rows.extend([
         _xlsx_row(total_row, ["Payment Instructions", "", "", "", "", "Subtotal", "", {"value": subtotal, "formula": f"SUM(H17:H{16 + len(line_items)})", "style": 8}], 7),
-        _xlsx_row(total_row + 1, ["Payment Method: ACH / Wire / Credit Card\nBank / Payment Portal: [Insert Details]\nPayment Frequency: Annually for all organizations\nReference: Please include the invoice number on payment.", "", "", "", "", "Tax", "", {"value": tax, "formula": f"SUMPRODUCT(H17:H{16 + len(line_items)},G17:G{16 + len(line_items)})", "style": 8}], 9, height=62),
+        _xlsx_row(total_row + 1, [sender["payment_instructions"], "", "", "", "", "Tax", "", {"value": tax, "formula": f"SUMPRODUCT(H17:H{16 + len(line_items)},G17:G{16 + len(line_items)})", "style": 8}], 9, height=62),
         _xlsx_row(total_row + 2, ["", "", "", "", "", "Total Due", "", {"value": subtotal + tax, "formula": f"H{total_row}+H{total_row + 1}", "style": 8}], 7),
         _xlsx_row(total_row + 5, ["Notes & Terms"], 7),
-        _xlsx_row(total_row + 6, ["SKU is the unique product-plan ID for each product such as ForgeShift or ForgeFuzz. Product Plan should be Starter, Enterprise, or Enterprise Plus. Payment is annual for all organizations. Use Qty for number of users when user-priced; use Qty = 1 for each subscription-priced or /month subscription line."], 9, height=56),
+        _xlsx_row(total_row + 6, [sender["footer_note"]], 9, height=56),
     ])
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -5351,11 +5657,30 @@ def _organization_invoice_address(organization: dict) -> str:
             return value
     return "100 Customer Avenue, Suite 200, San Francisco, CA 94105"
 
+def _invoice_sender_details(invoice: dict) -> dict:
+    return normalize_probestack_billing_details(invoice.get("sender"))
+
+def _invoice_sender_address_lines(sender: dict) -> list[str]:
+    return [
+        line for line in [
+            sender.get("address_line_1"),
+            sender.get("address_line_2"),
+            sender.get("city_state_zip"),
+            sender.get("country"),
+        ]
+        if line
+    ]
+
+def _invoice_sender_contact_line(sender: dict) -> str:
+    return " | ".join([value for value in [sender.get("billing_email"), sender.get("phone")] if value])
+
 def build_invoice_pdf(invoice: dict, line_items: list[dict]) -> bytes:
     organization = invoice["organization"]
     org_name = organization.get("legal_name") or organization.get("name") or "Customer"
     customer_address = _organization_invoice_address(organization)
-    sender_address_lines = ["415 Peachtree Pkwy", "Ste 250", "Cumming, GA 30041"]
+    sender = _invoice_sender_details(invoice)
+    sender_address_lines = _invoice_sender_address_lines(sender)
+    sender_contact_line = _invoice_sender_contact_line(sender)
     invoice_date = invoice["billing_date"].strftime("%Y-%m-%d")
     due_date = invoice["due_date"].strftime("%Y-%m-%d")
     billing_period = f"{invoice['period_start'].strftime('%Y-%m-%d')} - {invoice['period_end'].strftime('%Y-%m-%d')}"
@@ -5377,15 +5702,22 @@ def build_invoice_pdf(invoice: dict, line_items: list[dict]) -> bytes:
     stream += _pdf_text_line(42, 690, "Annual Software Subscriptions & AI Platform", 10, False, muted)
 
     stream += _pdf_text_line(42, 658, "From", 11, True, orange)
-    stream += _pdf_text_line(42, 638, "ProbeStack Inc. (USA)", 10, True, dark)
+    stream += _pdf_text_line(42, 638, sender["company_name"], 10, True, dark)
     for index, line in enumerate(sender_address_lines):
         stream += _pdf_text_line(42, 624 - (index * 13), line, 8.5, False, muted)
-    stream += _pdf_text_line(42, 585, "billing@probestack.com", 8.5, False, muted)
+    sender_next_y = 624 - (len(sender_address_lines) * 13)
+    if sender_contact_line:
+        stream += _pdf_text_line(42, sender_next_y, sender_contact_line, 8.5, False, muted)
+        sender_next_y -= 13
+    if sender.get("tax_id"):
+        stream += _pdf_text_line(42, sender_next_y, f"Tax ID: {sender['tax_id']}", 8.2, False, muted)
+        sender_next_y -= 13
 
-    stream += _pdf_text_line(42, 572, "Bill To", 11, True, orange)
-    stream += _pdf_text_line(42, 552, org_name, 10, True, dark)
+    bill_to_y = min(572, sender_next_y - 8)
+    stream += _pdf_text_line(42, bill_to_y, "Bill To", 11, True, orange)
+    stream += _pdf_text_line(42, bill_to_y - 20, org_name, 10, True, dark)
     for index, line in enumerate(_wrap_pdf_text(customer_address, 52)[:2]):
-        stream += _pdf_text_line(42, 538 - (index * 13), line, 8.5, False, muted)
+        stream += _pdf_text_line(42, bill_to_y - 34 - (index * 13), line, 8.5, False, muted)
 
     stream += _pdf_rect(334, 532, 236, 130, soft)
     stream += _pdf_text_line(348, 644, "Invoice Details", 11, True, orange)
@@ -5394,7 +5726,7 @@ def build_invoice_pdf(invoice: dict, line_items: list[dict]) -> bytes:
         ("Invoice #", invoice["invoice_number"]),
         ("Invoice Date", invoice_date),
         ("Due Date", due_date),
-        ("Payment Terms", "Net 30"),
+        ("Payment Terms", sender["payment_terms"]),
         ("Billing", "Annual"),
         ("Billing Period", billing_period),
         ("Status", str(invoice["status"]).title()),
@@ -5459,12 +5791,12 @@ def build_invoice_pdf(invoice: dict, line_items: list[dict]) -> bytes:
     notes_y = 108
     stream += _pdf_rect(42, 46, 320, 78, soft)
     stream += _pdf_text_line(56, notes_y, "Payment Instructions", 9.5, True, orange)
-    stream += _pdf_text_line(56, notes_y - 15, "Payment Method: ACH / Wire / Credit Card", 7.8, False, dark)
-    stream += _pdf_text_line(56, notes_y - 28, "Payment Frequency: Annually for all organizations", 7.8, False, dark)
-    stream += _pdf_text_line(56, notes_y - 41, "Reference: Include the invoice number on payment.", 7.8, False, dark)
+    for index, line in enumerate(str(sender["payment_instructions"]).splitlines()[:3]):
+        stream += _pdf_text_line(56, notes_y - 15 - (index * 13), line, 7.8, False, dark)
     stream += _pdf_text_line(56, notes_y - 60, "Notes & Terms", 8, True, muted)
-    stream += _pdf_text_line(122, notes_y - 60, "Services are governed by the applicable ProbeStack agreement.", 7.2, False, muted)
-    stream += _pdf_text_line(42, 28, "Questions: billing@probestack.com", 7.2, False, muted)
+    stream += _pdf_text_line(122, notes_y - 60, sender["footer_note"], 7.2, False, muted)
+    if sender.get("billing_email"):
+        stream += _pdf_text_line(42, 28, f"Questions: {sender['billing_email']}", 7.2, False, muted)
 
     stream_bytes = stream.encode("latin-1", "replace")
     objects = [
@@ -5958,6 +6290,53 @@ async def get_system_setting_value(db: AsyncSession, key: str, default: Optional
     setting = result.scalar_one_or_none()
     return setting.value if setting else default
 
+def normalize_probestack_billing_details(data: Optional[dict] = None) -> dict:
+    details = dict(DEFAULT_PROBESTACK_BILLING_DETAILS)
+    if isinstance(data, dict):
+        for key in details:
+            if key in data:
+                details[key] = str(data.get(key) or "").strip()
+    for key in ("company_name", "billing_email", "payment_terms", "payment_instructions", "footer_note"):
+        if not details[key]:
+            details[key] = DEFAULT_PROBESTACK_BILLING_DETAILS[key]
+    return details
+
+async def get_probestack_billing_details(db: AsyncSession) -> dict:
+    raw_value = await get_system_setting_value(db, PROBESTACK_BILLING_DETAILS_SETTING_KEY)
+    if not raw_value:
+        return normalize_probestack_billing_details()
+    try:
+        saved_details = json.loads(raw_value)
+    except json.JSONDecodeError:
+        logger.warning("Invalid ProbeStack billing details setting; using defaults")
+        saved_details = {}
+    return normalize_probestack_billing_details(saved_details)
+
+async def set_probestack_billing_details(
+    db: AsyncSession,
+    data: ProbestackBillingDetailsUpdate,
+    updated_by: Optional[str] = None
+) -> SystemSettingModel:
+    details = normalize_probestack_billing_details(data.model_dump())
+    result = await db.execute(
+        select(SystemSettingModel).where(SystemSettingModel.key == PROBESTACK_BILLING_DETAILS_SETTING_KEY)
+    )
+    setting = result.scalar_one_or_none()
+    setting_value = json.dumps(details, sort_keys=True)
+    if not setting:
+        setting = SystemSettingModel(
+            key=PROBESTACK_BILLING_DETAILS_SETTING_KEY,
+            value=setting_value,
+            updated_by=updated_by,
+        )
+        db.add(setting)
+    else:
+        setting.value = setting_value
+        setting.updated_by = updated_by
+        setting.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    return setting
+
 async def get_required_system_setting_value(db: AsyncSession, key: str, fallback: Optional[str] = None) -> str:
     value = await get_system_setting_value(db, key)
     if value:
@@ -6011,6 +6390,653 @@ async def get_approved_org_for_admin(payload: dict, db: AsyncSession) -> Organiz
         raise HTTPException(status_code=400, detail="Organization is not approved")
 
     return org
+
+def clean_bearer_token(value: Optional[str]) -> Optional[str]:
+    token = (value or "").strip()
+    if not token:
+        return None
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token or None
+
+def get_request_onboarding_context_token(request: Request) -> Optional[str]:
+    header_candidates = [
+        ONBOARDING_API_CONTEXT_HEADER,
+        "X-ProbeStack-Context-Token",
+        "X-Onboarding-Context-Token",
+        "X-Context-Token",
+    ]
+    seen_headers = set()
+    for header_name in header_candidates:
+        normalized_header = header_name.lower()
+        if normalized_header in seen_headers:
+            continue
+        seen_headers.add(normalized_header)
+        token = clean_bearer_token(request.headers.get(header_name))
+        if token:
+            return token
+
+    for cookie_name in ["ps_auth_token", "contextToken", "context_token", "onboarding_context_token"]:
+        token = clean_bearer_token(request.cookies.get(cookie_name))
+        if token:
+            return token
+    return None
+
+def get_forward_auth_headers(request: Request) -> dict:
+    headers = {"Accept": "application/json"}
+    context_token = get_request_onboarding_context_token(request)
+    configured_token = clean_bearer_token(ONBOARDING_API_BEARER_TOKEN)
+    if context_token:
+        headers["Authorization"] = f"Bearer {context_token}"
+    elif configured_token:
+        headers["Authorization"] = f"Bearer {configured_token}"
+    elif ONBOARDING_API_FORWARD_AUTHORIZATION:
+        authorization = request.headers.get("authorization")
+        if authorization:
+            headers["Authorization"] = authorization
+    return headers
+
+async def get_onboarding_service_token(
+    organization_id: Optional[str],
+    scopes: Optional[List[str]],
+    *,
+    force_refresh: bool = False,
+) -> Optional[str]:
+    if not organization_id or not scopes or not ONBOARDING_SERVICE_CLIENT_SECRET:
+        return None
+
+    scope_value = " ".join(sorted(set([scope for scope in scopes if scope])))
+    if not scope_value:
+        return None
+
+    cache_key = (organization_id, scope_value)
+    now = int(datetime.now(timezone.utc).timestamp())
+    cached = _onboarding_service_token_cache.get(cache_key)
+    if cached and not force_refresh and cached.get("expires_at", 0) > now + 30:
+        return cached.get("token")
+
+    basic_value = base64.b64encode(
+        f"{ONBOARDING_SERVICE_CLIENT_ID}:{ONBOARDING_SERVICE_CLIENT_SECRET}".encode("utf-8")
+    ).decode("ascii")
+    form_data = {
+        "grant_type": "client_credentials",
+        "audience": ONBOARDING_SERVICE_AUDIENCE,
+        "organization_id": organization_id,
+        "scope": scope_value,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=ONBOARDING_API_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                ONBOARDING_SERVICE_TOKEN_URL,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Basic {basic_value}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data=form_data,
+            )
+    except httpx.RequestError as exc:
+        logger.warning(f"Onboarding service token request failed: {exc}")
+        raise HTTPException(status_code=502, detail="Onboarding auth service is unavailable")
+
+    if response.status_code < 200 or response.status_code >= 300:
+        detail = extract_response_detail(response)
+        if response.status_code in {401, 403}:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Onboarding API authorization failed",
+                    "upstream_status": response.status_code,
+                    "upstream_detail": detail,
+                },
+            )
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    try:
+        payload = response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Onboarding auth service returned a non-JSON response")
+
+    token = clean_bearer_token(payload.get("access_token"))
+    if not token:
+        raise HTTPException(status_code=502, detail="Onboarding auth service did not return an access token")
+
+    expires_in = int(payload.get("expires_in") or 300)
+    _onboarding_service_token_cache[cache_key] = {
+        "token": token,
+        "expires_at": now + max(60, expires_in - 60),
+    }
+    return token
+
+async def get_onboarding_auth_headers(
+    request: Request,
+    *,
+    organization_id: Optional[str] = None,
+    scopes: Optional[List[str]] = None,
+    force_refresh: bool = False,
+) -> dict:
+    service_token = await get_onboarding_service_token(
+        organization_id,
+        scopes,
+        force_refresh=force_refresh,
+    )
+    if service_token:
+        return {"Accept": "application/json", "Authorization": f"Bearer {service_token}"}
+    return get_forward_auth_headers(request)
+
+def extract_response_detail(response: httpx.Response) -> Any:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text or response.reason_phrase
+    if isinstance(payload, dict):
+        return payload.get("detail") or payload.get("message") or payload
+    return payload
+
+async def onboarding_api_request(
+    request: Request,
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict] = None,
+    json_payload: Optional[dict] = None,
+    organization_id: Optional[str] = None,
+    scopes: Optional[List[str]] = None,
+    force_token_refresh: bool = False,
+) -> Any:
+    if not ONBOARDING_API_BASE_URL:
+        raise HTTPException(status_code=502, detail="Onboarding API base URL is not configured")
+    target_url = f"{ONBOARDING_API_BASE_URL}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=ONBOARDING_API_TIMEOUT_SECONDS) as client:
+            response = await client.request(
+                method,
+                target_url,
+                headers=await get_onboarding_auth_headers(
+                    request,
+                    organization_id=organization_id,
+                    scopes=scopes,
+                    force_refresh=force_token_refresh,
+                ),
+                params={key: value for key, value in (params or {}).items() if value is not None},
+                json=json_payload,
+            )
+            if response.status_code == 401 and organization_id and scopes and not force_token_refresh:
+                response = await client.request(
+                    method,
+                    target_url,
+                    headers=await get_onboarding_auth_headers(
+                        request,
+                        organization_id=organization_id,
+                        scopes=scopes,
+                        force_refresh=True,
+                    ),
+                    params={key: value for key, value in (params or {}).items() if value is not None},
+                    json=json_payload,
+                )
+    except httpx.RequestError as exc:
+        logger.warning(f"Onboarding API request failed for {method} {path}: {exc}")
+        raise HTTPException(status_code=502, detail="Onboarding API is unavailable")
+
+    if response.status_code < 200 or response.status_code >= 300:
+        detail = extract_response_detail(response)
+        if response.status_code in {401, 403}:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Onboarding auth service authorization failed",
+                    "upstream_status": response.status_code,
+                    "upstream_detail": detail,
+                },
+            )
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    if response.status_code == 204 or not response.content:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Onboarding API returned a non-JSON response")
+
+async def onboarding_api_get_with_local_fallback(
+    request: Request,
+    path: str,
+    *,
+    params: Optional[dict] = None,
+    organization_id: Optional[str] = None,
+    scopes: Optional[List[str]] = None,
+) -> Optional[Any]:
+    try:
+        return await onboarding_api_request(
+            request,
+            "GET",
+            path,
+            params=params,
+            organization_id=organization_id,
+            scopes=scopes,
+        )
+    except HTTPException as exc:
+        if ONBOARDING_API_LOCAL_FALLBACK and exc.status_code in {404, 502, 503, 504}:
+            logger.info(f"Using local fallback for onboarding GET {path}: {exc.detail}")
+            return None
+        raise
+
+def first_present(mapping: dict, keys: List[str]) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in [None, ""]:
+            return value
+    return None
+
+def unwrap_single_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        for key in ["data", "resource", "user", "member", "assignment"]:
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                return nested
+    return payload
+
+def extract_items(payload: Any, keys: Optional[List[str]] = None) -> List[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in keys or []:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested_items = extract_items(value, keys)
+            if nested_items:
+                return nested_items
+    for key in ["data", "content", "items", "results", "resources", "users", "members", "assignments"]:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested_items = extract_items(value, keys)
+            if nested_items:
+                return nested_items
+    return []
+
+def normalize_catalog_resource(item: dict, expected_type: str) -> dict:
+    resource = item.get("resource") if isinstance(item.get("resource"), dict) else item
+    merged = {**resource}
+    for key, value in item.items():
+        if key not in merged and key != "resource":
+            merged[key] = value
+
+    resource_type = (
+        first_present(merged, ["resourceType", "resource_type", "type", "scopeType", "scope_type"])
+        or expected_type
+    )
+    resource_type = str(resource_type).upper()
+    resource_id = first_present(
+        merged,
+        ["id", "resourceId", "resource_id", "scopeId", "scope_id", "businessUnitId", "business_unit_id", "projectId", "project_id"],
+    )
+    name = first_present(
+        merged,
+        ["name", "resourceName", "resource_name", "displayName", "display_name", "businessUnitName", "business_unit_name", "projectName", "project_name", "teamName", "team_name"],
+    )
+    code = first_present(
+        merged,
+        ["code", "resourceCode", "resource_code", "businessUnitCode", "business_unit_code", "projectCode", "project_code"],
+    )
+
+    normalized = dict(merged)
+    normalized["id"] = str(resource_id) if resource_id is not None else None
+    normalized["name"] = name or normalized["id"]
+    normalized["code"] = code
+    normalized["status"] = str(first_present(merged, ["status", "resourceStatus", "resource_status"]) or "active").lower()
+    normalized["resource_type"] = resource_type
+    normalized["resourceType"] = resource_type
+    normalized["users"] = extract_items(merged, ["users", "members", "principals"])
+
+    if resource_type == "PROJECT":
+        business_unit_id = first_present(
+            merged,
+            ["business_unit_id", "businessUnitId", "parentBusinessUnitId", "parent_business_unit_id"],
+        )
+        parent_type = str(first_present(merged, ["parentResourceType", "parent_resource_type"]) or "").upper()
+        if not business_unit_id and parent_type == "BUSINESS_UNIT":
+            business_unit_id = first_present(merged, ["parentResourceId", "parent_resource_id", "parentId", "parent_id"])
+        normalized["business_unit_id"] = business_unit_id
+        normalized["project_id"] = normalized["id"]
+        normalized["project_name"] = normalized["name"]
+        normalized["project_code"] = normalized["code"]
+    elif resource_type == "BUSINESS_UNIT":
+        normalized["business_unit_id"] = normalized["id"]
+        normalized["business_unit_name"] = normalized["name"]
+        normalized["business_unit_code"] = normalized["code"]
+        nested_projects = extract_items(merged, ["projects", "teams", "children"])
+        normalized["projects"] = [
+            normalize_catalog_resource(project, "PROJECT")
+            for project in nested_projects
+        ]
+        normalized["teams"] = normalized["projects"]
+    elif resource_type == "APPLICATION":
+        normalized["application_id"] = normalized["id"]
+
+    return normalized
+
+def normalize_business_unit_response(item: Any) -> dict:
+    business_unit = unwrap_single_payload(item)
+    if not isinstance(business_unit, dict):
+        return {}
+    normalized = normalize_catalog_resource(business_unit, "BUSINESS_UNIT")
+    display_name = first_present(business_unit, ["displayName", "display_name", "name"])
+    owner_name = first_present(business_unit, ["ownerName", "owner_name"])
+    owner_email = first_present(business_unit, ["ownerEmail", "owner_email"])
+    normalized["display_name"] = display_name
+    normalized["displayName"] = display_name
+    normalized["owner_name"] = owner_name
+    normalized["ownerName"] = owner_name
+    normalized["owner_email"] = owner_email
+    normalized["ownerEmail"] = owner_email
+    normalized["description"] = first_present(business_unit, ["description"]) or normalized.get("description")
+    return normalized
+
+def normalize_business_units_response(payload: Any) -> List[dict]:
+    items = extract_items(payload, ["businessUnits", "business_units", "data", "content", "items", "results"])
+    if not items and isinstance(unwrap_single_payload(payload), dict):
+        items = [unwrap_single_payload(payload)]
+    return [item for item in [normalize_business_unit_response(item) for item in items] if item.get("id")]
+
+def normalize_project_response(item: Any) -> dict:
+    project = unwrap_single_payload(item)
+    if not isinstance(project, dict):
+        return {}
+    normalized = normalize_catalog_resource(project, "PROJECT")
+    business_unit_id = first_present(
+        project,
+        ["businessUnitId", "business_unit_id", "parentBusinessUnitId", "parent_business_unit_id"],
+    ) or normalized.get("business_unit_id")
+    owner_name = first_present(project, ["ownerName", "owner_name"])
+    owner_email = first_present(project, ["ownerEmail", "owner_email"])
+    normalized["business_unit_id"] = business_unit_id
+    normalized["businessUnitId"] = business_unit_id
+    normalized["owner_name"] = owner_name
+    normalized["ownerName"] = owner_name
+    normalized["owner_email"] = owner_email
+    normalized["ownerEmail"] = owner_email
+    normalized["description"] = first_present(project, ["description"]) or normalized.get("description")
+    return normalized
+
+def normalize_projects_response(payload: Any) -> List[dict]:
+    items = extract_items(payload, ["projects", "data", "content", "items", "results"])
+    if not items and isinstance(unwrap_single_payload(payload), dict):
+        items = [unwrap_single_payload(payload)]
+    return [item for item in [normalize_project_response(item) for item in items] if item.get("id")]
+
+def onboarding_business_unit_payload(data: dict) -> dict:
+    return {
+        key: value
+        for key, value in {
+            "name": first_present(data, ["name"]),
+            "code": first_present(data, ["code"]),
+            "displayName": first_present(data, ["displayName", "display_name"]),
+            "ownerName": first_present(data, ["ownerName", "owner_name"]),
+            "ownerEmail": first_present(data, ["ownerEmail", "owner_email"]),
+            "description": first_present(data, ["description"]),
+            "status": first_present(data, ["status"]),
+        }.items()
+        if value is not None
+    }
+
+def onboarding_project_payload(data: dict) -> dict:
+    return {
+        key: value
+        for key, value in {
+            "businessUnitId": first_present(data, ["businessUnitId", "business_unit_id"]),
+            "name": first_present(data, ["name"]),
+            "code": first_present(data, ["code"]),
+            "description": first_present(data, ["description"]),
+            "ownerName": first_present(data, ["ownerName", "owner_name"]),
+            "ownerEmail": first_present(data, ["ownerEmail", "owner_email"]),
+            "status": first_present(data, ["status"]),
+        }.items()
+        if value is not None
+    }
+
+def onboarding_role_assignment_payload(data: dict) -> dict:
+    return {
+        key: value
+        for key, value in {
+            "principalId": first_present(data, ["principalId", "principal_id"]),
+            "principalEmail": first_present(data, ["principalEmail", "principal_email"]),
+            "principalName": first_present(data, ["principalName", "principal_name"]),
+            "roleKind": first_present(data, ["roleKind", "role_kind"]) or "ACCESS",
+            "roleCode": first_present(data, ["roleCode", "role_code"]),
+            "scopeType": first_present(data, ["scopeType", "scope_type"]),
+            "scopeId": first_present(data, ["scopeId", "scope_id"]),
+            "active": first_present(data, ["active"]),
+            "validFrom": first_present(data, ["validFrom", "valid_from"]),
+            "validTo": first_present(data, ["validTo", "valid_to"]),
+        }.items()
+        if value is not None
+    }
+
+def normalize_catalog_resources(payload: Any, expected_type: str) -> List[dict]:
+    items = extract_items(payload, ["resources", "data", "content", "items", "results"])
+    if not items and isinstance(unwrap_single_payload(payload), dict):
+        items = [unwrap_single_payload(payload)]
+    normalized = [normalize_catalog_resource(item, expected_type) for item in items]
+    return [
+        item for item in normalized
+        if item.get("id") and str(item.get("resource_type") or expected_type).upper() == expected_type
+    ]
+
+def normalize_catalog_user(item: dict) -> dict:
+    user = item.get("user") if isinstance(item.get("user"), dict) else item.get("member") if isinstance(item.get("member"), dict) else item
+    merged = {**user}
+    for key, value in item.items():
+        if key not in merged and key not in {"user", "member"}:
+            merged[key] = value
+    user_id = first_present(merged, ["id", "userId", "user_id", "principalId", "principal_id", "email", "principalEmail", "principal_email", "user_email"])
+    email = first_present(merged, ["email", "principalEmail", "principal_email", "userEmail", "user_email"])
+    name = first_present(merged, ["name", "principalName", "principal_name", "userName", "user_name", "displayName", "display_name"])
+    roles = extract_items(merged, ["roles", "assignedRoles", "assigned_roles"])
+    assignments = extract_items(merged, ["assignments", "roleAssignments", "role_assignments"])
+    role_names = [
+        first_present(role, ["name", "roleName", "role_name", "roleCode", "role_code", "code"])
+        for role in roles
+    ]
+    for assignment in assignments:
+        assignment_role = first_present(assignment, ["roleName", "role_name", "roleCode", "role_code", "code"])
+        if assignment_role:
+            role_names.append(assignment_role)
+    role_names = list(dict.fromkeys([str(role_name) for role_name in role_names if role_name]))
+    org_role = first_present(merged, ["org_role", "orgRole", "role_name", "roleName", "roleCode", "role_code"])
+    if org_role and org_role not in role_names:
+        role_names.insert(0, str(org_role))
+
+    normalized = dict(merged)
+    normalized["id"] = str(user_id) if user_id else email
+    normalized["email"] = email
+    normalized["name"] = name or (derive_name_from_email(email) if email else normalized["id"])
+    normalized["status"] = str(first_present(merged, ["status", "memberStatus", "member_status"]) or "active").lower()
+    normalized["role_name"] = role_names[0] if role_names else org_role
+    normalized["role_names"] = role_names or ([str(org_role)] if org_role else [])
+    normalized["roles"] = roles
+    normalized["assignments"] = assignments
+    normalized["business_units"] = extract_items(merged, ["business_units", "businessUnits"])
+    return normalized
+
+def normalize_catalog_users(payload: Any) -> List[dict]:
+    items = extract_items(payload, ["users", "members", "data", "content", "items", "results"])
+    if not items and isinstance(unwrap_single_payload(payload), dict):
+        items = [unwrap_single_payload(payload)]
+    return [user for user in [normalize_catalog_user(item) for item in items] if user.get("email") or user.get("id")]
+
+def catalog_user_lookup_key(user: dict) -> Optional[str]:
+    email = user.get("email") or user.get("user_email") or user.get("principal_email")
+    if email:
+        return str(email).strip().lower()
+    user_id = user.get("id") or user.get("principal_id") or user.get("user_id")
+    return str(user_id).strip().lower() if user_id else None
+
+def product_role_names_from_catalog_user(user: Optional[dict]) -> List[str]:
+    if not user:
+        return []
+    role_names = user.get("role_names") if isinstance(user.get("role_names"), list) else []
+    if not role_names and user.get("role_name"):
+        role_names = [user.get("role_name")]
+    return list(dict.fromkeys([str(role_name) for role_name in role_names if role_name]))
+
+def merge_admin_and_product_roles(admin_user: dict, catalog_user: Optional[dict]) -> dict:
+    admin_role_names = admin_user.get("role_names") if isinstance(admin_user.get("role_names"), list) else []
+    if not admin_role_names and admin_user.get("role_name"):
+        admin_role_names = [admin_user["role_name"]]
+    product_role_names = product_role_names_from_catalog_user(catalog_user)
+
+    merged = dict(admin_user)
+    merged["admin_roles"] = admin_user.get("roles") or []
+    merged["admin_role_ids"] = admin_user.get("role_ids") or []
+    merged["admin_role_names"] = admin_role_names
+    merged["product_roles"] = catalog_user.get("roles", []) if catalog_user else []
+    merged["product_role_names"] = product_role_names
+    merged["product_role_assignments"] = catalog_user.get("assignments", []) if catalog_user else []
+    merged["product_access"] = catalog_user
+    merged["combined_role_names"] = list(dict.fromkeys(admin_role_names + product_role_names))
+    return merged
+
+def normalize_catalog_assignment(item: dict) -> dict:
+    assignment = unwrap_single_payload(item)
+    if not isinstance(assignment, dict):
+        return {}
+    normalized = dict(assignment)
+    normalized["id"] = first_present(assignment, ["id", "assignmentId", "assignment_id", "roleAssignmentId", "role_assignment_id"])
+    normalized["principal_id"] = first_present(assignment, ["principalId", "principal_id", "userId", "user_id", "email"])
+    normalized["principal_email"] = first_present(assignment, ["principalEmail", "principal_email", "email", "userEmail", "user_email"])
+    normalized["principal_name"] = first_present(assignment, ["principalName", "principal_name", "name", "userName", "user_name"])
+    normalized["role_code"] = first_present(assignment, ["roleCode", "role_code", "code", "roleName", "role_name"])
+    normalized["scope_type"] = first_present(assignment, ["scopeType", "scope_type", "resourceType", "resource_type"])
+    normalized["scope_id"] = first_present(assignment, ["scopeId", "scope_id", "resourceId", "resource_id"])
+    return normalized
+
+def normalize_catalog_assignments(payload: Any) -> List[dict]:
+    items = extract_items(payload, ["assignments", "roleAssignments", "role_assignments", "data", "content", "items", "results"])
+    if not items and isinstance(unwrap_single_payload(payload), dict):
+        items = [unwrap_single_payload(payload)]
+    return [assignment for assignment in [normalize_catalog_assignment(item) for item in items] if assignment.get("id")]
+
+def user_from_resource_member(member: dict, project: dict, business_unit: Optional[dict]) -> dict:
+    user = normalize_catalog_user(member)
+    assignment_role = first_present(
+        member,
+        ["project_role", "projectRole", "role", "roleCode", "role_code", "roleName", "role_name"],
+    )
+    return {
+        "id": f"{project.get('id')}:{user.get('id') or user.get('email')}",
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "project_id": project.get("id"),
+        "project_role": str(assignment_role or user.get("role_name") or "member").lower(),
+        "status": user.get("status") or "active",
+        "project": project,
+        "business_unit": business_unit,
+        "business_unit_name": business_unit.get("name") if business_unit else None,
+        "application_name": business_unit.get("application_name") if business_unit else None,
+        "application_id": business_unit.get("application_id") if business_unit else None,
+        "user": user,
+    }
+
+async def local_business_units_for_org(db: AsyncSession, org_id: str, include_projects: bool = False) -> List[dict]:
+    result = await db.execute(
+        select(BusinessUnitModel)
+        .where(BusinessUnitModel.organization_id == org_id)
+        .order_by(BusinessUnitModel.name.asc())
+    )
+    business_units = result.scalars().all()
+    response = [await business_unit_to_dict(db, bu) for bu in business_units]
+    if include_projects and business_units:
+        bu_ids = [bu.id for bu in business_units]
+        projects_result = await db.execute(
+            select(ProjectModel)
+            .where(ProjectModel.organization_id == org_id, ProjectModel.business_unit_id.in_(bu_ids))
+            .order_by(ProjectModel.name.asc())
+        )
+        projects_by_bu = {}
+        for project in projects_result.scalars().all():
+            projects_by_bu.setdefault(project.business_unit_id, []).append(await project_to_dict(db, project))
+        for bu_data in response:
+            bu_data["projects"] = projects_by_bu.get(bu_data["id"], [])
+            bu_data["teams"] = bu_data["projects"]
+    return response
+
+async def local_projects_for_org(
+    db: AsyncSession,
+    org_id: str,
+    business_unit_id: Optional[str] = None,
+) -> List[dict]:
+    query = select(ProjectModel).where(ProjectModel.organization_id == org_id)
+    if business_unit_id:
+        query = query.where(ProjectModel.business_unit_id == business_unit_id)
+    result = await db.execute(query.order_by(ProjectModel.name.asc()))
+    return [await project_to_dict(db, project) for project in result.scalars().all()]
+
+async def get_catalog_resources_for_request(
+    request: Request,
+    resource_type: str,
+    *,
+    organization_id: Optional[str] = None,
+    page: int = 0,
+    size: int = 500,
+    include_inactive_users: bool = False,
+) -> Optional[List[dict]]:
+    payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/admin/access-catalog/resources",
+        params={
+            "resourceType": resource_type,
+            "includeInactiveUsers": str(include_inactive_users).lower(),
+            "page": page,
+            "size": size,
+        },
+        organization_id=organization_id,
+        scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+    )
+    if payload is None:
+        return None
+    return normalize_catalog_resources(payload, resource_type)
+
+async def get_one_catalog_resource_for_request(
+    request: Request,
+    resource_type: str,
+    resource_id: str,
+    *,
+    organization_id: Optional[str] = None,
+    include_inactive_users: bool = False,
+) -> Optional[dict]:
+    payload = await onboarding_api_get_with_local_fallback(
+        request,
+        f"/admin/access-catalog/resources/{resource_type}/{resource_id}",
+        params={"includeInactiveUsers": str(include_inactive_users).lower()},
+        organization_id=organization_id,
+        scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+    )
+    if payload is None:
+        return None
+    resources = normalize_catalog_resources(payload, resource_type)
+    return resources[0] if resources else None
+
+async def get_catalog_resources_for_dashboard(
+    request: Request,
+    resource_type: str,
+    organization_id: str,
+) -> Optional[List[dict]]:
+    try:
+        return await get_catalog_resources_for_request(
+            request,
+            resource_type,
+            organization_id=organization_id,
+            size=500,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {401, 403, 502, 503, 504}:
+            logger.info(f"Dashboard using local {resource_type} count because onboarding is unavailable: {exc.detail}")
+            return None
+        raise
 
 async def assert_business_unit_unique(
     db: AsyncSession,
@@ -6939,12 +7965,12 @@ async def get_billing_invoice_recipient_options(db: AsyncSession, organization_i
         .order_by(AdminModel.name.asc(), AdminModel.email.asc())
     )
     for admin in admin_result.scalars().all():
-        recipients[admin.email.lower()] = {
+        recipients.setdefault(admin.email.lower(), {
             "email": admin.email,
             "name": admin.name,
             "type": "org_admin",
             "label": f"{admin.name} ({admin.email}) - Org Admin",
-        }
+        })
     user_result = await db.execute(
         select(UserModel)
         .where(UserModel.organization_id == organization_id)
@@ -7856,7 +8882,7 @@ async def assert_unique_organization(
 # ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/login")
-async def login_admin(data: AdminLogin, db: AsyncSession = Depends(get_db)):
+async def login_admin(data: AdminLogin, fastapi_response: Response, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(AdminModel).where(AdminModel.email == data.email))
     admin = result.scalar_one_or_none()
     if not admin or not bcrypt.checkpw(data.password.encode(), admin.password_hash.encode()):
@@ -7866,8 +8892,20 @@ async def login_admin(data: AdminLogin, db: AsyncSession = Depends(get_db)):
     
     token = create_token(admin.id, admin.email, admin.role, admin.organization_id)
     organization_name = await get_organization_name(db, admin.organization_id)
+    context_token, context_expires_at = await create_admin_onboarding_context_token(db, admin, organization_name)
+    if context_token and context_expires_at:
+        cookie_max_age = max(1, context_expires_at - int(datetime.now(timezone.utc).timestamp()))
+        set_product_auth_cookies(fastapi_response, context_token, cookie_max_age)
+
     return {
         "token": token,
+        "contextToken": context_token,
+        "context_token": context_token,
+        "context_token_expires_at": (
+            datetime.fromtimestamp(context_expires_at, timezone.utc).isoformat()
+            if context_expires_at
+            else None
+        ),
         "admin": {
             "id": admin.id,
             "email": admin.email,
@@ -8448,7 +9486,11 @@ async def get_my_subscription(payload: dict = Depends(require_any_admin), db: As
     return [await subscription_to_dict(db, s) for s in subs]
 
 @api_router.get("/my-organization/users", tags=["Org Admin"])
-async def get_my_organization_users(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+async def get_my_organization_users(
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
     """Get users in current organization (org admin only)"""
     if payload.get("role") == "super_admin":
         raise HTTPException(status_code=400, detail="Super admins don't have an organization")
@@ -8462,7 +9504,30 @@ async def get_my_organization_users(payload: dict = Depends(require_any_admin), 
         .where(UserModel.organization_id == org_id)
         .order_by(UserModel.created_at.desc())
     )
-    return [await user_to_dict(db, u) for u in result.scalars().all()]
+    users = [await user_to_dict(db, u) for u in result.scalars().all()]
+
+    catalog_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/admin/access-catalog/users",
+        params={"status": "ACTIVE", "page": 0, "size": 500},
+        organization_id=org_id,
+        scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+    )
+    catalog_users = normalize_catalog_users(catalog_payload) if catalog_payload is not None else []
+    catalog_by_key = {
+        key: catalog_user
+        for catalog_user in catalog_users
+        for key in [catalog_user_lookup_key(catalog_user)]
+        if key
+    }
+
+    return [
+        merge_admin_and_product_roles(
+            user,
+            catalog_by_key.get(catalog_user_lookup_key(user)),
+        )
+        for user in users
+    ]
 
 @api_router.get("/my-organization/roles", tags=["Org Admin"])
 async def get_my_organization_roles(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
@@ -8483,63 +9548,448 @@ async def get_my_organization_roles(payload: dict = Depends(require_any_admin), 
     )
     return [model_to_dict(r, ["permissions"]) for r in result.scalars().all()]
 
+@api_router.get("/my-organization/organization-members", tags=["Org Admin - Access Catalog"])
+async def get_my_organization_members(
+    request: Request,
+    search: Optional[str] = None,
+    status: Optional[str] = "ACTIVE",
+    page: int = 0,
+    size: int = 25,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read organization members from the onboarding access catalog."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/organization-members",
+        params={"search": search, "status": status, "page": page, "size": size},
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_MEMBERS_READ],
+    )
+    if upstream_payload is not None:
+        return normalize_catalog_users(upstream_payload)
+
+    users_result = await db.execute(
+        select(UserModel)
+        .where(UserModel.organization_id == org.id)
+        .order_by(UserModel.created_at.desc())
+    )
+    users = [await user_to_dict(db, user) for user in users_result.scalars().all()]
+    if status:
+        status_filter = status.lower()
+        users = [user for user in users if str(user.get("status") or "").lower() == status_filter.lower()]
+    if search:
+        term = search.lower()
+        users = [
+            user for user in users
+            if term in " ".join([user.get("name") or "", user.get("email") or ""]).lower()
+        ]
+    return users[page * size:(page + 1) * size]
+
+@api_router.get("/my-organization/organization-members/{principal_id}/access", tags=["Org Admin - Access Catalog"])
+async def get_my_organization_member_access(
+    principal_id: str,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read one organization member's effective access from the onboarding access catalog."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        f"/organization-members/{principal_id}/access",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_MEMBERS_READ],
+    )
+    if upstream_payload is not None:
+        return upstream_payload
+
+    user_result = await db.execute(
+        select(UserModel).where(
+            UserModel.organization_id == org.id,
+            (UserModel.id == principal_id) | (UserModel.email == principal_id),
+        )
+    )
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Organization member not found")
+    business_unit_context = await build_business_unit_context(db, user=user, admin=None, organization_id=org.id)
+    return {
+        "member": await user_to_dict(db, user),
+        "assignments": [],
+        "effective_access": business_unit_context,
+    }
+
+@api_router.get("/my-organization/access-catalog/users", tags=["Org Admin - Access Catalog"])
+async def get_my_access_catalog_users(
+    request: Request,
+    search: Optional[str] = None,
+    status: Optional[str] = "ACTIVE",
+    page: int = 0,
+    size: int = 25,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read users with complete product access assignments."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/admin/access-catalog/users",
+        params={"search": search, "status": status, "page": page, "size": size},
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+    )
+    if upstream_payload is not None:
+        return normalize_catalog_users(upstream_payload)
+
+    users_result = await db.execute(
+        select(UserModel)
+        .where(UserModel.organization_id == org.id)
+        .order_by(UserModel.created_at.desc())
+    )
+    users = [await user_to_dict(db, user) for user in users_result.scalars().all()]
+    if status:
+        status_filter = status.lower()
+        users = [user for user in users if str(user.get("status") or "").lower() == status_filter.lower()]
+    if search:
+        term = search.lower()
+        users = [
+            user for user in users
+            if term in " ".join([user.get("name") or "", user.get("email") or ""]).lower()
+        ]
+    return users[page * size:(page + 1) * size]
+
+@api_router.get("/my-organization/access-catalog/users/{principal_id}", tags=["Org Admin - Access Catalog"])
+async def get_my_access_catalog_user(
+    principal_id: str,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read one user-centric access record."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        f"/admin/access-catalog/users/{principal_id}",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+    )
+    if upstream_payload is not None:
+        return normalize_catalog_user(unwrap_single_payload(upstream_payload))
+
+    user_result = await db.execute(
+        select(UserModel).where(
+            UserModel.organization_id == org.id,
+            (UserModel.id == principal_id) | (UserModel.email == principal_id),
+        )
+    )
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return await user_to_dict(db, user)
+
+@api_router.get("/my-organization/access-catalog/users/{principal_id}/bootstrap", tags=["Org Admin - Access Catalog"])
+async def get_my_access_catalog_user_bootstrap(
+    principal_id: str,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read login bootstrap claims for one user."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        f"/admin/access-catalog/users/{principal_id}/bootstrap",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_BOOTSTRAP_READ],
+    )
+    if upstream_payload is not None:
+        return upstream_payload
+
+    user_result = await db.execute(
+        select(UserModel).where(
+            UserModel.organization_id == org.id,
+            (UserModel.id == principal_id) | (UserModel.email == principal_id),
+        )
+    )
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_context = await build_user_context(db, email=user.email)
+    return {
+        "loginAccess": user_context,
+        "tokenClaims": build_role_assignments_claim(user_context),
+    }
+
+@api_router.get("/my-organization/access-catalog/resources", tags=["Org Admin - Access Catalog"])
+async def get_my_access_catalog_resources(
+    request: Request,
+    resourceType: Optional[str] = None,
+    includeInactiveUsers: bool = False,
+    page: int = 0,
+    size: int = 25,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read business units, projects, and applications with assigned users."""
+    org = await get_approved_org_for_admin(payload, db)
+    resource_type = resourceType.upper() if resourceType else None
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/admin/access-catalog/resources",
+        params={
+            "resourceType": resource_type,
+            "includeInactiveUsers": str(includeInactiveUsers).lower(),
+            "page": page,
+            "size": size,
+        },
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+    )
+    if upstream_payload is not None:
+        if resource_type:
+            return normalize_catalog_resources(upstream_payload, resource_type)
+        return upstream_payload
+
+    if resource_type == "BUSINESS_UNIT":
+        return await local_business_units_for_org(db, org.id, include_projects=True)
+    if resource_type == "PROJECT":
+        return await local_projects_for_org(db, org.id)
+    if resource_type == "APPLICATION":
+        result = await db.execute(
+            select(ApplicationModel)
+            .where(ApplicationModel.organization_id == org.id)
+            .order_by(ApplicationModel.application_name.asc())
+        )
+        return [await application_to_dict(db, application) for application in result.scalars().all()]
+    return {
+        "business_units": await local_business_units_for_org(db, org.id, include_projects=True),
+        "projects": await local_projects_for_org(db, org.id),
+    }
+
+@api_router.get("/my-organization/access-catalog/resources/{resource_type}/{resource_id}", tags=["Org Admin - Access Catalog"])
+async def get_my_access_catalog_resource(
+    resource_type: str,
+    resource_id: str,
+    request: Request,
+    includeInactiveUsers: bool = False,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read one resource-centric access record."""
+    org = await get_approved_org_for_admin(payload, db)
+    normalized_type = resource_type.upper()
+    upstream_resource = await get_one_catalog_resource_for_request(
+        request,
+        normalized_type,
+        resource_id,
+        organization_id=org.id,
+        include_inactive_users=includeInactiveUsers,
+    )
+    if upstream_resource is not None:
+        return upstream_resource
+
+    if normalized_type == "BUSINESS_UNIT":
+        business_units = await local_business_units_for_org(db, org.id, include_projects=True)
+        for business_unit in business_units:
+            if business_unit.get("id") == resource_id:
+                return business_unit
+    if normalized_type == "PROJECT":
+        projects = await local_projects_for_org(db, org.id)
+        for project in projects:
+            if project.get("id") == resource_id:
+                return project
+    if normalized_type == "APPLICATION":
+        application = await get_application_for_org(db, resource_id, org.id)
+        return await application_to_dict(db, application)
+    raise HTTPException(status_code=404, detail="Resource not found")
+
+@api_router.get("/my-organization/role-assignments", tags=["Org Admin - Access Catalog"])
+async def get_my_role_assignments(
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List direct scoped role assignments from onboarding."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/role-assignments",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_READ],
+    )
+    if upstream_payload is not None:
+        return normalize_catalog_assignments(upstream_payload)
+    return []
+
+@api_router.post("/my-organization/role-assignments", tags=["Org Admin - Access Catalog"])
+async def create_my_role_assignment(
+    data: dict,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a direct product role assignment through onboarding."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_request(
+        request,
+        "POST",
+        "/role-assignments",
+        json_payload=onboarding_role_assignment_payload(data),
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_WRITE],
+    )
+    return normalize_catalog_assignment(upstream_payload)
+
+@api_router.get("/my-organization/role-assignments/{role_assignment_id}", tags=["Org Admin - Access Catalog"])
+async def get_my_role_assignment(
+    role_assignment_id: str,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read one direct product role assignment through onboarding."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_request(
+        request,
+        "GET",
+        f"/role-assignments/{role_assignment_id}",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_READ],
+    )
+    return normalize_catalog_assignment(upstream_payload)
+
+@api_router.patch("/my-organization/role-assignments/{role_assignment_id}", tags=["Org Admin - Access Catalog"])
+async def update_my_role_assignment(
+    role_assignment_id: str,
+    data: dict,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a direct product role assignment through onboarding."""
+    org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_request(
+        request,
+        "PATCH",
+        f"/role-assignments/{role_assignment_id}",
+        json_payload=onboarding_role_assignment_payload(data),
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_WRITE],
+    )
+    return normalize_catalog_assignment(upstream_payload)
+
+@api_router.delete("/my-organization/role-assignments/{role_assignment_id}", tags=["Org Admin - Access Catalog"])
+async def revoke_my_role_assignment(
+    role_assignment_id: str,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a direct product role assignment through onboarding."""
+    org = await get_approved_org_for_admin(payload, db)
+    await onboarding_api_request(
+        request,
+        "DELETE",
+        f"/role-assignments/{role_assignment_id}",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_WRITE],
+    )
+    return {"success": True, "id": role_assignment_id}
+
 @api_router.get("/my-organization/business-units", tags=["Org Admin - Business Units"])
 async def get_my_business_units(
+    request: Request,
     include_projects: bool = False,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get Business units for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-
-    result = await db.execute(
-        select(BusinessUnitModel)
-        .where(BusinessUnitModel.organization_id == org.id)
-        .order_by(BusinessUnitModel.name.asc())
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/business-units",
+        params={"page": 0, "size": 500},
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
     )
-    business_units = result.scalars().all()
-    response = [await business_unit_to_dict(db, bu) for bu in business_units]
+    if upstream_payload is not None:
+        response = normalize_business_units_response(upstream_payload)
+        if include_projects:
+            catalog_projects = normalize_projects_response(
+                await onboarding_api_get_with_local_fallback(
+                    request,
+                    "/projects",
+                    params={"page": 0, "size": 500},
+                    organization_id=org.id,
+                    scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+                )
+            )
+            if catalog_projects is None:
+                catalog_projects = await local_projects_for_org(db, org.id)
+            projects_by_bu = {}
+            for project in catalog_projects:
+                projects_by_bu.setdefault(project.get("business_unit_id"), []).append(project)
+            for business_unit in response:
+                business_unit["projects"] = business_unit.get("projects") or projects_by_bu.get(business_unit.get("id"), [])
+                business_unit["teams"] = business_unit["projects"]
+        return response
 
-    if include_projects and business_units:
-        bu_ids = [bu.id for bu in business_units]
-        projects_result = await db.execute(
-            select(ProjectModel)
-            .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id.in_(bu_ids))
-            .order_by(ProjectModel.name.asc())
-        )
-        projects_by_bu = {}
-        for project in projects_result.scalars().all():
-            projects_by_bu.setdefault(project.business_unit_id, []).append(await project_to_dict(db, project))
-
-        for bu_data in response:
-            bu_data["projects"] = projects_by_bu.get(bu_data["id"], [])
-
-    return response
+    return await local_business_units_for_org(db, org.id, include_projects=include_projects)
 
 @api_router.post("/my-organization/business-units", tags=["Org Admin - Business Units"])
 async def create_my_business_unit(
-    data: BusinessUnitCreate,
+    data: dict,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Onboard a Business unit for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    business_unit = await create_business_unit_for_org(db, org, data, created_by=payload.get("sub"))
-    await db.commit()
-
-    return {
-        "message": "Business unit created successfully",
-        "business_unit": await business_unit_to_dict(db, business_unit),
-    }
+    upstream_payload = await onboarding_api_request(
+        request,
+        "POST",
+        "/business-units",
+        json_payload=onboarding_business_unit_payload(data),
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE],
+    )
+    return normalize_business_unit_response(upstream_payload)
 
 @api_router.get("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
 async def get_my_business_unit(
     business_unit_id: str,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get Business unit details and its projects for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        f"/business-units/{business_unit_id}",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
+    )
+    catalog_business_unit = normalize_business_unit_response(upstream_payload) if upstream_payload is not None else None
+    if catalog_business_unit is not None:
+        catalog_projects = normalize_projects_response(
+            await onboarding_api_get_with_local_fallback(
+                request,
+                "/projects",
+                params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
+                organization_id=org.id,
+                scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+            )
+        )
+        if catalog_projects is not None:
+            catalog_business_unit["projects"] = [
+                project for project in catalog_projects
+                if project.get("business_unit_id") == catalog_business_unit.get("id")
+            ]
+            catalog_business_unit["teams"] = catalog_business_unit["projects"]
+        return catalog_business_unit
 
     result = await db.execute(
         select(BusinessUnitModel).where(
@@ -8561,77 +10011,62 @@ async def get_my_business_unit(
     return response
 
 @api_router.put("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
+@api_router.patch("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
 async def update_my_business_unit(
     business_unit_id: str,
-    data: BusinessUnitUpdate,
+    data: dict,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Update a Business unit for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-
-    result = await db.execute(
-        select(BusinessUnitModel).where(
-            BusinessUnitModel.id == business_unit_id,
-            BusinessUnitModel.organization_id == org.id
-        )
-    )
-    business_unit = result.scalar_one_or_none()
-    if not business_unit:
-        raise HTTPException(status_code=404, detail="Business unit not found")
-
-    update_data = payload_dict(data, exclude_unset=True)
-    if "name" in update_data:
-        update_data["name"] = update_data["name"].strip()
-        if not update_data["name"]:
-            raise HTTPException(status_code=400, detail="Business unit name is required")
-    if "code" in update_data:
-        update_data["code"] = update_data["code"].strip() if update_data["code"] else None
-    if "status" in update_data and update_data["status"] not in ["active", "inactive", "archived"]:
-        raise HTTPException(status_code=400, detail="Invalid status")
-    if "sync_status" in update_data and update_data["sync_status"] not in ["synced", "pending", "failed"]:
-        raise HTTPException(status_code=400, detail="Invalid sync status")
-    for count_key in ["members_count", "consumers_count"]:
-        if count_key in update_data and update_data[count_key] is not None:
-            update_data[count_key] = max(update_data[count_key], 0)
-    if "tags" in update_data:
-        update_data["tags"] = json.dumps(update_data["tags"] or [])
-    if "owner_name" in update_data:
-        update_data["owner_name"] = await resolve_organization_user_label(
-            db,
-            org.id,
-            update_data["owner_name"],
-            "Business unit owner",
-        )
-
-    await assert_business_unit_unique(
-        db,
+    upstream_payload = await onboarding_api_request(
+        request,
+        "PATCH",
+        f"/business-units/{business_unit_id}",
+        json_payload=onboarding_business_unit_payload(data),
         organization_id=org.id,
-        name=update_data.get("name"),
-        code=update_data.get("code"),
-        exclude_id=business_unit_id
+        scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE],
     )
+    return normalize_business_unit_response(upstream_payload)
 
-    for key, value in update_data.items():
-        if hasattr(business_unit, key):
-            setattr(business_unit, key, normalize_onboarding_value(key, value))
-    await upsert_business_unit_quotas(db, business_unit.id, update_data)
-    business_unit.updated_at = datetime.now(timezone.utc)
-    await db.commit()
-
-    return {
-        "message": "Business unit updated successfully",
-        "business_unit": await business_unit_to_dict(db, business_unit),
-    }
+@api_router.delete("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
+async def delete_my_business_unit(
+    business_unit_id: str,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a Business unit through onboarding."""
+    org = await get_approved_org_for_admin(payload, db)
+    await onboarding_api_request(
+        request,
+        "DELETE",
+        f"/business-units/{business_unit_id}",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE],
+    )
+    return {"success": True, "id": business_unit_id}
 
 @api_router.get("/my-organization/business-units/{business_unit_id}/projects", tags=["Org Admin - Projects"])
 async def get_my_business_unit_projects(
     business_unit_id: str,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get projects for one Business unit in the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/projects",
+        params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+    )
+    if upstream_payload is not None:
+        return normalize_projects_response(upstream_payload)
 
     bu_result = await db.execute(
         select(BusinessUnitModel).where(
@@ -8651,48 +10086,77 @@ async def get_my_business_unit_projects(
 
 @api_router.get("/my-organization/projects", tags=["Org Admin - Projects"])
 async def get_my_projects(
+    request: Request,
     business_unit_id: Optional[str] = None,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get projects for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        "/projects",
+        params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+    )
+    if upstream_payload is not None:
+        catalog_projects = normalize_projects_response(upstream_payload)
+        if business_unit_id:
+            return [project for project in catalog_projects if project.get("business_unit_id") == business_unit_id]
+        return catalog_projects
 
-    query = select(ProjectModel).where(ProjectModel.organization_id == org.id)
-    if business_unit_id:
-        query = query.where(ProjectModel.business_unit_id == business_unit_id)
-
-    result = await db.execute(query.order_by(ProjectModel.name.asc()))
-    return [await project_to_dict(db, project) for project in result.scalars().all()]
+    return await local_projects_for_org(db, org.id, business_unit_id)
 
 @api_router.post("/my-organization/projects", tags=["Org Admin - Projects"])
 async def create_my_project(
-    data: ProjectCreate,
+    data: dict,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Onboard a project for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    if not data.business_unit_id:
-        raise HTTPException(status_code=400, detail="Business unit is required when onboarding a Project")
-    project = await create_project_for_org(
-        db,
-        org,
-        ExternalProjectCreate(**payload_dict(data)),
-        created_by=payload.get("sub")
+    upstream_payload = await onboarding_api_request(
+        request,
+        "POST",
+        "/projects",
+        json_payload=onboarding_project_payload(data),
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_PROJECTS_WRITE],
     )
-    await db.commit()
-
-    return {"message": "Project created successfully", "project": await project_to_dict(db, project)}
+    return normalize_project_response(upstream_payload)
 
 @api_router.get("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
 async def get_my_project(
     project_id: str,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get project details for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        f"/projects/{project_id}",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+    )
+    catalog_project = normalize_project_response(upstream_payload) if upstream_payload is not None else None
+    if catalog_project is not None:
+        business_unit_id = catalog_project.get("business_unit_id")
+        catalog_project["business_unit"] = None
+        if business_unit_id:
+            catalog_business_unit = normalize_business_unit_response(
+                await onboarding_api_get_with_local_fallback(
+                    request,
+                    f"/business-units/{business_unit_id}",
+                    organization_id=org.id,
+                    scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
+                )
+            )
+            catalog_project["business_unit"] = catalog_business_unit
+        return catalog_project
 
     result = await db.execute(
         select(ProjectModel).where(
@@ -8720,60 +10184,43 @@ async def get_my_project(
     return response
 
 @api_router.put("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
+@api_router.patch("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
 async def update_my_project(
     project_id: str,
-    data: ProjectUpdate,
+    data: dict,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Update a project for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-
-    result = await db.execute(
-        select(ProjectModel).where(
-            ProjectModel.id == project_id,
-            ProjectModel.organization_id == org.id
-        )
-    )
-    project = result.scalar_one_or_none()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    update_data = payload_dict(data, exclude_unset=True)
-    if "name" in update_data:
-        update_data["name"] = update_data["name"].strip()
-        if not update_data["name"]:
-            raise HTTPException(status_code=400, detail="Project name is required")
-    if "code" in update_data:
-        update_data["code"] = update_data["code"].strip() if update_data["code"] else None
-    if "status" in update_data and update_data["status"] not in PROJECT_STATUS_VALUES:
-        raise HTTPException(status_code=400, detail="Invalid status")
-    if update_data.get("business_unit_id"):
-        bu_result = await db.execute(
-            select(BusinessUnitModel).where(
-                BusinessUnitModel.id == update_data["business_unit_id"],
-                BusinessUnitModel.organization_id == org.id
-            )
-        )
-        if not bu_result.scalar_one_or_none():
-            raise HTTPException(status_code=404, detail="Business unit not found")
-
-    await assert_project_unique(
-        db,
+    upstream_payload = await onboarding_api_request(
+        request,
+        "PATCH",
+        f"/projects/{project_id}",
+        json_payload=onboarding_project_payload(data),
         organization_id=org.id,
-        name=update_data.get("name"),
-        code=update_data.get("code"),
-        exclude_id=project_id
+        scopes=[ONBOARDING_SCOPE_PROJECTS_WRITE],
     )
+    return normalize_project_response(upstream_payload)
 
-    for key, value in update_data.items():
-        if hasattr(project, key):
-            setattr(project, key, normalize_onboarding_value(key, value))
-    await upsert_project_environments(db, project.id, update_data)
-    project.updated_at = datetime.now(timezone.utc)
-    await db.commit()
-
-    return {"message": "Project updated successfully", "project": await project_to_dict(db, project)}
+@api_router.delete("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
+async def delete_my_project(
+    project_id: str,
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a project through onboarding."""
+    org = await get_approved_org_for_admin(payload, db)
+    await onboarding_api_request(
+        request,
+        "DELETE",
+        f"/projects/{project_id}",
+        organization_id=org.id,
+        scopes=[ONBOARDING_SCOPE_PROJECTS_WRITE],
+    )
+    return {"success": True, "id": project_id}
 
 @api_router.get("/my-organization/applications", tags=["Org Admin - Applications"])
 async def get_my_applications(
@@ -8867,11 +10314,31 @@ async def update_my_application(
 @api_router.get("/my-organization/projects/{project_id}/team", tags=["Org Admin - Project Members"])
 async def get_my_project_team(
     project_id: str,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get invited and active project members for a project in the current organization."""
     org = await get_approved_org_for_admin(payload, db)
+    catalog_project = await get_one_catalog_resource_for_request(
+        request,
+        "PROJECT",
+        project_id,
+        organization_id=org.id,
+    )
+    if catalog_project is not None:
+        business_unit = None
+        if catalog_project.get("business_unit_id"):
+            business_unit = await get_one_catalog_resource_for_request(
+                request,
+                "BUSINESS_UNIT",
+                catalog_project["business_unit_id"],
+                organization_id=org.id,
+            )
+        return [
+            user_from_resource_member(member, catalog_project, business_unit)
+            for member in catalog_project.get("users", [])
+        ]
     await get_project_for_org(db, project_id, org.id)
 
     result = await db.execute(
@@ -8886,11 +10353,36 @@ async def get_my_project_team(
 
 @api_router.get("/my-organization/project-team-members", tags=["Org Admin - Project Members"])
 async def get_my_project_team_members(
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get project members across all projects and Business units."""
     org = await get_approved_org_for_admin(payload, db)
+    catalog_projects = await get_catalog_resources_for_request(
+        request,
+        "PROJECT",
+        organization_id=org.id,
+        size=500,
+    )
+    if catalog_projects is not None:
+        catalog_business_units = await get_catalog_resources_for_request(
+            request,
+            "BUSINESS_UNIT",
+            organization_id=org.id,
+            size=500,
+        ) or []
+        business_units_by_id = {
+            business_unit.get("id"): business_unit
+            for business_unit in catalog_business_units
+            if business_unit.get("id")
+        }
+        response = []
+        for project in catalog_projects:
+            business_unit = business_units_by_id.get(project.get("business_unit_id"))
+            for member in project.get("users", []):
+                response.append(user_from_resource_member(member, project, business_unit))
+        return response
 
     result = await db.execute(
         select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
@@ -9578,7 +11070,11 @@ async def get_my_upgrade_requests(payload: dict = Depends(require_any_admin), db
     return [await upgrade_request_to_dict(db, r) for r in result.scalars().all()]
 
 @api_router.get("/my-organization/dashboard", tags=["Org Admin"])
-async def get_my_organization_dashboard(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
+async def get_my_organization_dashboard(
+    request: Request,
+    payload: dict = Depends(require_any_admin),
+    db: AsyncSession = Depends(get_db),
+):
     """Get dashboard stats for current organization (org admin only)"""
     if payload.get("role") == "super_admin":
         raise HTTPException(status_code=400, detail="Super admins don't have an organization. Use /dashboard/stats")
@@ -9604,8 +11100,26 @@ async def get_my_organization_dashboard(payload: dict = Depends(require_any_admi
     # Counts
     user_count = await db.scalar(select(func.count()).select_from(UserModel).where(UserModel.organization_id == org_id))
     role_count = await db.scalar(select(func.count()).select_from(RoleModel).where(RoleModel.organization_id.is_(None)))
-    business_unit_count = await db.scalar(select(func.count()).select_from(BusinessUnitModel).where(BusinessUnitModel.organization_id == org_id))
-    project_count = await db.scalar(select(func.count()).select_from(ProjectModel).where(ProjectModel.organization_id == org_id))
+    catalog_business_units = await get_catalog_resources_for_dashboard(
+        request,
+        "BUSINESS_UNIT",
+        org_id,
+    )
+    catalog_projects = await get_catalog_resources_for_dashboard(
+        request,
+        "PROJECT",
+        org_id,
+    )
+    business_unit_count = (
+        len(catalog_business_units)
+        if catalog_business_units is not None
+        else await db.scalar(select(func.count()).select_from(BusinessUnitModel).where(BusinessUnitModel.organization_id == org_id))
+    )
+    project_count = (
+        len(catalog_projects)
+        if catalog_projects is not None
+        else await db.scalar(select(func.count()).select_from(ProjectModel).where(ProjectModel.organization_id == org_id))
+    )
     pending_user_requests = await db.scalar(
         select(func.count()).select_from(UserRequestModel)
         .where(UserRequestModel.organization_id == org_id)
@@ -10977,6 +12491,29 @@ async def initiate_login(data: IdentifyOrgRequest, db: AsyncSession = Depends(ge
 
 
 # ==================== IDENTITY PROVIDER SETTINGS ====================
+
+@api_router.get("/probestack/billing-details", tags=["Admin - ProbeStack"])
+async def get_probestack_billing_details_setting(
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get ProbeStack billing details used as the invoice sender."""
+    return await get_probestack_billing_details(db)
+
+@api_router.put("/probestack/billing-details", tags=["Admin - ProbeStack"])
+async def update_probestack_billing_details_setting(
+    data: ProbestackBillingDetailsUpdate,
+    payload: dict = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update ProbeStack billing details used as the invoice sender."""
+    setting = await set_probestack_billing_details(db, data, payload.get("sub"))
+    await db.commit()
+    return {
+        "message": "ProbeStack billing details updated",
+        "details": normalize_probestack_billing_details(json.loads(setting.value)),
+        "updated_at": setting.updated_at.isoformat() if setting.updated_at else None,
+    }
 
 @api_router.get("/identity-provider", tags=["Admin - Identity Provider"])
 async def get_identity_provider_setting(
@@ -14763,6 +16300,7 @@ async def download_billing_invoice(billing_id: str, payload: dict = Depends(requ
     if not line_items:
         raise HTTPException(status_code=400, detail="No active subscriptions found for this organization")
 
+    sender_details = await get_probestack_billing_details(db)
     billing_date = record.billing_date
     if billing_date.tzinfo is None:
         billing_date = billing_date.replace(tzinfo=timezone.utc)
@@ -14776,6 +16314,7 @@ async def download_billing_invoice(billing_id: str, payload: dict = Depends(requ
         "period_end": period_end,
         "status": record.status,
         "organization": model_to_dict(organization, ["requested_tools", "supported_domains", "gateway_environments", "compliance_standards"]),
+        "sender": sender_details,
     }
     contents = build_invoice_workbook(invoice, line_items)
     filename = f"{record.invoice_number}.xlsx"
@@ -14801,6 +16340,7 @@ async def download_billing_invoice_pdf(billing_id: str, payload: dict = Depends(
     if not line_items:
         raise HTTPException(status_code=400, detail="No active subscriptions found for this organization")
 
+    sender_details = await get_probestack_billing_details(db)
     billing_date = record.billing_date
     if billing_date.tzinfo is None:
         billing_date = billing_date.replace(tzinfo=timezone.utc)
@@ -14812,6 +16352,7 @@ async def download_billing_invoice_pdf(billing_id: str, payload: dict = Depends(
         "period_end": datetime(billing_date.year, 12, 31, tzinfo=timezone.utc),
         "status": record.status,
         "organization": model_to_dict(organization, ["requested_tools", "supported_domains", "gateway_environments", "compliance_standards"]),
+        "sender": sender_details,
     }
     contents = build_invoice_pdf(invoice, line_items)
     filename = f"{record.invoice_number}.pdf"
@@ -14854,6 +16395,7 @@ async def send_billing_invoice_by_email(
     if not line_items:
         raise HTTPException(status_code=400, detail="No active subscriptions found for this organization")
 
+    sender_details = await get_probestack_billing_details(db)
     billing_date = record.billing_date
     if billing_date.tzinfo is None:
         billing_date = billing_date.replace(tzinfo=timezone.utc)
@@ -14866,6 +16408,7 @@ async def send_billing_invoice_by_email(
         "period_end": datetime(billing_date.year, 12, 31, tzinfo=timezone.utc),
         "status": record.status,
         "organization": model_to_dict(organization, ["requested_tools", "supported_domains", "gateway_environments", "compliance_standards"]),
+        "sender": sender_details,
     }
     pdf_contents = build_invoice_pdf(invoice, line_items)
     notification_emails = await get_notification_group_emails(db)
@@ -16039,25 +17582,14 @@ async def issue_user_context_token(
     cookie_max_age = max(1, expires_at - int(datetime.now(timezone.utc).timestamp()))
     set_product_auth_cookies(fastapi_response, token, cookie_max_age)
     await db.commit()
-    response_user_context = build_context_token_response_user_context(user_context)
-    organization_name = response_user_context.get("organization_name")
 
     return {
         "success": True,
-        "token": token,
-        "token_type": "Bearer",
-        "token_algorithm": PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
-        "kid": PROBESTACK_CONTEXT_TOKEN_KID,
-        "issuer": PROBESTACK_TOKEN_ISSUER,
-        "jwks_uri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
-        "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
-        "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
-        "cookie_set": True,
-        "organization_name": organization_name,
-        "org_name": organization_name,
-        "user": response_user_context,
+        "data": build_profile_response_data(user_context),
     }
 
+@api_router.get("/public/profile", tags=["Public API"])
+@api_router.get("/public/users/profile", tags=["Public API"])
 @api_router.get("/public/users/context-token/me", tags=["Public API"])
 async def get_user_context_from_signed_token(
     request: Request,
@@ -16089,13 +17621,12 @@ async def get_user_context_from_signed_token(
         raise HTTPException(status_code=403, detail="Token user does not match current user")
 
     await db.commit()
-    response_user_context = build_context_token_response_user_context(user_context)
-    organization_name = response_user_context.get("organization_name")
     return {
         "success": True,
-        "organization_name": organization_name,
-        "org_name": organization_name,
-        "user": response_user_context,
+        "data": build_profile_response_data(
+            user_context,
+            session=build_profile_session_from_token_payload(payload),
+        ),
     }
 
 
