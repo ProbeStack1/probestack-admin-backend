@@ -17620,6 +17620,17 @@ async def issue_user_context_token(
 
     return {
         "success": True,
+        "token": token,
+        "contextToken": token,
+        "context_token": token,
+        "token_type": "Bearer",
+        "token_algorithm": PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
+        "kid": PROBESTACK_CONTEXT_TOKEN_KID,
+        "issuer": PROBESTACK_TOKEN_ISSUER,
+        "jwks_uri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
+        "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
+        "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+        "cookie_set": True,
         "data": build_profile_response_data(user_context),
     }
 
