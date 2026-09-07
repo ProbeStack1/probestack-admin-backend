@@ -9313,7 +9313,12 @@ async def assert_unique_organization(
 # ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/login")
-async def login_admin(data: AdminLogin, fastapi_response: Response, db: AsyncSession = Depends(get_db)):
+async def login_admin(
+    data: AdminLogin,
+    request: Request,
+    fastapi_response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(AdminModel).where(AdminModel.email == data.email))
     admin = result.scalar_one_or_none()
     if not admin or not bcrypt.checkpw(data.password.encode(), admin.password_hash.encode()):
@@ -9326,7 +9331,7 @@ async def login_admin(data: AdminLogin, fastapi_response: Response, db: AsyncSes
     context_token, context_expires_at = await create_admin_onboarding_context_token(db, admin, organization_name)
     if context_token and context_expires_at:
         cookie_max_age = max(1, context_expires_at - int(datetime.now(timezone.utc).timestamp()))
-        set_product_auth_cookies(fastapi_response, context_token, cookie_max_age)
+        set_product_auth_cookies(fastapi_response, context_token, cookie_max_age, request)
 
     return {
         "token": token,
@@ -13856,13 +13861,23 @@ async def get_identity_session_revocation(
     result = await db.execute(subject_query)
     return result.scalar_one_or_none()
 
-def set_product_auth_cookies(response: Response, token: Optional[str], expires_in: Any = None) -> None:
+def is_local_cookie_request(request: Optional[Request]) -> bool:
+    hostname = (request.url.hostname if request else "") or ""
+    return hostname in {"localhost", "127.0.0.1", "::1"} or hostname.endswith(".localhost")
+
+def set_product_auth_cookies(
+    response: Response,
+    token: Optional[str],
+    expires_in: Any = None,
+    request: Optional[Request] = None,
+) -> None:
     if not token:
         return
     try:
         cookie_max_age = max(1, min(int(float(expires_in or 86400)), 86400))
     except (TypeError, ValueError):
         cookie_max_age = 86400
+    local_cookie = is_local_cookie_request(request)
     for cookie_name, cookie_value in {
         "ps_auth_token": token,
         "ps_auth_session": "true",
@@ -13872,13 +13887,14 @@ def set_product_auth_cookies(response: Response, token: Optional[str], expires_i
             value=cookie_value,
             max_age=cookie_max_age,
             path="/",
-            domain=".probestack.io",
-            secure=True,
+            domain=None if local_cookie else ".probestack.io",
+            secure=not local_cookie,
             httponly=True,
             samesite="lax",
         )
 
-def clear_product_auth_cookies(response: Response) -> None:
+def clear_product_auth_cookies(response: Response, request: Optional[Request] = None) -> None:
+    local_cookie = is_local_cookie_request(request)
     for cookie_name in ("ps_auth_token", "ps_auth_session"):
         response.delete_cookie(
             key=cookie_name,
@@ -13888,6 +13904,14 @@ def clear_product_auth_cookies(response: Response) -> None:
             httponly=True,
             samesite="lax",
         )
+        if local_cookie:
+            response.delete_cookie(
+                key=cookie_name,
+                path="/",
+                secure=False,
+                httponly=True,
+                samesite="lax",
+            )
         response.delete_cookie(
             key=cookie_name,
             path="/",
@@ -14617,7 +14641,7 @@ async def logout_identity_provider_session(
     clear its own SSO cookie. JWT access/id tokens remain valid until exp.
     """
     data = data or IdentityLogoutRequest()
-    clear_product_auth_cookies(fastapi_response)
+    clear_product_auth_cookies(fastapi_response, request)
 
     cookie_context_token = request.cookies.get("ps_auth_token")
     context_token = cookie_context_token
@@ -14881,13 +14905,13 @@ async def logout_identity_provider_session_redirect(
         else:
             _, post_logout_uri = resolve_auth0_post_logout_uri(selected_product, post_logout_redirect_uri)
         redirect_response = RedirectResponse(url=post_logout_uri, status_code=302)
-        clear_product_auth_cookies(redirect_response)
+        clear_product_auth_cookies(redirect_response, request)
         return redirect_response
 
     if provider == "zitadel":
         _, post_logout_uri = resolve_zitadel_post_logout_uri(selected_product, post_logout_redirect_uri)
         redirect_response = RedirectResponse(url=post_logout_uri, status_code=302)
-        clear_product_auth_cookies(redirect_response)
+        clear_product_auth_cookies(redirect_response, request)
         return redirect_response
 
     require_identity_provider_configured("auth0")
@@ -14901,7 +14925,7 @@ async def logout_identity_provider_session_redirect(
     logout_url = f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
 
     redirect_response = RedirectResponse(url=logout_url, status_code=302)
-    clear_product_auth_cookies(redirect_response)
+    clear_product_auth_cookies(redirect_response, request)
     return redirect_response
 
 @api_router.get("/zitadel-logins", tags=["Admin - Zitadel"])
@@ -18146,7 +18170,7 @@ async def issue_user_context_token(
     user_context = await enrich_user_context_with_onboarding_access(request, user_context)
     token, expires_at = create_user_context_token(user_context)
     cookie_max_age = max(1, expires_at - int(datetime.now(timezone.utc).timestamp()))
-    set_product_auth_cookies(fastapi_response, token, cookie_max_age)
+    set_product_auth_cookies(fastapi_response, token, cookie_max_age, request)
     await db.commit()
 
     return {
