@@ -5255,7 +5255,42 @@ def build_context_token_jwks() -> dict:
     }
 
 def build_user_context_token_claims(user_context: dict, issued_at: int, expires_at: int) -> dict:
-    return build_profile_response_data(user_context)
+    user = user_context["user"]
+    organization = user_context.get("organization") or {}
+    admin = user_context.get("admin") or {}
+    org_role = user_context.get("org_role") or {}
+    role_display_name = org_role.get("name") or admin.get("role") or "user"
+
+    if user_context.get("is_super_admin"):
+        token_role = "super_admin"
+        role_display_name = "Super Admin"
+    elif user_context.get("is_org_admin"):
+        token_role = "org_admin"
+        role_display_name = "Org Admin / Owner"
+    else:
+        token_role = normalize_token_value(role_display_name, "user")
+
+    return {
+        "iss": PROBESTACK_TOKEN_ISSUER,
+        "aud": PROBESTACK_TOKEN_AUDIENCE,
+        "sub": user["id"],
+        "email": user["email"],
+        "name": user.get("name") or user["email"],
+        "type": "user",
+        "role": token_role,
+        "roleName": role_display_name,
+        "organization_id": organization.get("id"),
+        "organization_name": organization.get("name"),
+        "account_type": user_context.get("account_type", "enterprise"),
+        "token_type": "probestack_user_context",
+        "is_admin": bool(user_context.get("is_admin")),
+        "is_org_admin": bool(user_context.get("is_org_admin")),
+        "is_super_admin": bool(user_context.get("is_super_admin")),
+        "jti": str(uuid.uuid4()),
+        "iat": issued_at,
+        "nbf": issued_at,
+        "exp": expires_at,
+    }
 
 def create_user_context_token(user_context: dict) -> tuple[str, int]:
     expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
