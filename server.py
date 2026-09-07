@@ -26,7 +26,7 @@ import httpx
 import base64
 import hashlib
 import re
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 import secrets
 import smtplib
 from email.message import EmailMessage
@@ -836,6 +836,40 @@ class ZitadelManagementAPI:
 
         logger.error(f"Zitadel delete organization error: {response.text}")
         return {"success": False, "error": response.text, "status_code": response.status_code}
+
+    async def terminate_session(self, session_id: Optional[str]) -> dict:
+        """Terminate a Zitadel browser session by session ID."""
+        if not self.enabled:
+            return {"success": False, "skipped": True, "error": "Zitadel is not configured"}
+
+        cleaned_session_id = (session_id or "").strip()
+        if not cleaned_session_id:
+            return {"success": False, "skipped": True, "reason": "no_session_id"}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.request(
+                "DELETE",
+                f"{self.base_url}/v2/sessions/{quote(cleaned_session_id, safe='')}",
+                headers=self._headers(),
+                json={},
+                timeout=30.0,
+            )
+
+        if response.status_code in [200, 202, 204, 404]:
+            return {
+                "success": True,
+                "missing": response.status_code == 404,
+                "session_id": cleaned_session_id,
+                "data": self._response_json_or_empty(response),
+            }
+
+        logger.error(f"Zitadel terminate session error: {response.text}")
+        return {
+            "success": False,
+            "session_id": cleaned_session_id,
+            "error": response.text,
+            "status_code": response.status_code,
+        }
 
     async def search_organizations(
         self,
@@ -13526,6 +13560,14 @@ def infer_logout_product(
                 return product_key
     return "probestack"
 
+def extract_zitadel_session_id(*tokens: Optional[str]) -> Optional[str]:
+    for token in tokens:
+        claims = decode_unverified_jwt_claims(token)
+        session_id = claims.get("sid")
+        if session_id:
+            return str(session_id)
+    return None
+
 async def get_logout_login_record(
     db: AsyncSession,
     provider: str,
@@ -14171,6 +14213,17 @@ async def logout_identity_provider_session(
         revoke_token = login_record.access_token
 
     provider_revocation = await revoke_provider_token(provider, revoke_token)
+    provider_session_logout = None
+    if provider == "zitadel" and data.provider_logout is not False:
+        provider_session_logout = await zitadel_mgmt.terminate_session(
+            extract_zitadel_session_id(
+                id_token_hint,
+                provider_token,
+                context_token,
+                login_record.id_token if login_record else None,
+                login_record.access_token if login_record else None,
+            )
+        )
     session_revocation = await record_identity_session_revocation(
         db,
         provider,
@@ -14204,6 +14257,30 @@ async def logout_identity_provider_session(
             "provider_logout": False,
             "cleared_cookies": True,
             "revocation": provider_revocation,
+            "provider_session_logout": provider_session_logout,
+            "session_revocation": {
+                "id": (session_revocation or context_session_revocation).id,
+                "subject": (session_revocation or context_session_revocation).subject,
+                "revoked_at": (session_revocation or context_session_revocation).revoked_at.isoformat()
+                if (session_revocation or context_session_revocation).revoked_at else None,
+            } if (session_revocation or context_session_revocation) else None,
+            "product": product_key,
+            "post_logout_redirect_uri": post_logout_uri,
+            "login_record_id": login_record.id if login_record else None,
+        }
+
+    if provider == "zitadel" and provider_session_logout and provider_session_logout.get("success"):
+        product_key, post_logout_uri = resolve_zitadel_post_logout_uri(product, data.post_logout_redirect_uri)
+        return {
+            "success": True,
+            "identity_provider": provider,
+            "logout_url": post_logout_uri,
+            "redirect_required": True,
+            "provider_logout": True,
+            "provider_logout_mode": "server_session_delete",
+            "cleared_cookies": True,
+            "revocation": provider_revocation,
+            "provider_session_logout": provider_session_logout,
             "session_revocation": {
                 "id": (session_revocation or context_session_revocation).id,
                 "subject": (session_revocation or context_session_revocation).subject,
@@ -14248,6 +14325,7 @@ async def logout_identity_provider_session(
         "redirect_required": True,
         "cleared_cookies": True,
         "revocation": provider_revocation,
+        "provider_session_logout": provider_session_logout,
         "session_revocation": {
             "id": (session_revocation or context_session_revocation).id,
             "subject": (session_revocation or context_session_revocation).subject,
@@ -14315,7 +14393,17 @@ async def logout_identity_provider_session_redirect(
         revoke_token = login_record.refresh_token
     if not revoke_token and provider == "zitadel" and login_record:
         revoke_token = login_record.access_token
-    await revoke_provider_token(provider, revoke_token)
+    provider_revocation = await revoke_provider_token(provider, revoke_token)
+    provider_session_logout = None
+    if provider == "zitadel" and provider_logout is not False:
+        provider_session_logout = await zitadel_mgmt.terminate_session(
+            extract_zitadel_session_id(
+                id_token_hint,
+                token,
+                login_record.id_token if login_record else None,
+                login_record.access_token if login_record else None,
+            )
+        )
     session_revocation = await record_identity_session_revocation(
         db,
         provider,
@@ -14341,6 +14429,12 @@ async def logout_identity_provider_session_redirect(
             _, post_logout_uri = resolve_zitadel_post_logout_uri(selected_product, post_logout_redirect_uri)
         else:
             _, post_logout_uri = resolve_auth0_post_logout_uri(selected_product, post_logout_redirect_uri)
+        redirect_response = RedirectResponse(url=post_logout_uri, status_code=302)
+        clear_product_auth_cookies(redirect_response)
+        return redirect_response
+
+    if provider == "zitadel" and provider_session_logout and provider_session_logout.get("success"):
+        _, post_logout_uri = resolve_zitadel_post_logout_uri(selected_product, post_logout_redirect_uri)
         redirect_response = RedirectResponse(url=post_logout_uri, status_code=302)
         clear_product_auth_cookies(redirect_response)
         return redirect_response
