@@ -5255,60 +5255,7 @@ def build_context_token_jwks() -> dict:
     }
 
 def build_user_context_token_claims(user_context: dict, issued_at: int, expires_at: int) -> dict:
-    user = user_context["user"]
-    organization = user_context.get("organization") or {}
-    admin = user_context.get("admin") or {}
-    org_role = user_context.get("org_role") or {}
-    role_display_name = org_role.get("name") or admin.get("role") or "user"
-    admin_access = user_context.get("admin_backend_access") or {}
-    onboarding_access = user_context.get("onboarding_access") or {}
-    combined_access = user_context.get("combined_access") or {}
-
-    if user_context.get("is_super_admin"):
-        token_role = "super_admin"
-    elif user_context.get("is_org_admin"):
-        token_role = "org_admin"
-    else:
-        token_role = normalize_token_value(role_display_name, "user")
-
-    return {
-        "iss": PROBESTACK_TOKEN_ISSUER,
-        "aud": PROBESTACK_TOKEN_AUDIENCE,
-        "sub": user["id"],
-        "email": user["email"],
-        "name": user.get("name") or user["email"],
-        "type": "user",
-        "role": token_role,
-        "roleName": role_display_name,
-        "organization_id": organization.get("id"),
-        "organization_name": organization.get("name"),
-        "account_type": user_context.get("account_type", "enterprise"),
-        "token_type": "probestack_user_context",
-        "is_admin": bool(user_context.get("is_admin")),
-        "is_org_admin": bool(user_context.get("is_org_admin")),
-        "is_super_admin": bool(user_context.get("is_super_admin")),
-        "user_roles": {
-            "admin_backend": admin_access.get("roles") or [],
-            "onboarding": onboarding_access.get("roles") or [],
-            "combined": combined_access.get("roles") or [],
-        },
-        "business_units": {
-            "admin_backend": admin_access.get("business_units") or [],
-            "onboarding": onboarding_access.get("business_units") or [],
-            "combined": combined_access.get("business_units") or [],
-        },
-        "projects": {
-            "admin_backend": admin_access.get("projects") or [],
-            "onboarding": onboarding_access.get("projects") or [],
-            "combined": combined_access.get("projects") or [],
-            "without_business_unit": combined_access.get("projects_without_business_unit") or [],
-        },
-        "role_assignments": build_role_assignments_claim(user_context),
-        "jti": str(uuid.uuid4()),
-        "iat": issued_at,
-        "nbf": issued_at,
-        "exp": expires_at,
-    }
+    return build_profile_response_data(user_context)
 
 def create_user_context_token(user_context: dict) -> tuple[str, int]:
     expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
@@ -6208,9 +6155,10 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
                 token,
                 get_context_token_public_key(),
                 algorithms=[PROBESTACK_CONTEXT_TOKEN_ALGORITHM],
-                issuer=PROBESTACK_TOKEN_ISSUER,
-                options={"verify_aud": False},
+                options={"verify_aud": False, "verify_iss": False},
             )
+            if not is_probestack_context_token_claims(payload):
+                raise jwt.InvalidTokenError("Invalid ProbeStack context token")
         else:
             payload = jwt.decode(
                 token,
@@ -6234,14 +6182,23 @@ def optional_verify_token(credentials: Optional[HTTPAuthorizationCredentials] = 
 def normalize_context_token_claim_aliases(payload: dict) -> dict:
     if not payload:
         return {}
+    profile_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    profile_user = profile_data.get("user") if isinstance(profile_data.get("user"), dict) else {}
+    profile_organization = profile_data.get("organization") if isinstance(profile_data.get("organization"), dict) else {}
+    profile_administration = profile_data.get("administration") if isinstance(profile_data.get("administration"), dict) else {}
+    profile_roles = profile_data.get("business_roles") if isinstance(profile_data.get("business_roles"), list) else []
+    primary_profile_role = profile_roles[0] if profile_roles and isinstance(profile_roles[0], dict) else {}
     organization_name = (
         payload.get("organization_name")
         or payload.get("userOrgName")
         or payload.get("org_name")
+        or profile_organization.get("name")
     )
-    payload.setdefault("email", payload.get("userEmail"))
-    payload.setdefault("role", payload.get("userRole"))
-    payload.setdefault("organization_id", payload.get("userOrgId"))
+    payload.setdefault("sub", profile_user.get("id"))
+    payload.setdefault("email", payload.get("userEmail") or profile_user.get("email"))
+    payload.setdefault("role", payload.get("userRole") or primary_profile_role.get("key") or primary_profile_role.get("name"))
+    payload.setdefault("roleName", payload.get("userRoleName") or primary_profile_role.get("name"))
+    payload.setdefault("organization_id", payload.get("userOrgId") or profile_organization.get("id"))
     payload.setdefault("organization_name", organization_name)
     payload.setdefault("org_name", organization_name)
     payload.setdefault("userId", payload.get("sub"))
@@ -6253,6 +6210,10 @@ def normalize_context_token_claim_aliases(payload: dict) -> dict:
     payload.setdefault("backendOrgId", payload.get("organization_id"))
     payload.setdefault("tokenType", payload.get("account_type"))
     payload.setdefault("token_type", "probestack_user_context")
+    payload.setdefault("account_type", profile_organization.get("account_type"))
+    payload.setdefault("is_admin", bool(profile_administration.get("is_admin")))
+    payload.setdefault("is_org_admin", bool(profile_administration.get("is_org_admin")))
+    payload.setdefault("is_super_admin", bool(profile_administration.get("is_super_admin")))
     return payload
 
 def normalized_issuer_url(value: str) -> str:
@@ -13932,6 +13893,16 @@ def is_probestack_context_token_claims(decoded: dict) -> bool:
     return (
         decoded.get("token_type") == "probestack_user_context"
         or normalized_issuer_url(decoded.get("iss") or "") == normalized_issuer_url(PROBESTACK_TOKEN_ISSUER)
+        or (
+            isinstance(decoded.get("user"), dict)
+            and isinstance(decoded.get("organization"), dict)
+            and isinstance(decoded.get("business_roles"), list)
+            and isinstance(decoded.get("administration"), dict)
+        )
+        or (
+            isinstance(decoded.get("data"), dict)
+            and is_probestack_context_token_claims(decoded.get("data"))
+        )
     )
 
 def verify_context_token_claims(token: Optional[str]) -> dict:
@@ -13945,8 +13916,7 @@ def verify_context_token_claims(token: Optional[str]) -> dict:
             token,
             get_context_token_public_key(),
             algorithms=[PROBESTACK_CONTEXT_TOKEN_ALGORITHM],
-            issuer=PROBESTACK_TOKEN_ISSUER,
-            options={"verify_aud": False},
+            options={"verify_aud": False, "verify_iss": False},
         )
     except Exception:
         return {}
@@ -18146,18 +18116,6 @@ async def issue_user_context_token(
 
     return {
         "success": True,
-        "token": token,
-        "contextToken": token,
-        "context_token": token,
-        "token_type": "Bearer",
-        "token_algorithm": PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
-        "kid": PROBESTACK_CONTEXT_TOKEN_KID,
-        "issuer": PROBESTACK_TOKEN_ISSUER,
-        "jwks_uri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
-        "admin_backend_host": ADMIN_BACKEND_PUBLIC_URL,
-        "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
-        "cookie_set": True,
-        "user": build_context_token_response_user_context(user_context),
         "data": build_profile_response_data(user_context),
     }
 
