@@ -4805,6 +4805,173 @@ async def build_business_unit_context(
         "projects_without_business_unit": projects_without_business_unit,
     }
 
+def compact_role_claim(role_name: Optional[str], source: str, role_id: Optional[str] = None) -> Optional[dict]:
+    if not role_name:
+        return None
+    return {
+        "id": role_id,
+        "key": normalize_token_value(role_name, "role"),
+        "name": role_name,
+        "source": source,
+    }
+
+def source_access_from_user_context(user_context: dict) -> dict:
+    roles = []
+    for role in user_context.get("roles") or []:
+        role_claim = compact_role_claim(role.get("name") or role.get("role_name") or role.get("key"), "admin_backend", role.get("id"))
+        if role_claim:
+            roles.append(role_claim)
+    if not roles:
+        org_role = user_context.get("org_role") or {}
+        role_claim = compact_role_claim(org_role.get("name"), "admin_backend", org_role.get("id"))
+        if role_claim:
+            roles.append(role_claim)
+
+    return {
+        "roles": dedupe_role_claims(roles),
+        "business_units": tag_context_business_units(user_context.get("business_units") or [], "admin_backend"),
+        "projects": tag_context_projects(user_context.get("projects") or [], "admin_backend"),
+        "projects_without_business_unit": tag_context_projects(user_context.get("projects_without_business_unit") or [], "admin_backend"),
+    }
+
+def tag_context_projects(projects: List[dict], source: str) -> List[dict]:
+    tagged = []
+    for project in projects or []:
+        name = project.get("project_name") or project.get("name")
+        role = project.get("project_role") or project.get("role")
+        if not name:
+            continue
+        tagged.append({
+            "project_name": name,
+            "project_role": role or "member",
+            "source": source,
+        })
+    return tagged
+
+def tag_context_business_units(business_units: List[dict], source: str) -> List[dict]:
+    tagged = []
+    for business_unit in business_units or []:
+        name = business_unit.get("bu_name") or business_unit.get("name")
+        if not name:
+            continue
+        tagged.append({
+            "bu_name": name,
+            "bu_role": business_unit.get("bu_role") or business_unit.get("business_unit_role") or business_unit.get("role") or "member",
+            "source": source,
+            "projects": tag_context_projects(business_unit.get("projects") or [], source),
+        })
+    return tagged
+
+def role_claim_key(role: dict) -> str:
+    return normalize_token_value(role.get("key") or role.get("name"), "role")
+
+def dedupe_role_claims(roles: List[dict]) -> List[dict]:
+    deduped = []
+    seen = set()
+    for role in roles or []:
+        key = role_claim_key(role)
+        source = role.get("source") or ""
+        dedupe_key = (key, source)
+        if not key or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        deduped.append(role)
+    return deduped
+
+def context_item_key(*values: Optional[str]) -> Optional[str]:
+    for value in values:
+        if value:
+            return normalize_token_value(str(value), "item")
+    return None
+
+def merge_context_projects(project_groups: List[List[dict]]) -> List[dict]:
+    merged = {}
+    for projects in project_groups:
+        for project in projects or []:
+            key = context_item_key(project.get("project_name"), project.get("name"))
+            if not key:
+                continue
+            existing = merged.setdefault(key, {
+                "project_name": project.get("project_name") or project.get("name"),
+                "project_role": project.get("project_role") or project.get("role") or "member",
+                "sources": [],
+            })
+            source = project.get("source")
+            if source and source not in existing["sources"]:
+                existing["sources"].append(source)
+            role = project.get("project_role") or project.get("role")
+            if role and existing.get("project_role") == "member":
+                existing["project_role"] = role
+    return list(merged.values())
+
+def merge_context_business_units(business_unit_groups: List[List[dict]]) -> List[dict]:
+    merged = {}
+    for business_units in business_unit_groups:
+        for business_unit in business_units or []:
+            key = context_item_key(business_unit.get("bu_name"), business_unit.get("name"))
+            if not key:
+                continue
+            existing = merged.setdefault(key, {
+                "bu_name": business_unit.get("bu_name") or business_unit.get("name"),
+                "bu_role": business_unit.get("bu_role") or business_unit.get("role") or "member",
+                "sources": [],
+                "projects": [],
+            })
+            source = business_unit.get("source")
+            if source and source not in existing["sources"]:
+                existing["sources"].append(source)
+            role = business_unit.get("bu_role") or business_unit.get("role")
+            if role and existing.get("bu_role") == "member":
+                existing["bu_role"] = role
+            existing["projects"] = merge_context_projects([
+                existing.get("projects") or [],
+                business_unit.get("projects") or [],
+            ])
+    return list(merged.values())
+
+def merge_source_access_contexts(admin_access: dict, onboarding_access: dict) -> dict:
+    combined_roles = dedupe_role_claims((admin_access.get("roles") or []) + (onboarding_access.get("roles") or []))
+    return {
+        "roles": combined_roles,
+        "business_units": merge_context_business_units([
+            admin_access.get("business_units") or [],
+            onboarding_access.get("business_units") or [],
+        ]),
+        "projects": merge_context_projects([
+            admin_access.get("projects") or [],
+            onboarding_access.get("projects") or [],
+        ]),
+        "projects_without_business_unit": merge_context_projects([
+            admin_access.get("projects_without_business_unit") or [],
+            onboarding_access.get("projects_without_business_unit") or [],
+        ]),
+    }
+
+def apply_access_sources_to_user_context(user_context: dict, onboarding_access: Optional[dict] = None) -> dict:
+    admin_access = user_context.get("admin_backend_access") or source_access_from_user_context(user_context)
+    onboarding_access = onboarding_access or user_context.get("onboarding_access") or empty_onboarding_access_context()
+    combined_access = merge_source_access_contexts(admin_access, onboarding_access)
+    user_context["admin_backend_access"] = admin_access
+    user_context["onboarding_access"] = onboarding_access
+    user_context["combined_access"] = combined_access
+    user_context["business_units"] = combined_access["business_units"]
+    user_context["projects"] = combined_access["projects"]
+    user_context["projects_without_business_unit"] = combined_access["projects_without_business_unit"]
+    user_context["combined_roles"] = combined_access["roles"]
+    return user_context
+
+def empty_onboarding_access_context(available: bool = False, error: Optional[str] = None) -> dict:
+    context = {
+        "available": available,
+        "roles": [],
+        "business_units": [],
+        "projects": [],
+        "projects_without_business_unit": [],
+    }
+    if error:
+        context["error"] = error
+    return context
+
 async def build_user_context(
     db: AsyncSession,
     email: Optional[str],
@@ -4901,7 +5068,7 @@ async def build_user_context(
             user.zitadel_user_id = zitadel_user_id
         await db.flush()
 
-    return {
+    user_context = {
         "user": {
             "id": user.id if user else admin.id,
             "email": primary_email,
@@ -4945,6 +5112,7 @@ async def build_user_context(
         "plans": subscription_context["plans"],
         "tools": subscription_context["tools"],
     }
+    return apply_access_sources_to_user_context(user_context)
 
 def normalize_scoped_role(role: Optional[str], scope: str, is_admin_scope: bool = False) -> str:
     role_key = normalize_token_value(role, "member")
@@ -5092,6 +5260,9 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
     admin = user_context.get("admin") or {}
     org_role = user_context.get("org_role") or {}
     role_display_name = org_role.get("name") or admin.get("role") or "user"
+    admin_access = user_context.get("admin_backend_access") or {}
+    onboarding_access = user_context.get("onboarding_access") or {}
+    combined_access = user_context.get("combined_access") or {}
 
     if user_context.get("is_super_admin"):
         token_role = "super_admin"
@@ -5116,6 +5287,23 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "is_admin": bool(user_context.get("is_admin")),
         "is_org_admin": bool(user_context.get("is_org_admin")),
         "is_super_admin": bool(user_context.get("is_super_admin")),
+        "user_roles": {
+            "admin_backend": admin_access.get("roles") or [],
+            "onboarding": onboarding_access.get("roles") or [],
+            "combined": combined_access.get("roles") or [],
+        },
+        "business_units": {
+            "admin_backend": admin_access.get("business_units") or [],
+            "onboarding": onboarding_access.get("business_units") or [],
+            "combined": combined_access.get("business_units") or [],
+        },
+        "projects": {
+            "admin_backend": admin_access.get("projects") or [],
+            "onboarding": onboarding_access.get("projects") or [],
+            "combined": combined_access.get("projects") or [],
+            "without_business_unit": combined_access.get("projects_without_business_unit") or [],
+        },
+        "role_assignments": build_role_assignments_claim(user_context),
         "jti": str(uuid.uuid4()),
         "iat": issued_at,
         "nbf": issued_at,
@@ -5216,7 +5404,7 @@ def build_profile_organization(user_context: dict) -> Optional[dict]:
 
 def build_profile_business_roles(user_context: dict) -> List[dict]:
     roles = []
-    for role in user_context.get("roles") or []:
+    for role in user_context.get("combined_roles") or user_context.get("roles") or []:
         role_name = role.get("name") or role.get("role_name") or role.get("key") or role.get("id")
         permissions = role.get("permissions") or []
         roles.append({
@@ -6970,6 +7158,206 @@ def user_from_resource_member(member: dict, project: dict, business_unit: Option
         "application_id": business_unit.get("application_id") if business_unit else None,
         "user": user,
     }
+
+def catalog_member_matches_context_user(member: dict, user_context: dict) -> bool:
+    user = user_context.get("user") or {}
+    normalized_member = normalize_catalog_user(member)
+    user_email = (user.get("email") or "").strip().lower()
+    member_email = (normalized_member.get("email") or "").strip().lower()
+    if user_email and member_email and user_email == member_email:
+        return True
+    user_ids = {
+        str(value).strip().lower()
+        for value in [
+            user.get("id"),
+            user.get("auth0_user_id"),
+            user.get("zitadel_user_id"),
+        ]
+        if value
+    }
+    member_id = str(normalized_member.get("id") or "").strip().lower()
+    return bool(member_id and member_id in user_ids)
+
+def assignment_matches_context_user(assignment: dict, user_context: dict) -> bool:
+    user = user_context.get("user") or {}
+    user_email = (user.get("email") or "").strip().lower()
+    assignment_email = (assignment.get("principal_email") or "").strip().lower()
+    if user_email and assignment_email and user_email == assignment_email:
+        return True
+    user_ids = {
+        str(value).strip().lower()
+        for value in [
+            user.get("id"),
+            user.get("auth0_user_id"),
+            user.get("zitadel_user_id"),
+        ]
+        if value
+    }
+    principal_id = str(assignment.get("principal_id") or "").strip().lower()
+    return bool(principal_id and principal_id in user_ids)
+
+def role_from_catalog_member(member: dict, fallback: str = "member") -> str:
+    return str(first_present(
+        member,
+        ["project_role", "projectRole", "business_unit_role", "businessUnitRole", "role", "roleCode", "role_code", "roleName", "role_name"],
+    ) or fallback)
+
+def add_onboarding_role(role_names: List[str], role_name: Optional[str]) -> None:
+    if role_name and role_name not in role_names:
+        role_names.append(str(role_name))
+
+def add_onboarding_business_unit(business_units_by_key: dict, business_unit: dict, role: str) -> dict:
+    name = business_unit.get("name") or business_unit.get("business_unit_name") or business_unit.get("id")
+    key = context_item_key(business_unit.get("id"), name)
+    entry = business_units_by_key.setdefault(key, {
+        "bu_name": name,
+        "bu_role": role or "member",
+        "source": "onboarding",
+        "projects": [],
+    })
+    if role and entry.get("bu_role") == "member":
+        entry["bu_role"] = role
+    return entry
+
+def add_onboarding_project(
+    projects_by_key: dict,
+    business_units_by_key: dict,
+    project: dict,
+    role: str,
+    business_unit: Optional[dict] = None,
+) -> dict:
+    name = project.get("name") or project.get("project_name") or project.get("id")
+    key = context_item_key(project.get("id"), name)
+    project_entry = projects_by_key.setdefault(key, {
+        "project_name": name,
+        "project_role": role or "member",
+        "source": "onboarding",
+    })
+    if role and project_entry.get("project_role") == "member":
+        project_entry["project_role"] = role
+
+    if business_unit:
+        bu_entry = add_onboarding_business_unit(business_units_by_key, business_unit, "member")
+        if not any(context_item_key(item.get("project_name")) == context_item_key(project_entry.get("project_name")) for item in bu_entry["projects"]):
+            bu_entry["projects"].append(project_entry)
+    return project_entry
+
+def build_onboarding_access_context(
+    user_context: dict,
+    *,
+    catalog_user: Optional[dict] = None,
+    business_units: Optional[List[dict]] = None,
+    projects: Optional[List[dict]] = None,
+    assignments: Optional[List[dict]] = None,
+    available: bool = False,
+) -> dict:
+    business_units = business_units or []
+    projects = projects or []
+    assignments = assignments or []
+    business_units_by_id = {str(item.get("id")): item for item in business_units if item.get("id")}
+    projects_by_id = {str(item.get("id")): item for item in projects if item.get("id")}
+    business_units_by_key = {}
+    projects_by_key = {}
+    role_names = []
+
+    for role_name in product_role_names_from_catalog_user(catalog_user):
+        add_onboarding_role(role_names, role_name)
+
+    for business_unit in business_units:
+        for member in business_unit.get("users") or []:
+            if catalog_member_matches_context_user(member, user_context):
+                add_onboarding_business_unit(business_units_by_key, business_unit, role_from_catalog_member(member))
+
+    for project in projects:
+        business_unit = business_units_by_id.get(str(project.get("business_unit_id"))) if project.get("business_unit_id") else None
+        for member in project.get("users") or []:
+            if catalog_member_matches_context_user(member, user_context):
+                add_onboarding_project(projects_by_key, business_units_by_key, project, role_from_catalog_member(member), business_unit)
+
+    for assignment in assignments:
+        if not assignment_matches_context_user(assignment, user_context):
+            continue
+        role_code = str(assignment.get("role_code") or "member")
+        add_onboarding_role(role_names, role_code)
+        scope_type = str(assignment.get("scope_type") or "").upper()
+        scope_id = str(assignment.get("scope_id") or "")
+        if "BUSINESS" in scope_type or scope_type == "BU":
+            business_unit = business_units_by_id.get(scope_id) or {"id": scope_id, "name": scope_id}
+            add_onboarding_business_unit(business_units_by_key, business_unit, role_code)
+        elif "PROJECT" in scope_type or "TEAM" in scope_type:
+            project = projects_by_id.get(scope_id) or {"id": scope_id, "name": scope_id}
+            business_unit = business_units_by_id.get(str(project.get("business_unit_id"))) if project.get("business_unit_id") else None
+            add_onboarding_project(projects_by_key, business_units_by_key, project, role_code, business_unit)
+
+    role_claims = [
+        role_claim
+        for role_claim in [compact_role_claim(role_name, "onboarding") for role_name in role_names]
+        if role_claim
+    ]
+    return {
+        "available": available,
+        "roles": dedupe_role_claims(role_claims),
+        "business_units": list(business_units_by_key.values()),
+        "projects": list(projects_by_key.values()),
+        "projects_without_business_unit": [
+            project
+            for project in projects_by_key.values()
+            if not any(project in (business_unit.get("projects") or []) for business_unit in business_units_by_key.values())
+        ],
+    }
+
+async def enrich_user_context_with_onboarding_access(request: Request, user_context: dict) -> dict:
+    organization = user_context.get("organization") or {}
+    organization_id = organization.get("id")
+    if not organization_id or user_context.get("account_type") == "individual":
+        return apply_access_sources_to_user_context(user_context, empty_onboarding_access_context())
+
+    user = user_context.get("user") or {}
+    principal_id = user.get("id") or user.get("email")
+    try:
+        business_units_payload = await onboarding_api_get_with_local_fallback(
+            request,
+            "/business-units",
+            params={"page": 0, "size": 500},
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
+        )
+        projects_payload = await onboarding_api_get_with_local_fallback(
+            request,
+            "/projects",
+            params={"page": 0, "size": 500},
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+        )
+        assignments_payload = await onboarding_api_get_with_local_fallback(
+            request,
+            "/role-assignments",
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_READ],
+        )
+        catalog_user_payload = None
+        if principal_id:
+            catalog_user_payload = await onboarding_api_get_with_local_fallback(
+                request,
+                f"/admin/access-catalog/users/{principal_id}",
+                organization_id=organization_id,
+                scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+            )
+    except HTTPException as exc:
+        if exc.status_code in {401, 403, 404, 502, 503, 504}:
+            logger.info(f"Using admin-backend-only context because onboarding access is unavailable: {exc.detail}")
+            return apply_access_sources_to_user_context(user_context, empty_onboarding_access_context(error=str(exc.detail)))
+        raise
+
+    onboarding_access = build_onboarding_access_context(
+        user_context,
+        catalog_user=normalize_catalog_user(unwrap_single_payload(catalog_user_payload)) if catalog_user_payload is not None else None,
+        business_units=normalize_business_units_response(business_units_payload) if business_units_payload is not None else [],
+        projects=normalize_projects_response(projects_payload) if projects_payload is not None else [],
+        assignments=normalize_catalog_assignments(assignments_payload) if assignments_payload is not None else [],
+        available=any(payload is not None for payload in [business_units_payload, projects_payload, assignments_payload, catalog_user_payload]),
+    )
+    return apply_access_sources_to_user_context(user_context, onboarding_access)
 
 async def local_business_units_for_org(db: AsyncSession, org_id: str, include_projects: bool = False) -> List[dict]:
     result = await db.execute(
@@ -17665,6 +18053,7 @@ async def get_user_context_token_jwks():
 @api_router.post("/public/users/context-token", tags=["Public API"])
 async def issue_user_context_token(
     data: UserContextTokenRequest,
+    request: Request,
     fastapi_response: Response,
     db: AsyncSession = Depends(get_db),
 ):
@@ -17702,6 +18091,7 @@ async def issue_user_context_token(
         auth0_user_id=auth0_user_id,
         zitadel_user_id=zitadel_user_id,
     )
+    user_context = await enrich_user_context_with_onboarding_access(request, user_context)
     token, expires_at = create_user_context_token(user_context)
     cookie_max_age = max(1, expires_at - int(datetime.now(timezone.utc).timestamp()))
     set_product_auth_cookies(fastapi_response, token, cookie_max_age)
@@ -17753,6 +18143,7 @@ async def get_user_context_from_signed_token(
         auth0_user_id=auth0_user_id,
         zitadel_user_id=zitadel_user_id,
     )
+    user_context = await enrich_user_context_with_onboarding_access(request, user_context)
     if user_id and user_context.get("user", {}).get("id") != user_id:
         raise HTTPException(status_code=403, detail="Token user does not match current user")
 
