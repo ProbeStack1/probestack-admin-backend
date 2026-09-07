@@ -5321,6 +5321,7 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "iat": issued_at,
         "nbf": issued_at,
         "exp": expires_at,
+        "data": build_profile_response_data(user_context),
     }
 
 def create_user_context_token(user_context: dict) -> tuple[str, int]:
@@ -5524,6 +5525,11 @@ def build_profile_response_data(user_context: dict, session: Optional[dict] = No
             "is_super_admin": bool(user_context.get("is_super_admin")),
         },
         "applications": build_profile_applications(user_context),
+        "business_units": user_context.get("business_units") or [],
+        "projects": user_context.get("projects") or [],
+        "projects_without_business_unit": user_context.get("projects_without_business_unit") or [],
+        "role_assignments": build_role_assignments_claim(user_context),
+        "entitlements": build_entitlements_claim(user_context),
         "subscriptions": [
             build_profile_subscription(subscription)
             for subscription in user_context.get("subscriptions") or []
