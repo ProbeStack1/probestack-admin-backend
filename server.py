@@ -18116,6 +18116,7 @@ async def issue_user_context_token(
 
     return {
         "success": True,
+        "contextToken": token,
         "data": build_profile_response_data(user_context),
     }
 
