@@ -5321,7 +5321,6 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "iat": issued_at,
         "nbf": issued_at,
         "exp": expires_at,
-        "data": build_profile_response_data(user_context),
     }
 
 def create_user_context_token(user_context: dict) -> tuple[str, int]:
