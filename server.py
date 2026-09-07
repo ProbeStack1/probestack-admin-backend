@@ -139,6 +139,7 @@ ZITADEL_POST_LOGOUT_URIS = {
     "console": os.environ.get("ZITADEL_CONSOLE_POST_LOGOUT_URI", "https://console.probestack.io"),
     "local": os.environ.get("ZITADEL_LOCAL_POST_LOGOUT_URI", "http://localhost:3000/admin/zitadel-test"),
 }
+ZITADEL_FORCE_LOGIN_PROMPT = os.environ.get("ZITADEL_FORCE_LOGIN_PROMPT", "true").lower() in ["1", "true", "yes"]
 
 # Onboarding MongoDB role lookup. Used when creating local users so existing
 # onboarding roles remain the source of truth when a matching developer exists.
@@ -13695,6 +13696,9 @@ async def zitadel_init(data: ZitadelInitRequest, db: AsyncSession = Depends(get_
         "login_hint": email,
         "organization": selected_zitadel_org_id,
     }
+    if ZITADEL_FORCE_LOGIN_PROMPT:
+        zitadel_params["prompt"] = "login"
+        zitadel_params["max_age"] = "0"
     if data.state:
         zitadel_params["state"] = data.state
     else:
