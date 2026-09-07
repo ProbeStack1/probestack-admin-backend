@@ -14727,7 +14727,7 @@ async def logout_identity_provider_session(
             "login_record_id": login_record.id if login_record else None,
         }
 
-    if provider == "zitadel" and provider_session_logout and provider_session_logout.get("success"):
+    if provider == "zitadel":
         product_key, post_logout_uri = resolve_zitadel_post_logout_uri(product, data.post_logout_redirect_uri)
         return {
             "success": True,
@@ -14735,7 +14735,11 @@ async def logout_identity_provider_session(
             "logout_url": post_logout_uri,
             "redirect_required": True,
             "provider_logout": True,
-            "provider_logout_mode": "server_session_delete",
+            "provider_logout_mode": (
+                "server_session_delete"
+                if provider_session_logout and provider_session_logout.get("success")
+                else "server_session_delete_attempted"
+            ),
             "cleared_cookies": True,
             "revocation": provider_revocation,
             "provider_session_logout": provider_session_logout,
@@ -14750,31 +14754,15 @@ async def logout_identity_provider_session(
             "login_record_id": login_record.id if login_record else None,
         }
 
-    if provider == "zitadel":
-        if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
-            raise HTTPException(status_code=500, detail="Zitadel logout is not configured")
-        product_key, post_logout_uri = resolve_zitadel_post_logout_uri(product, data.post_logout_redirect_uri)
-        logout_params = {
-            "client_id": ZITADEL_CLIENT_ID,
-            "post_logout_redirect_uri": post_logout_uri,
-        }
-        if id_token_hint:
-            logout_params["id_token_hint"] = id_token_hint
-        if data.state:
-            logout_params["state"] = data.state
-        if logout_hint:
-            logout_params["logout_hint"] = logout_hint
-        logout_url = f"{zitadel_mgmt.base_url}/oidc/v1/end_session?{urlencode(logout_params)}"
-    else:
-        require_identity_provider_configured("auth0")
-        product_key, post_logout_uri = resolve_auth0_post_logout_uri(product, data.post_logout_redirect_uri)
-        logout_params = {
-            "client_id": AUTH0_CLIENT_ID,
-            "returnTo": post_logout_uri,
-        }
-        if data.state:
-            logout_params["state"] = data.state
-        logout_url = f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
+    require_identity_provider_configured("auth0")
+    product_key, post_logout_uri = resolve_auth0_post_logout_uri(product, data.post_logout_redirect_uri)
+    logout_params = {
+        "client_id": AUTH0_CLIENT_ID,
+        "returnTo": post_logout_uri,
+    }
+    if data.state:
+        logout_params["state"] = data.state
+    logout_url = f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
 
     return {
         "success": True,
@@ -14891,37 +14879,21 @@ async def logout_identity_provider_session_redirect(
         clear_product_auth_cookies(redirect_response)
         return redirect_response
 
-    if provider == "zitadel" and provider_session_logout and provider_session_logout.get("success"):
+    if provider == "zitadel":
         _, post_logout_uri = resolve_zitadel_post_logout_uri(selected_product, post_logout_redirect_uri)
         redirect_response = RedirectResponse(url=post_logout_uri, status_code=302)
         clear_product_auth_cookies(redirect_response)
         return redirect_response
 
-    if provider == "zitadel":
-        if not ZITADEL_CLIENT_ID or not zitadel_mgmt.base_url:
-            raise HTTPException(status_code=500, detail="Zitadel logout is not configured")
-        _, post_logout_uri = resolve_zitadel_post_logout_uri(selected_product, post_logout_redirect_uri)
-        logout_params = {
-            "client_id": ZITADEL_CLIENT_ID,
-            "post_logout_redirect_uri": post_logout_uri,
-        }
-        if id_token_hint:
-            logout_params["id_token_hint"] = id_token_hint
-        if state:
-            logout_params["state"] = state
-        if selected_logout_hint:
-            logout_params["logout_hint"] = selected_logout_hint
-        logout_url = f"{zitadel_mgmt.base_url}/oidc/v1/end_session?{urlencode(logout_params)}"
-    else:
-        require_identity_provider_configured("auth0")
-        _, post_logout_uri = resolve_auth0_post_logout_uri(selected_product, post_logout_redirect_uri)
-        logout_params = {
-            "client_id": AUTH0_CLIENT_ID,
-            "returnTo": post_logout_uri,
-        }
-        if state:
-            logout_params["state"] = state
-        logout_url = f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
+    require_identity_provider_configured("auth0")
+    _, post_logout_uri = resolve_auth0_post_logout_uri(selected_product, post_logout_redirect_uri)
+    logout_params = {
+        "client_id": AUTH0_CLIENT_ID,
+        "returnTo": post_logout_uri,
+    }
+    if state:
+        logout_params["state"] = state
+    logout_url = f"https://{AUTH0_DOMAIN}/v2/logout?{urlencode(logout_params)}"
 
     redirect_response = RedirectResponse(url=logout_url, status_code=302)
     clear_product_auth_cookies(redirect_response)
