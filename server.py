@@ -5108,27 +5108,14 @@ def build_user_context_token_claims(user_context: dict, issued_at: int, expires_
         "name": user.get("name") or user["email"],
         "type": "user",
         "role": token_role,
+        "roleName": role_display_name,
         "organization_id": organization.get("id"),
         "organization_name": organization.get("name"),
-        "org_name": organization.get("name"),
-        "backendOrgId": organization.get("id"),
-        "userId": user["id"],
-        "userEmail": user["email"],
-        "userRole": token_role,
-        "userRoleName": role_display_name,
-        "userOrgId": organization.get("id"),
-        "userOrgName": organization.get("name"),
-        "tokenType": user_context.get("account_type", "enterprise"),
+        "account_type": user_context.get("account_type", "enterprise"),
         "token_type": "probestack_user_context",
-        "tokenAlgorithm": PROBESTACK_CONTEXT_TOKEN_ALGORITHM,
-        "jwksUri": PROBESTACK_CONTEXT_TOKEN_JWKS_URI,
-        "adminBackendHost": ADMIN_BACKEND_PUBLIC_URL,
-        "admin_id": admin.get("id"),
         "is_admin": bool(user_context.get("is_admin")),
         "is_org_admin": bool(user_context.get("is_org_admin")),
         "is_super_admin": bool(user_context.get("is_super_admin")),
-        "role_assignments": build_role_assignments_claim(user_context),
-        "entitlements": build_entitlements_claim(user_context),
         "jti": str(uuid.uuid4()),
         "iat": issued_at,
         "nbf": issued_at,
@@ -6069,6 +6056,14 @@ def normalize_context_token_claim_aliases(payload: dict) -> dict:
     payload.setdefault("organization_id", payload.get("userOrgId"))
     payload.setdefault("organization_name", organization_name)
     payload.setdefault("org_name", organization_name)
+    payload.setdefault("userId", payload.get("sub"))
+    payload.setdefault("userEmail", payload.get("email"))
+    payload.setdefault("userRole", payload.get("role"))
+    payload.setdefault("userRoleName", payload.get("roleName"))
+    payload.setdefault("userOrgId", payload.get("organization_id"))
+    payload.setdefault("userOrgName", payload.get("organization_name"))
+    payload.setdefault("backendOrgId", payload.get("organization_id"))
+    payload.setdefault("tokenType", payload.get("account_type"))
     payload.setdefault("token_type", "probestack_user_context")
     return payload
 
