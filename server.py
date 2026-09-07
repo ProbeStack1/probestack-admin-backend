@@ -7438,6 +7438,23 @@ async def get_one_catalog_resource_for_request(
     resources = normalize_catalog_resources(payload, resource_type)
     return resources[0] if resources else None
 
+async def get_onboarding_project_for_request(
+    request: Request,
+    project_id: str,
+    *,
+    organization_id: str,
+) -> Optional[dict]:
+    upstream_payload = await onboarding_api_get_with_local_fallback(
+        request,
+        f"/projects/{project_id}",
+        organization_id=organization_id,
+        scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+    )
+    if upstream_payload is None:
+        return None
+    project = normalize_project_response(upstream_payload)
+    return project if project.get("id") else None
+
 async def get_catalog_resources_for_dashboard(
     request: Request,
     resource_type: str,
@@ -10757,6 +10774,24 @@ async def get_my_project_team(
             user_from_resource_member(member, catalog_project, business_unit)
             for member in catalog_project.get("users", [])
         ]
+    onboarding_project = await get_onboarding_project_for_request(
+        request,
+        project_id,
+        organization_id=org.id,
+    )
+    if onboarding_project is not None:
+        business_unit = None
+        if onboarding_project.get("business_unit_id"):
+            business_unit = await get_one_catalog_resource_for_request(
+                request,
+                "BUSINESS_UNIT",
+                onboarding_project["business_unit_id"],
+                organization_id=org.id,
+            )
+        return [
+            user_from_resource_member(member, onboarding_project, business_unit)
+            for member in onboarding_project.get("users", [])
+        ]
     await get_project_for_org(db, project_id, org.id)
 
     result = await db.execute(
@@ -10829,12 +10864,18 @@ async def get_my_project_team_members(
 async def invite_my_project_team(
     project_id: str,
     data: ProjectTeamInviteCreate,
+    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Invite one or more organization-domain users to a project."""
     org = await get_approved_org_for_admin(payload, db)
-    project = await get_project_for_org(db, project_id, org.id)
+    project = None
+    try:
+        project = await get_project_for_org(db, project_id, org.id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
     project_role = (data.project_role or "member").strip().lower()
     if project_role not in ["manager", "member", "viewer"]:
         raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
@@ -10851,6 +10892,40 @@ async def invite_my_project_team(
 
     if not emails:
         raise HTTPException(status_code=400, detail="At least one email address is required")
+
+    if project is None:
+        onboarding_project = await get_onboarding_project_for_request(
+            request,
+            project_id,
+            organization_id=org.id,
+        )
+        if onboarding_project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        invited = []
+        for email in emails:
+            upstream_payload = await onboarding_api_request(
+                request,
+                "POST",
+                "/role-assignments",
+                json_payload=onboarding_role_assignment_payload({
+                    "principalEmail": email,
+                    "roleKind": "ACCESS",
+                    "roleCode": project_role,
+                    "scopeType": "PROJECT",
+                    "scopeId": project_id,
+                    "active": True,
+                }),
+                organization_id=org.id,
+                scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_WRITE],
+            )
+            invited.append(normalize_catalog_assignment(upstream_payload))
+
+        return {
+            "message": "Project invitations sent",
+            "invited": invited,
+            "skipped": [],
+        }
 
     invited = []
     skipped = []
