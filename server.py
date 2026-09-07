@@ -206,10 +206,32 @@ ONBOARDING_API_LOCAL_FALLBACK = os.environ.get("ONBOARDING_API_LOCAL_FALLBACK", 
 ONBOARDING_API_BEARER_TOKEN = os.environ.get("ONBOARDING_API_BEARER_TOKEN", "").strip()
 ONBOARDING_API_CONTEXT_HEADER = os.environ.get("ONBOARDING_API_CONTEXT_HEADER", "X-ProbeStack-Context-Token")
 ONBOARDING_API_FORWARD_AUTHORIZATION = os.environ.get("ONBOARDING_API_FORWARD_AUTHORIZATION", "true").lower() in ["1", "true", "yes"]
-ONBOARDING_SERVICE_TOKEN_URL = os.environ.get("ONBOARDING_SERVICE_TOKEN_URL", "https://auth.probestack.io/oauth2/token")
-ONBOARDING_SERVICE_CLIENT_ID = os.environ.get("ONBOARDING_SERVICE_CLIENT_ID", "probestack-admin-backend")
-ONBOARDING_SERVICE_CLIENT_SECRET = os.environ.get("ONBOARDING_SERVICE_CLIENT_SECRET", "").strip()
-ONBOARDING_SERVICE_AUDIENCE = os.environ.get("ONBOARDING_SERVICE_AUDIENCE", "probestack-api")
+TOKEN_ISSUER_TOKEN_URL = os.environ.get(
+    "TOKEN_ISSUER_TOKEN_URL",
+    os.environ.get(
+        "ONBOARDING_SERVICE_TOKEN_URL",
+        "https://probestack.io/token-issuer-api/api/v1/service-tokens",
+    ),
+).rstrip("/")
+TOKEN_ISSUER_CLIENT_ID = os.environ.get(
+    "TOKEN_ISSUER_CLIENT_ID",
+    os.environ.get("ONBOARDING_SERVICE_CLIENT_ID", "probestack-admin-backend"),
+)
+TOKEN_ISSUER_CLIENT_SECRET = os.environ.get(
+    "TOKEN_ISSUER_CLIENT_SECRET",
+    os.environ.get("ONBOARDING_SERVICE_CLIENT_SECRET", ""),
+).strip()
+TOKEN_ISSUER_AUDIENCE = os.environ.get(
+    "TOKEN_ISSUER_AUDIENCE",
+    os.environ.get("ONBOARDING_SERVICE_AUDIENCE", "probestack-api"),
+)
+TOKEN_ISSUER_ORGANIZATION_ID = os.environ.get("TOKEN_ISSUER_ORGANIZATION_ID", "").strip()
+TOKEN_ISSUER_SCOPE = os.environ.get("TOKEN_ISSUER_SCOPE", "").strip()
+TOKEN_ISSUER_AUTH_MODE = os.environ.get("TOKEN_ISSUER_AUTH_MODE", "auto").strip().lower()
+ONBOARDING_SERVICE_TOKEN_URL = TOKEN_ISSUER_TOKEN_URL
+ONBOARDING_SERVICE_CLIENT_ID = TOKEN_ISSUER_CLIENT_ID
+ONBOARDING_SERVICE_CLIENT_SECRET = TOKEN_ISSUER_CLIENT_SECRET
+ONBOARDING_SERVICE_AUDIENCE = TOKEN_ISSUER_AUDIENCE
 ONBOARDING_SCOPE_MEMBERS_READ = "onboarding:members:read"
 ONBOARDING_SCOPE_ACCESS_READ = "onboarding:access:read"
 ONBOARDING_SCOPE_BOOTSTRAP_READ = "onboarding:bootstrap:read"
@@ -219,6 +241,14 @@ ONBOARDING_SCOPE_BUSINESS_UNITS_READ = "onboarding:business-units:read"
 ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE = "onboarding:business-units:write"
 ONBOARDING_SCOPE_PROJECTS_READ = "onboarding:projects:read"
 ONBOARDING_SCOPE_PROJECTS_WRITE = "onboarding:projects:write"
+ONBOARDING_SCOPE_APPLICATIONS_READ = "onboarding:applications:read"
+ONBOARDING_SCOPE_APPLICATIONS_WRITE = "onboarding:applications:write"
+ONBOARDING_SCOPE_CONSUMERS_READ = "onboarding:consumers:read"
+ONBOARDING_SCOPE_CONSUMERS_WRITE = "onboarding:consumers:write"
+ONBOARDING_SCOPE_DEVELOPERS_READ = "onboarding:developers:read"
+ONBOARDING_SCOPE_DEVELOPERS_WRITE = "onboarding:developers:write"
+ONBOARDING_SCOPE_TEAMS_READ = "onboarding:teams:read"
+ONBOARDING_SCOPE_TEAMS_WRITE = "onboarding:teams:write"
 _onboarding_service_token_cache = {}
 PROBESTACK_TOKEN_ISSUER = os.environ.get("PROBESTACK_TOKEN_ISSUER", "https://auth.probestack.io")
 _PROBESTACK_TOKEN_AUDIENCE_RAW = os.environ.get("PROBESTACK_TOKEN_AUDIENCE", '["probestack-api", "probestack-ui"]')
@@ -6651,45 +6681,122 @@ def get_forward_auth_headers(request: Request) -> dict:
             headers["Authorization"] = authorization
     return headers
 
+def configured_onboarding_service_scope(scopes: Optional[List[str]]) -> Optional[str]:
+    if TOKEN_ISSUER_SCOPE:
+        return " ".join([scope for scope in TOKEN_ISSUER_SCOPE.split() if scope])
+    if not scopes:
+        return None
+    unique_scopes = []
+    for scope in scopes:
+        if scope and scope not in unique_scopes:
+            unique_scopes.append(scope)
+    return " ".join(unique_scopes) or None
+
+def extract_onboarding_service_token(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        payload.get("access_token"),
+        payload.get("token"),
+        payload.get("service_token"),
+    ]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        candidates.extend(
+            [
+                data.get("access_token"),
+                data.get("token"),
+                data.get("service_token"),
+            ]
+        )
+    for candidate in candidates:
+        token = clean_bearer_token(candidate)
+        if token:
+            return token
+    return None
+
+def extract_onboarding_service_token_ttl(payload: Any) -> int:
+    if not isinstance(payload, dict):
+        return 300
+    data = payload.get("data")
+    ttl_candidates = [
+        payload.get("expires_in"),
+        payload.get("ttl"),
+        data.get("expires_in") if isinstance(data, dict) else None,
+        data.get("ttl") if isinstance(data, dict) else None,
+    ]
+    for ttl in ttl_candidates:
+        try:
+            if ttl:
+                return int(ttl)
+        except (TypeError, ValueError):
+            continue
+    return 300
+
 async def get_onboarding_service_token(
     organization_id: Optional[str],
     scopes: Optional[List[str]],
     *,
     force_refresh: bool = False,
 ) -> Optional[str]:
-    if not organization_id or not scopes or not ONBOARDING_SERVICE_CLIENT_SECRET:
+    target_organization_id = (organization_id or TOKEN_ISSUER_ORGANIZATION_ID or "").strip()
+    scope_value = configured_onboarding_service_scope(scopes)
+    if not target_organization_id or not scope_value or not TOKEN_ISSUER_CLIENT_SECRET:
         return None
 
-    scope_value = " ".join(sorted(set([scope for scope in scopes if scope])))
-    if not scope_value:
-        return None
-
-    cache_key = (organization_id, scope_value)
+    cache_key = (target_organization_id, scope_value)
     now = int(datetime.now(timezone.utc).timestamp())
     cached = _onboarding_service_token_cache.get(cache_key)
     if cached and not force_refresh and cached.get("expires_at", 0) > now + 30:
         return cached.get("token")
 
     basic_value = base64.b64encode(
-        f"{ONBOARDING_SERVICE_CLIENT_ID}:{ONBOARDING_SERVICE_CLIENT_SECRET}".encode("utf-8")
+        f"{TOKEN_ISSUER_CLIENT_ID}:{TOKEN_ISSUER_CLIENT_SECRET}".encode("utf-8")
     ).decode("ascii")
+    json_payload = {
+        "client_id": TOKEN_ISSUER_CLIENT_ID,
+        "client_secret": TOKEN_ISSUER_CLIENT_SECRET,
+        "audience": TOKEN_ISSUER_AUDIENCE,
+        "organization_id": target_organization_id,
+        "scope": scope_value,
+    }
     form_data = {
         "grant_type": "client_credentials",
-        "audience": ONBOARDING_SERVICE_AUDIENCE,
-        "organization_id": organization_id,
+        "audience": TOKEN_ISSUER_AUDIENCE,
+        "organization_id": target_organization_id,
         "scope": scope_value,
     }
     try:
         async with httpx.AsyncClient(timeout=ONBOARDING_API_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                ONBOARDING_SERVICE_TOKEN_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Authorization": f"Basic {basic_value}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data=form_data,
-            )
+            if TOKEN_ISSUER_AUTH_MODE == "form":
+                response = await client.post(
+                    TOKEN_ISSUER_TOKEN_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Basic {basic_value}",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    data=form_data,
+                )
+            else:
+                response = await client.post(
+                    TOKEN_ISSUER_TOKEN_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    json=json_payload,
+                )
+                if TOKEN_ISSUER_AUTH_MODE == "auto" and response.status_code in {400, 401, 404, 405, 415, 422}:
+                    response = await client.post(
+                        TOKEN_ISSUER_TOKEN_URL,
+                        headers={
+                            "Accept": "application/json",
+                            "Authorization": f"Basic {basic_value}",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                        },
+                        data=form_data,
+                    )
     except httpx.RequestError as exc:
         logger.warning(f"Onboarding service token request failed: {exc}")
         raise HTTPException(status_code=502, detail="Onboarding auth service is unavailable")
@@ -6712,11 +6819,11 @@ async def get_onboarding_service_token(
     except ValueError:
         raise HTTPException(status_code=502, detail="Onboarding auth service returned a non-JSON response")
 
-    token = clean_bearer_token(payload.get("access_token"))
+    token = extract_onboarding_service_token(payload)
     if not token:
-        raise HTTPException(status_code=502, detail="Onboarding auth service did not return an access token")
+        raise HTTPException(status_code=502, detail="Onboarding auth service did not return a service token")
 
-    expires_in = int(payload.get("expires_in") or 300)
+    expires_in = extract_onboarding_service_token_ttl(payload)
     _onboarding_service_token_cache[cache_key] = {
         "token": token,
         "expires_at": now + max(60, expires_in - 60),
