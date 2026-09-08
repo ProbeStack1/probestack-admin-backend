@@ -202,7 +202,7 @@ ONBOARDING_API_BASE_URL = os.environ.get(
     "https://probestack.io/onboarding-api/api/v1/onboarding",
 ).rstrip("/")
 ONBOARDING_API_TIMEOUT_SECONDS = float(os.environ.get("ONBOARDING_API_TIMEOUT_SECONDS", "8"))
-ONBOARDING_API_LOCAL_FALLBACK = os.environ.get("ONBOARDING_API_LOCAL_FALLBACK", "true").lower() in ["1", "true", "yes"]
+ONBOARDING_API_LOCAL_FALLBACK = os.environ.get("ONBOARDING_API_LOCAL_FALLBACK", "false").lower() in ["1", "true", "yes"]
 ONBOARDING_API_BEARER_TOKEN = os.environ.get("ONBOARDING_API_BEARER_TOKEN", "").strip()
 ONBOARDING_API_CONTEXT_HEADER = os.environ.get("ONBOARDING_API_CONTEXT_HEADER", "X-ProbeStack-Context-Token")
 ONBOARDING_API_FORWARD_AUTHORIZATION = os.environ.get("ONBOARDING_API_FORWARD_AUTHORIZATION", "true").lower() in ["1", "true", "yes"]
@@ -4863,6 +4863,7 @@ def source_access_from_user_context(user_context: dict) -> dict:
         "business_units": tag_context_business_units(user_context.get("business_units") or [], "admin_backend"),
         "projects": tag_context_projects(user_context.get("projects") or [], "admin_backend"),
         "projects_without_business_unit": tag_context_projects(user_context.get("projects_without_business_unit") or [], "admin_backend"),
+        "applications": tag_context_applications(user_context.get("applications") or [], "admin_backend"),
     }
 
 def tag_context_projects(projects: List[dict], source: str) -> List[dict]:
@@ -4877,6 +4878,20 @@ def tag_context_projects(projects: List[dict], source: str) -> List[dict]:
             "project_role": role or "member",
             "source": source,
         })
+    return tagged
+
+def tag_context_applications(applications: List[dict], source: str) -> List[dict]:
+    tagged = []
+    for application in applications or []:
+        name = application.get("name") or application.get("application_name")
+        if not name and not application.get("id"):
+            continue
+        tagged_application = dict(application)
+        tagged_application["source"] = source
+        tagged_application["name"] = name or application.get("id")
+        tagged_application["application_name"] = application.get("application_name") or name or application.get("id")
+        tagged_application["application_role"] = application.get("application_role") or application.get("role") or "member"
+        tagged.append(tagged_application)
     return tagged
 
 def tag_context_business_units(business_units: List[dict], source: str) -> List[dict]:
@@ -4960,6 +4975,29 @@ def merge_context_business_units(business_unit_groups: List[List[dict]]) -> List
             ])
     return list(merged.values())
 
+def merge_context_applications(application_groups: List[List[dict]]) -> List[dict]:
+    merged = {}
+    for applications in application_groups:
+        for application in applications or []:
+            key = context_item_key(
+                application.get("id"),
+                application.get("application_id"),
+                application.get("applicationId"),
+                application.get("application_name"),
+                application.get("name"),
+            )
+            if not key:
+                continue
+            existing = merged.setdefault(key, dict(application))
+            existing.setdefault("sources", [])
+            source = application.get("source")
+            if source and source not in existing["sources"]:
+                existing["sources"].append(source)
+            role = application.get("application_role") or application.get("role")
+            if role and existing.get("application_role", "member") == "member":
+                existing["application_role"] = role
+    return list(merged.values())
+
 def merge_source_access_contexts(admin_access: dict, onboarding_access: dict) -> dict:
     combined_roles = dedupe_role_claims((admin_access.get("roles") or []) + (onboarding_access.get("roles") or []))
     return {
@@ -4976,6 +5014,10 @@ def merge_source_access_contexts(admin_access: dict, onboarding_access: dict) ->
             admin_access.get("projects_without_business_unit") or [],
             onboarding_access.get("projects_without_business_unit") or [],
         ]),
+        "applications": merge_context_applications([
+            admin_access.get("applications") or [],
+            onboarding_access.get("applications") or [],
+        ]),
     }
 
 def apply_access_sources_to_user_context(user_context: dict, onboarding_access: Optional[dict] = None) -> dict:
@@ -4988,6 +5030,7 @@ def apply_access_sources_to_user_context(user_context: dict, onboarding_access: 
     user_context["business_units"] = combined_access["business_units"]
     user_context["projects"] = combined_access["projects"]
     user_context["projects_without_business_unit"] = combined_access["projects_without_business_unit"]
+    user_context["applications"] = combined_access["applications"]
     user_context["combined_roles"] = combined_access["roles"]
     return user_context
 
@@ -4998,6 +5041,7 @@ def empty_onboarding_access_context(available: bool = False, error: Optional[str
         "business_units": [],
         "projects": [],
         "projects_without_business_unit": [],
+        "applications": [],
     }
     if error:
         context["error"] = error
@@ -5082,13 +5126,11 @@ async def build_user_context(
         organization_id=organization_id,
     )
     subscription_context = await build_subscription_context(db, subscriptions)
-    business_unit_context = await build_business_unit_context(
-        db,
-        user=user,
-        admin=admin,
-        organization_id=organization_id,
-        role_is_org_admin=role_is_org_admin,
-    )
+    business_unit_context = {
+        "business_units": [],
+        "projects": [],
+        "projects_without_business_unit": [],
+    }
 
     now = datetime.now(timezone.utc)
     if user:
@@ -5139,6 +5181,7 @@ async def build_user_context(
         "business_units": business_unit_context["business_units"],
         "projects": business_unit_context["projects"],
         "projects_without_business_unit": business_unit_context["projects_without_business_unit"],
+        "applications": [],
         "subscriptions": subscription_context["subscriptions"],
         "plans": subscription_context["plans"],
         "tools": subscription_context["tools"],
@@ -6849,6 +6892,8 @@ async def get_onboarding_auth_headers(
     )
     if service_token:
         return {"Accept": "application/json", "Authorization": f"Bearer {service_token}"}
+    if scopes:
+        raise HTTPException(status_code=502, detail="Onboarding service token is not configured")
     return get_forward_auth_headers(request)
 
 def extract_response_detail(response: httpx.Response) -> Any:
@@ -7313,6 +7358,8 @@ def normalize_catalog_user(item: dict) -> dict:
     normalized["roles"] = roles
     normalized["assignments"] = assignments
     normalized["business_units"] = extract_items(merged, ["business_units", "businessUnits"])
+    normalized["projects"] = extract_items(merged, ["projects"])
+    normalized["applications"] = extract_items(merged, ["applications"])
     return normalized
 
 def normalize_catalog_users(payload: Any) -> List[dict]:
@@ -7477,22 +7524,78 @@ def add_onboarding_project(
             bu_entry["projects"].append(project_entry)
     return project_entry
 
+def add_onboarding_application(
+    applications_by_key: dict,
+    application: dict,
+    role: str,
+    project: Optional[dict] = None,
+    business_unit: Optional[dict] = None,
+) -> dict:
+    normalized = normalize_application_response(application)
+    if not normalized:
+        normalized = dict(application)
+    name = (
+        normalized.get("name")
+        or normalized.get("application_name")
+        or normalized.get("applicationId")
+        or normalized.get("application_id")
+        or normalized.get("id")
+    )
+    key = context_item_key(
+        normalized.get("id"),
+        normalized.get("application_id"),
+        normalized.get("applicationId"),
+        name,
+    )
+    if not key:
+        return {}
+
+    entry = applications_by_key.setdefault(key, dict(normalized))
+    entry["name"] = entry.get("name") or name
+    entry["application_name"] = entry.get("application_name") or name
+    entry["application_role"] = entry.get("application_role") or role or "member"
+    entry["source"] = "onboarding"
+    if role and entry.get("application_role") == "member":
+        entry["application_role"] = role
+    if project and not isinstance(entry.get("project"), dict):
+        entry["project"] = {
+            "id": project.get("id"),
+            "name": project.get("name") or project.get("project_name"),
+        }
+    if business_unit:
+        project_entry = entry.get("project") if isinstance(entry.get("project"), dict) else {}
+        project_entry["business_unit"] = {
+            "id": business_unit.get("id"),
+            "name": business_unit.get("name") or business_unit.get("business_unit_name") or business_unit.get("bu_name"),
+        }
+        entry["project"] = project_entry
+    return entry
+
 def build_onboarding_access_context(
     user_context: dict,
     *,
     catalog_user: Optional[dict] = None,
     business_units: Optional[List[dict]] = None,
     projects: Optional[List[dict]] = None,
+    applications: Optional[List[dict]] = None,
     assignments: Optional[List[dict]] = None,
     available: bool = False,
 ) -> dict:
     business_units = business_units or []
     projects = projects or []
+    applications = applications or []
     assignments = assignments or []
     business_units_by_id = {str(item.get("id")): item for item in business_units if item.get("id")}
     projects_by_id = {str(item.get("id")): item for item in projects if item.get("id")}
+    applications_by_id = {
+        str(value): application
+        for application in applications
+        for value in [application.get("id"), application.get("application_id"), application.get("applicationId")]
+        if value
+    }
     business_units_by_key = {}
     projects_by_key = {}
+    applications_by_key = {}
     role_names = []
 
     for role_name in product_role_names_from_catalog_user(catalog_user):
@@ -7509,6 +7612,28 @@ def build_onboarding_access_context(
             if catalog_member_matches_context_user(member, user_context):
                 add_onboarding_project(projects_by_key, business_units_by_key, project, role_from_catalog_member(member), business_unit)
 
+    for application in applications:
+        project = projects_by_id.get(str(application.get("project_id"))) if application.get("project_id") else None
+        business_unit = None
+        if project and project.get("business_unit_id"):
+            business_unit = business_units_by_id.get(str(project.get("business_unit_id")))
+        if not business_unit and application.get("business_unit_id"):
+            business_unit = business_units_by_id.get(str(application.get("business_unit_id")))
+        for member in application.get("users") or []:
+            if catalog_member_matches_context_user(member, user_context):
+                add_onboarding_application(applications_by_key, application, role_from_catalog_member(member), project, business_unit)
+
+    if catalog_user:
+        for project in catalog_user.get("projects") or []:
+            normalized_project = normalize_project_response(project)
+            business_unit = business_units_by_id.get(str(normalized_project.get("business_unit_id"))) if normalized_project.get("business_unit_id") else None
+            add_onboarding_project(projects_by_key, business_units_by_key, normalized_project, role_from_catalog_member(project), business_unit)
+        for application in catalog_user.get("applications") or []:
+            normalized_application = normalize_application_response(application)
+            project = projects_by_id.get(str(normalized_application.get("project_id"))) if normalized_application.get("project_id") else None
+            business_unit = business_units_by_id.get(str(normalized_application.get("business_unit_id"))) if normalized_application.get("business_unit_id") else None
+            add_onboarding_application(applications_by_key, normalized_application, role_from_catalog_member(application), project, business_unit)
+
     for assignment in assignments:
         if not assignment_matches_context_user(assignment, user_context):
             continue
@@ -7523,6 +7648,11 @@ def build_onboarding_access_context(
             project = projects_by_id.get(scope_id) or {"id": scope_id, "name": scope_id}
             business_unit = business_units_by_id.get(str(project.get("business_unit_id"))) if project.get("business_unit_id") else None
             add_onboarding_project(projects_by_key, business_units_by_key, project, role_code, business_unit)
+        elif "APPLICATION" in scope_type or scope_type == "APP":
+            application = applications_by_id.get(scope_id) or {"id": scope_id, "name": scope_id}
+            project = projects_by_id.get(str(application.get("project_id"))) if application.get("project_id") else None
+            business_unit = business_units_by_id.get(str(application.get("business_unit_id"))) if application.get("business_unit_id") else None
+            add_onboarding_application(applications_by_key, application, role_code, project, business_unit)
 
     role_claims = [
         role_claim
@@ -7539,6 +7669,7 @@ def build_onboarding_access_context(
             for project in projects_by_key.values()
             if not any(project in (business_unit.get("projects") or []) for business_unit in business_units_by_key.values())
         ],
+        "applications": list(applications_by_key.values()),
     }
 
 async def enrich_user_context_with_onboarding_access(request: Request, user_context: dict) -> dict:
@@ -7563,6 +7694,13 @@ async def enrich_user_context_with_onboarding_access(request: Request, user_cont
             params={"page": 0, "size": 500},
             organization_id=organization_id,
             scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+        )
+        applications_payload = await onboarding_api_get_with_local_fallback(
+            request,
+            "/applications",
+            params={"page": 0, "size": 500},
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
         )
         assignments_payload = await onboarding_api_get_with_local_fallback(
             request,
@@ -7589,8 +7727,9 @@ async def enrich_user_context_with_onboarding_access(request: Request, user_cont
         catalog_user=normalize_catalog_user(unwrap_single_payload(catalog_user_payload)) if catalog_user_payload is not None else None,
         business_units=normalize_business_units_response(business_units_payload) if business_units_payload is not None else [],
         projects=normalize_projects_response(projects_payload) if projects_payload is not None else [],
+        applications=normalize_applications_response(applications_payload) if applications_payload is not None else [],
         assignments=normalize_catalog_assignments(assignments_payload) if assignments_payload is not None else [],
-        available=any(payload is not None for payload in [business_units_payload, projects_payload, assignments_payload, catalog_user_payload]),
+        available=any(payload is not None for payload in [business_units_payload, projects_payload, applications_payload, assignments_payload, catalog_user_payload]),
     )
     return apply_access_sources_to_user_context(user_context, onboarding_access)
 
@@ -10410,8 +10549,9 @@ async def get_my_access_catalog_resources(
     """Read business units, projects, and applications with assigned users."""
     org = await get_approved_org_for_admin(payload, db)
     resource_type = resourceType.upper() if resourceType else None
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         "/admin/access-catalog/resources",
         params={
             "resourceType": resource_type,
@@ -10422,26 +10562,9 @@ async def get_my_access_catalog_resources(
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_ACCESS_READ],
     )
-    if upstream_payload is not None:
-        if resource_type:
-            return normalize_catalog_resources(upstream_payload, resource_type)
-        return upstream_payload
-
-    if resource_type == "BUSINESS_UNIT":
-        return await local_business_units_for_org(db, org.id, include_projects=True)
-    if resource_type == "PROJECT":
-        return await local_projects_for_org(db, org.id)
-    if resource_type == "APPLICATION":
-        result = await db.execute(
-            select(ApplicationModel)
-            .where(ApplicationModel.organization_id == org.id)
-            .order_by(ApplicationModel.application_name.asc())
-        )
-        return [await application_to_dict(db, application) for application in result.scalars().all()]
-    return {
-        "business_units": await local_business_units_for_org(db, org.id, include_projects=True),
-        "projects": await local_projects_for_org(db, org.id),
-    }
+    if resource_type:
+        return normalize_catalog_resources(upstream_payload, resource_type)
+    return upstream_payload
 
 @api_router.get("/my-organization/access-catalog/resources/{resource_type}/{resource_id}", tags=["Org Admin - Access Catalog"])
 async def get_my_access_catalog_resource(
@@ -10582,36 +10705,33 @@ async def get_my_business_units(
 ):
     """Get Business units for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         "/business-units",
         params={"page": 0, "size": 500},
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
     )
-    if upstream_payload is not None:
-        response = normalize_business_units_response(upstream_payload)
-        if include_projects:
-            catalog_projects = normalize_projects_response(
-                await onboarding_api_get_with_local_fallback(
-                    request,
-                    "/projects",
-                    params={"page": 0, "size": 500},
-                    organization_id=org.id,
-                    scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
-                )
+    response = normalize_business_units_response(upstream_payload)
+    if include_projects:
+        catalog_projects = normalize_projects_response(
+            await onboarding_api_request(
+                request,
+                "GET",
+                "/projects",
+                params={"page": 0, "size": 500},
+                organization_id=org.id,
+                scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
             )
-            if catalog_projects is None:
-                catalog_projects = await local_projects_for_org(db, org.id)
-            projects_by_bu = {}
-            for project in catalog_projects:
-                projects_by_bu.setdefault(project.get("business_unit_id"), []).append(project)
-            for business_unit in response:
-                business_unit["projects"] = business_unit.get("projects") or projects_by_bu.get(business_unit.get("id"), [])
-                business_unit["teams"] = business_unit["projects"]
-        return response
-
-    return await local_business_units_for_org(db, org.id, include_projects=include_projects)
+        )
+        projects_by_bu = {}
+        for project in catalog_projects:
+            projects_by_bu.setdefault(project.get("business_unit_id"), []).append(project)
+        for business_unit in response:
+            business_unit["projects"] = business_unit.get("projects") or projects_by_bu.get(business_unit.get("id"), [])
+            business_unit["teams"] = business_unit["projects"]
+    return response
 
 @api_router.post("/my-organization/business-units", tags=["Org Admin - Business Units"])
 async def create_my_business_unit(
@@ -10641,49 +10761,30 @@ async def get_my_business_unit(
 ):
     """Get Business unit details and its projects for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         f"/business-units/{business_unit_id}",
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
     )
-    catalog_business_unit = normalize_business_unit_response(upstream_payload) if upstream_payload is not None else None
-    if catalog_business_unit is not None:
-        catalog_projects = normalize_projects_response(
-            await onboarding_api_get_with_local_fallback(
-                request,
-                "/projects",
-                params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
-                organization_id=org.id,
-                scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
-            )
-        )
-        if catalog_projects is not None:
-            catalog_business_unit["projects"] = [
-                project for project in catalog_projects
-                if project.get("business_unit_id") == catalog_business_unit.get("id")
-            ]
-            catalog_business_unit["teams"] = catalog_business_unit["projects"]
-        return catalog_business_unit
-
-    result = await db.execute(
-        select(BusinessUnitModel).where(
-            BusinessUnitModel.id == business_unit_id,
-            BusinessUnitModel.organization_id == org.id
+    catalog_business_unit = normalize_business_unit_response(upstream_payload)
+    catalog_projects = normalize_projects_response(
+        await onboarding_api_request(
+            request,
+            "GET",
+            "/projects",
+            params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
+            organization_id=org.id,
+            scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
         )
     )
-    business_unit = result.scalar_one_or_none()
-    if not business_unit:
-        raise HTTPException(status_code=404, detail="Business unit not found")
-
-    projects_result = await db.execute(
-        select(ProjectModel)
-        .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
-        .order_by(ProjectModel.name.asc())
-    )
-    response = await business_unit_to_dict(db, business_unit)
-    response["projects"] = [await project_to_dict(db, project) for project in projects_result.scalars().all()]
-    return response
+    catalog_business_unit["projects"] = [
+        project for project in catalog_projects
+        if project.get("business_unit_id") == catalog_business_unit.get("id")
+    ]
+    catalog_business_unit["teams"] = catalog_business_unit["projects"]
+    return catalog_business_unit
 
 @api_router.put("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
 @api_router.patch("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
@@ -10733,31 +10834,15 @@ async def get_my_business_unit_projects(
 ):
     """Get projects for one Business unit in the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         "/projects",
         params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
     )
-    if upstream_payload is not None:
-        return normalize_projects_response(upstream_payload)
-
-    bu_result = await db.execute(
-        select(BusinessUnitModel).where(
-            BusinessUnitModel.id == business_unit_id,
-            BusinessUnitModel.organization_id == org.id
-        )
-    )
-    if not bu_result.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Business unit not found")
-
-    result = await db.execute(
-        select(ProjectModel)
-        .where(ProjectModel.organization_id == org.id, ProjectModel.business_unit_id == business_unit_id)
-        .order_by(ProjectModel.name.asc())
-    )
-    return [await project_to_dict(db, project) for project in result.scalars().all()]
+    return normalize_projects_response(upstream_payload)
 
 @api_router.get("/my-organization/projects", tags=["Org Admin - Projects"])
 async def get_my_projects(
@@ -10768,20 +10853,18 @@ async def get_my_projects(
 ):
     """Get projects for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         "/projects",
         params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
     )
-    if upstream_payload is not None:
-        catalog_projects = normalize_projects_response(upstream_payload)
-        if business_unit_id:
-            return [project for project in catalog_projects if project.get("business_unit_id") == business_unit_id]
-        return catalog_projects
-
-    return await local_projects_for_org(db, org.id, business_unit_id)
+    catalog_projects = normalize_projects_response(upstream_payload)
+    if business_unit_id:
+        return [project for project in catalog_projects if project.get("business_unit_id") == business_unit_id]
+    return catalog_projects
 
 @api_router.post("/my-organization/projects", tags=["Org Admin - Projects"])
 async def create_my_project(
@@ -10811,52 +10894,27 @@ async def get_my_project(
 ):
     """Get project details for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         f"/projects/{project_id}",
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
     )
-    catalog_project = normalize_project_response(upstream_payload) if upstream_payload is not None else None
-    if catalog_project is not None:
-        business_unit_id = catalog_project.get("business_unit_id")
-        catalog_project["business_unit"] = None
-        if business_unit_id:
-            catalog_business_unit = normalize_business_unit_response(
-                await onboarding_api_get_with_local_fallback(
-                    request,
-                    f"/business-units/{business_unit_id}",
-                    organization_id=org.id,
-                    scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
-                )
-            )
-            catalog_project["business_unit"] = catalog_business_unit
-        return catalog_project
-
-    result = await db.execute(
-        select(ProjectModel).where(
-            ProjectModel.id == project_id,
-            ProjectModel.organization_id == org.id
-        )
-    )
-    project = result.scalar_one_or_none()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    response = await project_to_dict(db, project)
-    if project.business_unit_id:
-        bu_result = await db.execute(
-            select(BusinessUnitModel).where(
-                BusinessUnitModel.id == project.business_unit_id,
-                BusinessUnitModel.organization_id == org.id
+    catalog_project = normalize_project_response(upstream_payload)
+    business_unit_id = catalog_project.get("business_unit_id")
+    catalog_project["business_unit"] = None
+    if business_unit_id:
+        catalog_project["business_unit"] = normalize_business_unit_response(
+            await onboarding_api_request(
+                request,
+                "GET",
+                f"/business-units/{business_unit_id}",
+                organization_id=org.id,
+                scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
             )
         )
-        business_unit = bu_result.scalar_one_or_none()
-        response["business_unit"] = await business_unit_to_dict(db, business_unit) if business_unit else None
-    else:
-        response["business_unit"] = None
-
-    return response
+    return catalog_project
 
 @api_router.put("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
 @api_router.patch("/my-organization/projects/{project_id}", tags=["Org Admin - Projects"])
@@ -10907,8 +10965,9 @@ async def get_my_applications(
 ):
     """Get applications for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         "/applications",
         params={
             "businessUnitId": business_unit_id,
@@ -10919,25 +10978,18 @@ async def get_my_applications(
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
     )
-    if upstream_payload is not None:
-        applications = normalize_applications_response(upstream_payload)
-        if business_unit_id:
-            applications = [
-                application for application in applications
-                if application.get("business_unit_id") == business_unit_id
-            ]
-        if project_id:
-            applications = [
-                application for application in applications
-                if application.get("project_id") == project_id
-            ]
-        return applications
-
-    query = select(ApplicationModel).where(ApplicationModel.organization_id == org.id)
+    applications = normalize_applications_response(upstream_payload)
+    if business_unit_id:
+        applications = [
+            application for application in applications
+            if application.get("business_unit_id") == business_unit_id
+        ]
     if project_id:
-        query = query.where(ApplicationModel.project_id == project_id)
-    result = await db.execute(query.order_by(ApplicationModel.application_name.asc()))
-    return [await application_to_dict(db, application) for application in result.scalars().all()]
+        applications = [
+            application for application in applications
+            if application.get("project_id") == project_id
+        ]
+    return applications
 
 @api_router.post("/my-organization/applications", tags=["Org Admin - Applications"])
 async def create_my_application(
@@ -10967,17 +11019,14 @@ async def get_my_application(
 ):
     """Get one application for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_get_with_local_fallback(
+    upstream_payload = await onboarding_api_request(
         request,
+        "GET",
         f"/applications/{application_id}",
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
     )
-    if upstream_payload is not None:
-        return normalize_application_response(upstream_payload)
-
-    application = await get_application_for_org(db, application_id, org.id)
-    return await application_to_dict(db, application)
+    return normalize_application_response(upstream_payload)
 
 @api_router.put("/my-organization/applications/{application_id}", tags=["Org Admin - Applications"])
 @api_router.patch("/my-organization/applications/{application_id}", tags=["Org Admin - Applications"])
