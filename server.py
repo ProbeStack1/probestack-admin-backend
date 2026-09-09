@@ -308,6 +308,7 @@ ZITADEL_PASSWORD_RESET_URL_TEMPLATE = os.environ.get(
 DEFAULT_CORS_ORIGINS = [
     "https://probestack.io",
     "https://www.probestack.io",
+    "https://forgesphere.probestack.io",
     "https://community.probestack.io",
     "http://community.probestack.io",
 ]
