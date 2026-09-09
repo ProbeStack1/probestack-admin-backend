@@ -6893,8 +6893,6 @@ async def get_onboarding_auth_headers(
     )
     if service_token:
         return {"Accept": "application/json", "Authorization": f"Bearer {service_token}"}
-    if scopes:
-        raise HTTPException(status_code=502, detail="Onboarding service token is not configured")
     return get_forward_auth_headers(request)
 
 def extract_response_detail(response: httpx.Response) -> Any:
@@ -6922,31 +6920,46 @@ async def onboarding_api_request(
     target_url = f"{ONBOARDING_API_BASE_URL}{path}"
     try:
         async with httpx.AsyncClient(timeout=ONBOARDING_API_TIMEOUT_SECONDS) as client:
+            auth_headers = await get_onboarding_auth_headers(
+                request,
+                organization_id=organization_id,
+                scopes=scopes,
+                force_refresh=force_token_refresh,
+            )
             response = await client.request(
                 method,
                 target_url,
-                headers=await get_onboarding_auth_headers(
-                    request,
-                    organization_id=organization_id,
-                    scopes=scopes,
-                    force_refresh=force_token_refresh,
-                ),
+                headers=auth_headers,
                 params={key: value for key, value in (params or {}).items() if value is not None},
                 json=json_payload,
             )
             if response.status_code == 401 and organization_id and scopes and not force_token_refresh:
+                refreshed_headers = await get_onboarding_auth_headers(
+                    request,
+                    organization_id=organization_id,
+                    scopes=scopes,
+                    force_refresh=True,
+                )
                 response = await client.request(
                     method,
                     target_url,
-                    headers=await get_onboarding_auth_headers(
-                        request,
-                        organization_id=organization_id,
-                        scopes=scopes,
-                        force_refresh=True,
-                    ),
+                    headers=refreshed_headers,
                     params={key: value for key, value in (params or {}).items() if value is not None},
                     json=json_payload,
                 )
+                forwarded_headers = get_forward_auth_headers(request)
+                if (
+                    response.status_code == 401
+                    and forwarded_headers.get("Authorization")
+                    and forwarded_headers.get("Authorization") != refreshed_headers.get("Authorization")
+                ):
+                    response = await client.request(
+                        method,
+                        target_url,
+                        headers=forwarded_headers,
+                        params={key: value for key, value in (params or {}).items() if value is not None},
+                        json=json_payload,
+                    )
     except httpx.RequestError as exc:
         logger.warning(f"Onboarding API request failed for {method} {path}: {exc}")
         raise HTTPException(status_code=502, detail="Onboarding API is unavailable")
