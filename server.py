@@ -7434,27 +7434,6 @@ def normalize_catalog_assignments(payload: Any) -> List[dict]:
         items = [unwrap_single_payload(payload)]
     return [assignment for assignment in [normalize_catalog_assignment(item) for item in items] if assignment.get("id")]
 
-def user_from_resource_member(member: dict, project: dict, business_unit: Optional[dict]) -> dict:
-    user = normalize_catalog_user(member)
-    assignment_role = first_present(
-        member,
-        ["project_role", "projectRole", "role", "roleCode", "role_code", "roleName", "role_name"],
-    )
-    return {
-        "id": f"{project.get('id')}:{user.get('id') or user.get('email')}",
-        "email": user.get("email"),
-        "name": user.get("name"),
-        "project_id": project.get("id"),
-        "project_role": str(assignment_role or user.get("role_name") or "member").lower(),
-        "status": user.get("status") or "active",
-        "project": project,
-        "business_unit": business_unit,
-        "business_unit_name": business_unit.get("name") if business_unit else None,
-        "application_name": business_unit.get("application_name") if business_unit else None,
-        "application_id": business_unit.get("application_id") if business_unit else None,
-        "user": user,
-    }
-
 def catalog_member_matches_context_user(member: dict, user_context: dict) -> bool:
     user = user_context.get("user") or {}
     normalized_member = normalize_catalog_user(member)
@@ -7825,23 +7804,6 @@ async def get_one_catalog_resource_for_request(
         return None
     resources = normalize_catalog_resources(payload, resource_type)
     return resources[0] if resources else None
-
-async def get_onboarding_project_for_request(
-    request: Request,
-    project_id: str,
-    *,
-    organization_id: str,
-) -> Optional[dict]:
-    upstream_payload = await onboarding_api_get_with_local_fallback(
-        request,
-        f"/projects/{project_id}",
-        organization_id=organization_id,
-        scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
-    )
-    if upstream_payload is None:
-        return None
-    project = normalize_project_response(upstream_payload)
-    return project if project.get("id") else None
 
 async def get_catalog_resources_for_dashboard(
     request: Request,
@@ -11407,49 +11369,11 @@ async def revoke_my_access_team_from_application(
 @api_router.get("/my-organization/projects/{project_id}/team", tags=["Org Admin - Project Members"])
 async def get_my_project_team(
     project_id: str,
-    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get invited and active project members for a project in the current organization."""
     org = await get_approved_org_for_admin(payload, db)
-    catalog_project = await get_one_catalog_resource_for_request(
-        request,
-        "PROJECT",
-        project_id,
-        organization_id=org.id,
-    )
-    if catalog_project is not None:
-        business_unit = None
-        if catalog_project.get("business_unit_id"):
-            business_unit = await get_one_catalog_resource_for_request(
-                request,
-                "BUSINESS_UNIT",
-                catalog_project["business_unit_id"],
-                organization_id=org.id,
-            )
-        return [
-            user_from_resource_member(member, catalog_project, business_unit)
-            for member in catalog_project.get("users", [])
-        ]
-    onboarding_project = await get_onboarding_project_for_request(
-        request,
-        project_id,
-        organization_id=org.id,
-    )
-    if onboarding_project is not None:
-        business_unit = None
-        if onboarding_project.get("business_unit_id"):
-            business_unit = await get_one_catalog_resource_for_request(
-                request,
-                "BUSINESS_UNIT",
-                onboarding_project["business_unit_id"],
-                organization_id=org.id,
-            )
-        return [
-            user_from_resource_member(member, onboarding_project, business_unit)
-            for member in onboarding_project.get("users", [])
-        ]
     await get_project_for_org(db, project_id, org.id)
 
     result = await db.execute(
@@ -11464,37 +11388,11 @@ async def get_my_project_team(
 
 @api_router.get("/my-organization/project-team-members", tags=["Org Admin - Project Members"])
 async def get_my_project_team_members(
-    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get project members across all projects and Business units."""
     org = await get_approved_org_for_admin(payload, db)
-    catalog_projects = await get_catalog_resources_for_request(
-        request,
-        "PROJECT",
-        organization_id=org.id,
-        size=500,
-    )
-    if catalog_projects is not None:
-        catalog_business_units = await get_catalog_resources_for_request(
-            request,
-            "BUSINESS_UNIT",
-            organization_id=org.id,
-            size=500,
-        ) or []
-        business_units_by_id = {
-            business_unit.get("id"): business_unit
-            for business_unit in catalog_business_units
-            if business_unit.get("id")
-        }
-        response = []
-        for project in catalog_projects:
-            business_unit = business_units_by_id.get(project.get("business_unit_id"))
-            for member in project.get("users", []):
-                response.append(user_from_resource_member(member, project, business_unit))
-        return response
-
     result = await db.execute(
         select(ProjectTeamMemberModel, ProjectModel, BusinessUnitModel)
         .join(ProjectModel, ProjectTeamMemberModel.project_id == ProjectModel.id)
@@ -11522,18 +11420,12 @@ async def get_my_project_team_members(
 async def invite_my_project_team(
     project_id: str,
     data: ProjectTeamInviteCreate,
-    request: Request,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Invite one or more organization-domain users to a project."""
     org = await get_approved_org_for_admin(payload, db)
-    project = None
-    try:
-        project = await get_project_for_org(db, project_id, org.id)
-    except HTTPException as exc:
-        if exc.status_code != 404:
-            raise
+    project = await get_project_for_org(db, project_id, org.id)
     project_role = (data.project_role or "member").strip().lower()
     if project_role not in ["manager", "member", "viewer"]:
         raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
@@ -11550,40 +11442,6 @@ async def invite_my_project_team(
 
     if not emails:
         raise HTTPException(status_code=400, detail="At least one email address is required")
-
-    if project is None:
-        onboarding_project = await get_onboarding_project_for_request(
-            request,
-            project_id,
-            organization_id=org.id,
-        )
-        if onboarding_project is None:
-            raise HTTPException(status_code=404, detail="Project not found")
-
-        invited = []
-        for email in emails:
-            upstream_payload = await onboarding_api_request(
-                request,
-                "POST",
-                "/role-assignments",
-                json_payload=onboarding_role_assignment_payload({
-                    "principalEmail": email,
-                    "roleKind": "ACCESS",
-                    "roleCode": project_role,
-                    "scopeType": "PROJECT",
-                    "scopeId": project_id,
-                    "active": True,
-                }),
-                organization_id=org.id,
-                scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_WRITE],
-            )
-            invited.append(normalize_catalog_assignment(upstream_payload))
-
-        return {
-            "message": "Project invitations sent",
-            "invited": invited,
-            "skipped": [],
-        }
 
     invited = []
     skipped = []
