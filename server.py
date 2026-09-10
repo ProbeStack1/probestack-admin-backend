@@ -2424,10 +2424,6 @@ class ProjectUpdate(BaseModel):
     description: Optional[str] = None
     status: Optional[str] = None
 
-class ProjectTeamInviteCreate(BaseModel):
-    emails: List[str]
-    project_role: Optional[str] = "member"
-
 class ExternalProjectCreate(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -8957,61 +8953,6 @@ def build_probestack_email_logo_html(
           </table>
     """
 
-def send_project_invite_email(
-    *,
-    to_email: str,
-    invitee_name: str,
-    organization_name: str,
-    project_name: str,
-    project_role: str,
-    setup_url: Optional[str],
-    invited_by_email: Optional[str]
-) -> dict:
-    action_url = setup_url or build_login_url()
-    action_label = "Set up your account" if setup_url else "Open ProbeStack"
-    subject = f"You're invited to {project_name} on ProbeStack"
-    safe_invitee_name = escape(invitee_name)
-    safe_organization_name = escape(organization_name)
-    safe_project_name = escape(project_name)
-    safe_project_role = escape(project_role)
-    safe_invited_by = escape(invited_by_email or "your organization admin")
-    safe_action_url = escape(action_url, quote=True)
-    safe_action_label = escape(action_label)
-    text_body = "\n".join([
-        f"Hi {invitee_name},",
-        "",
-        f"You have been invited to the {project_name} project in {organization_name} as {project_role}.",
-        f"Invited by: {invited_by_email or 'your organization admin'}",
-        "",
-        f"{action_label}: {action_url}",
-        "",
-        "If you were not expecting this invitation, you can ignore this email.",
-        "",
-        "ProbeStack"
-    ])
-    html_body = f"""
-    <div style="margin:0;background:#f6f8fb;padding:28px 0;font-family:Arial,Helvetica,sans-serif;color:#172033;">
-      <div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e6ebf2;border-radius:14px;overflow:hidden;">
-        <div style="background:#0f172a;padding:24px 30px 20px;color:#ffffff;">
-          {build_probestack_email_logo_html("Project Invitation", accent_color="#cbd5e1")}
-          <h1 style="margin:0;font-size:24px;line-height:1.3;font-weight:700;">You have been invited to a project</h1>
-          <p style="margin:10px 0 0;color:#cbd5e1;font-size:15px;">{safe_project_name} in {safe_organization_name}</p>
-        </div>
-        <div style="padding:28px 30px;">
-          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Hi {safe_invitee_name},</p>
-          <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">You have been invited to the <strong>{safe_project_name}</strong> project in <strong>{safe_organization_name}</strong> as <strong>{safe_project_role}</strong>.</p>
-          <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#475569;">Invited by: {safe_invited_by}</p>
-          <a href="{safe_action_url}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-weight:700;padding:12px 18px;border-radius:8px;font-size:14px;">{safe_action_label}</a>
-          <p style="margin:22px 0 0;font-size:13px;line-height:1.6;color:#64748b;">If you were not expecting this invitation, you can ignore this email.</p>
-        </div>
-      </div>
-    </div>
-    """
-    result = send_email(to_email, subject, text_body, html_body)
-    if setup_url:
-        result["setup_url"] = setup_url
-    return result
-
 def send_new_organization_request_email(
     *,
     request_id: str,
@@ -11415,114 +11356,6 @@ async def get_my_project_team_members(
         response.append(member_data)
 
     return response
-
-@api_router.post("/my-organization/projects/{project_id}/team/invite", tags=["Org Admin - Project Members"])
-async def invite_my_project_team(
-    project_id: str,
-    data: ProjectTeamInviteCreate,
-    payload: dict = Depends(require_any_admin),
-    db: AsyncSession = Depends(get_db)
-):
-    """Invite one or more organization-domain users to a project."""
-    org = await get_approved_org_for_admin(payload, db)
-    project = await get_project_for_org(db, project_id, org.id)
-    project_role = (data.project_role or "member").strip().lower()
-    if project_role not in ["manager", "member", "viewer"]:
-        raise HTTPException(status_code=400, detail="Project role must be manager, member, or viewer")
-
-    emails = []
-    seen = set()
-    for raw_email in data.emails or []:
-        email = normalize_email(raw_email)
-        if not email or email in seen:
-            continue
-        await assert_email_allowed_for_org(db, email, org)
-        seen.add(email)
-        emails.append(email)
-
-    if not emails:
-        raise HTTPException(status_code=400, detail="At least one email address is required")
-
-    invited = []
-    skipped = []
-    for email in emails:
-        user_result = await db.execute(
-            select(UserModel).where(
-                UserModel.email == email,
-                UserModel.organization_id == org.id,
-            )
-        )
-        user = user_result.scalar_one_or_none()
-        if not user:
-            raise HTTPException(status_code=400, detail=f"User {email} is not present in this organization")
-        if user.status != "active":
-            raise HTTPException(status_code=400, detail=f"User {email} is not active")
-
-        existing_member_result = await db.execute(
-            select(ProjectTeamMemberModel).where(
-                ProjectTeamMemberModel.project_id == project.id,
-                ProjectTeamMemberModel.email == email
-            )
-        )
-        existing_member = existing_member_result.scalar_one_or_none()
-        if existing_member:
-            if existing_member.status == "removed":
-                existing_member.status = "invited"
-                existing_member.project_role = project_role
-                existing_member.invited_by = payload.get("sub")
-                existing_member.invited_at = datetime.now(timezone.utc)
-                existing_member.updated_at = datetime.now(timezone.utc)
-                invited.append(existing_member)
-            else:
-                skipped.append({"email": email, "reason": "Already invited to this project"})
-            continue
-
-        accepted_at = datetime.now(timezone.utc)
-
-        member = ProjectTeamMemberModel(
-            organization_id=org.id,
-            project_id=project.id,
-            user_id=user.id,
-            email=email,
-            name=user.name,
-            project_role=project_role,
-            status="active",
-            invited_by=payload.get("sub"),
-            accepted_at=accepted_at
-        )
-        db.add(member)
-        await db.flush()
-        invited.append(member)
-
-    await db.commit()
-
-    email_results = []
-    for member in invited:
-        member_user = None
-        if member.user_id:
-            member_user_result = await db.execute(select(UserModel).where(UserModel.id == member.user_id))
-            member_user = member_user_result.scalar_one_or_none()
-        setup_url = build_setup_account_url(member.email, member_user.first_login_token) if member_user else None
-        email_result = send_project_invite_email(
-            to_email=member.email,
-            invitee_name=member.name or derive_name_from_email(member.email),
-            organization_name=org.name,
-            project_name=project.name,
-            project_role=member.project_role,
-            setup_url=setup_url,
-            invited_by_email=payload.get("email")
-        )
-        email_results.append({
-            "email": member.email,
-            **email_result
-        })
-
-    return {
-        "message": f"Invited {len(invited)} project member(s) to {project.name}",
-        "invited": [await project_team_member_to_dict(db, member) for member in invited],
-        "skipped": skipped,
-        "emails": email_results
-    }
 
 @api_router.get("/my-organization/billing", tags=["Org Admin"])
 async def get_my_organization_billing(payload: dict = Depends(require_any_admin), db: AsyncSession = Depends(get_db)):
