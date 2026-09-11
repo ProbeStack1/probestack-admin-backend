@@ -7182,6 +7182,8 @@ def normalize_application_response(item: Any) -> dict:
     business_unit_id = first_present(normalized, ["businessUnitId", "business_unit_id"])
     name = first_present(normalized, ["name", "applicationName", "application_name", "displayName", "display_name"])
     display_name = first_present(normalized, ["displayName", "display_name", "name", "applicationName", "application_name"])
+    owner_name = first_present(normalized, ["ownerName", "owner_name"])
+    owner_email = first_present(normalized, ["ownerEmail", "owner_email"])
     normalized["application_id"] = application_id
     normalized["applicationId"] = application_id
     normalized["application_name"] = name
@@ -7192,6 +7194,10 @@ def normalize_application_response(item: Any) -> dict:
     normalized["projectId"] = project_id
     normalized["business_unit_id"] = business_unit_id
     normalized["businessUnitId"] = business_unit_id
+    normalized["owner_name"] = owner_name
+    normalized["ownerName"] = owner_name
+    normalized["owner_email"] = owner_email
+    normalized["ownerEmail"] = owner_email
     return normalized
 
 def normalize_applications_response(payload: Any) -> List[dict]:
@@ -7306,6 +7312,18 @@ def onboarding_access_team_payload(data: dict) -> dict:
         if value is not None
     }
 
+def require_onboarding_payload_fields(data: dict, required_fields: List[str]) -> None:
+    missing_fields = [
+        field
+        for field in required_fields
+        if data.get(field) is None or (isinstance(data.get(field), str) and not data[field].strip())
+    ]
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Required onboarding fields missing: {', '.join(missing_fields)}",
+        )
+
 def onboarding_role_assignment_payload(data: dict) -> dict:
     return {
         key: value
@@ -7323,6 +7341,19 @@ def onboarding_role_assignment_payload(data: dict) -> dict:
         }.items()
         if value is not None
     }
+
+def onboarding_role_assignment_update_payload(data: dict) -> dict:
+    payload = {}
+    for output_key, input_keys in {
+        "active": ["active"],
+        "validFrom": ["validFrom", "valid_from"],
+        "validTo": ["validTo", "valid_to"],
+    }.items():
+        for input_key in input_keys:
+            if input_key in data:
+                payload[output_key] = data[input_key]
+                break
+    return payload
 
 def normalize_catalog_resources(payload: Any, expected_type: str) -> List[dict]:
     items = extract_items(payload, ["resources", "data", "content", "items", "results"])
@@ -10174,6 +10205,22 @@ async def update_my_organization(
     """Update onboarding fields for the current organization."""
     org = await get_approved_org_for_admin(payload, db)
     raw_update_data = payload_dict(data, exclude_unset=True)
+    immutable_fields = {
+        "id",
+        "organization_id",
+        "organization_code",
+        "name",
+        "legal_name",
+        "status",
+        "created_by",
+        "created_at",
+    }
+    attempted_immutable_fields = sorted(immutable_fields.intersection(raw_update_data))
+    if attempted_immutable_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Organization fields cannot be changed: {', '.join(attempted_immutable_fields)}",
+        )
     update_data = {k: v for k, v in raw_update_data.items() if v is not None}
     if "supported_domains" in update_data and isinstance(update_data["supported_domains"], list):
         update_data["supported_domains"] = json.dumps(update_data["supported_domains"])
@@ -10182,10 +10229,6 @@ async def update_my_organization(
     if "main_app_domain" in raw_update_data:
         update_data["main_app_domain"] = normalize_custom_domain(raw_update_data.get("main_app_domain"))
         await assert_custom_domain_available(db, update_data["main_app_domain"], organization_id=org.id)
-    if "name" in update_data:
-        update_data["name"] = update_data["name"].strip()
-        if not update_data["name"]:
-            raise HTTPException(status_code=400, detail="Organization name is required")
     if "domain" in update_data:
         update_data["domain"] = update_data["domain"].strip() if update_data["domain"] else None
         if update_data["domain"] and not org.supported_domains:
@@ -10547,11 +10590,16 @@ async def create_my_role_assignment(
 ):
     """Create a direct product role assignment through onboarding."""
     org = await get_approved_org_for_admin(payload, db)
+    assignment_payload = onboarding_role_assignment_payload(data)
+    require_onboarding_payload_fields(
+        assignment_payload,
+        ["principalId", "principalEmail", "principalName", "roleCode", "scopeType", "scopeId"],
+    )
     upstream_payload = await onboarding_api_request(
         request,
         "POST",
         "/role-assignments",
-        json_payload=onboarding_role_assignment_payload(data),
+        json_payload=assignment_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_WRITE],
     )
@@ -10585,11 +10633,17 @@ async def update_my_role_assignment(
 ):
     """Update a direct product role assignment through onboarding."""
     org = await get_approved_org_for_admin(payload, db)
+    assignment_update_payload = onboarding_role_assignment_update_payload(data)
+    if not assignment_update_payload:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of active, validFrom, or validTo is required",
+        )
     upstream_payload = await onboarding_api_request(
         request,
         "PATCH",
         f"/role-assignments/{role_assignment_id}",
-        json_payload=onboarding_role_assignment_payload(data),
+        json_payload=assignment_update_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_ASSIGNMENTS_WRITE],
     )
@@ -10617,6 +10671,8 @@ async def revoke_my_role_assignment(
 async def get_my_business_units(
     request: Request,
     include_projects: bool = False,
+    page: int = 0,
+    size: int = 500,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -10626,7 +10682,7 @@ async def get_my_business_units(
         request,
         "GET",
         "/business-units",
-        params={"page": 0, "size": 500},
+        params={"page": page, "size": size},
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
     )
@@ -10659,15 +10715,42 @@ async def create_my_business_unit(
 ):
     """Onboard a Business unit for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    requested_status = str(first_present(data, ["status"]) or "ACTIVE").strip().upper()
+    if requested_status not in {"ACTIVE", "INACTIVE", "ARCHIVED"}:
+        raise HTTPException(status_code=400, detail="Invalid business unit status")
+
+    # The Postman contract creates business units as ACTIVE. Apply any requested
+    # non-active state through the documented PATCH operation after creation.
+    create_payload = onboarding_business_unit_payload(data)
+    if not create_payload.get("displayName"):
+        create_payload["displayName"] = create_payload.get("name")
+    create_payload["status"] = "ACTIVE"
+    require_onboarding_payload_fields(create_payload, ["name", "code", "displayName"])
     upstream_payload = await onboarding_api_request(
         request,
         "POST",
         "/business-units",
-        json_payload=onboarding_business_unit_payload(data),
+        json_payload=create_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE],
     )
-    return normalize_business_unit_response(upstream_payload)
+    business_unit = normalize_business_unit_response(upstream_payload)
+    if requested_status != "ACTIVE":
+        business_unit_id = business_unit.get("id")
+        if not business_unit_id:
+            raise HTTPException(status_code=502, detail="Onboarding API did not return the created business unit ID")
+        updated_payload = await onboarding_api_request(
+            request,
+            "PATCH",
+            f"/business-units/{business_unit_id}",
+            json_payload={"status": requested_status},
+            organization_id=org.id,
+            scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE],
+        )
+        updated_business_unit = normalize_business_unit_response(updated_payload)
+        if updated_business_unit:
+            business_unit = updated_business_unit
+    return business_unit
 
 @api_router.get("/my-organization/business-units/{business_unit_id}", tags=["Org Admin - Business Units"])
 async def get_my_business_unit(
@@ -10765,6 +10848,8 @@ async def get_my_business_unit_projects(
 async def get_my_projects(
     request: Request,
     business_unit_id: Optional[str] = None,
+    page: int = 0,
+    size: int = 500,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -10774,7 +10859,7 @@ async def get_my_projects(
         request,
         "GET",
         "/projects",
-        params={"businessUnitId": business_unit_id, "page": 0, "size": 500},
+        params={"businessUnitId": business_unit_id, "page": page, "size": size},
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
     )
@@ -10792,11 +10877,14 @@ async def create_my_project(
 ):
     """Onboard a project for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    create_payload = onboarding_project_payload(data)
+    create_payload["status"] = str(create_payload.get("status") or "READY").strip().upper()
+    require_onboarding_payload_fields(create_payload, ["businessUnitId", "name", "code"])
     upstream_payload = await onboarding_api_request(
         request,
         "POST",
         "/projects",
-        json_payload=onboarding_project_payload(data),
+        json_payload=create_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_PROJECTS_WRITE],
     )
@@ -10877,6 +10965,8 @@ async def get_my_applications(
     request: Request,
     business_unit_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    page: int = 0,
+    size: int = 500,
     payload: dict = Depends(require_any_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -10889,8 +10979,8 @@ async def get_my_applications(
         params={
             "businessUnitId": business_unit_id,
             "projectId": project_id,
-            "page": 0,
-            "size": 500,
+            "page": page,
+            "size": size,
         },
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
@@ -10917,11 +11007,33 @@ async def create_my_application(
 ):
     """Onboard an application under a project."""
     org = await get_approved_org_for_admin(payload, db)
+    create_payload = onboarding_application_payload(data)
+    project_id = create_payload.get("projectId")
+    require_onboarding_payload_fields(create_payload, ["projectId", "name"])
+    if not create_payload.get("businessUnitId"):
+        project_payload = await onboarding_api_request(
+            request,
+            "GET",
+            f"/projects/{project_id}",
+            organization_id=org.id,
+            scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+        )
+        project = normalize_project_response(project_payload)
+        create_payload["businessUnitId"] = project.get("business_unit_id")
+    if not create_payload.get("applicationId"):
+        create_payload["applicationId"] = f"admin-app-{uuid.uuid4().hex}"
+    if not create_payload.get("displayName"):
+        create_payload["displayName"] = create_payload.get("name")
+    create_payload["status"] = str(create_payload.get("status") or "DRAFT").strip().upper()
+    require_onboarding_payload_fields(
+        create_payload,
+        ["businessUnitId", "projectId", "name", "applicationId", "displayName"],
+    )
     upstream_payload = await onboarding_api_request(
         request,
         "POST",
         "/applications",
-        json_payload=onboarding_application_payload(data),
+        json_payload=create_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_APPLICATIONS_WRITE],
     )
@@ -11013,11 +11125,14 @@ async def create_my_consumer(
 ):
     """Create an onboarding API consumer for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    create_payload = onboarding_consumer_payload(data)
+    create_payload["status"] = str(create_payload.get("status") or "ACTIVE").strip().upper()
+    require_onboarding_payload_fields(create_payload, ["name"])
     upstream_payload = await onboarding_api_request(
         request,
         "POST",
         "/consumers",
-        json_payload=onboarding_consumer_payload(data),
+        json_payload=create_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_CONSUMERS_WRITE],
     )
@@ -11109,11 +11224,16 @@ async def create_my_developer(
 ):
     """Create an onboarding developer record for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    create_payload = onboarding_developer_payload(data)
+    create_payload["accountStatus"] = str(
+        create_payload.get("accountStatus") or "ACTIVE"
+    ).strip().upper()
+    require_onboarding_payload_fields(create_payload, ["email", "username", "role"])
     upstream_payload = await onboarding_api_request(
         request,
         "POST",
         "/developers",
-        json_payload=onboarding_developer_payload(data),
+        json_payload=create_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_DEVELOPERS_WRITE],
     )
@@ -11202,11 +11322,13 @@ async def create_my_access_team(
 ):
     """Create an onboarding access team for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
+    create_payload = onboarding_access_team_payload(data)
+    require_onboarding_payload_fields(create_payload, ["name"])
     upstream_payload = await onboarding_api_request(
         request,
         "POST",
         "/access/teams",
-        json_payload=onboarding_access_team_payload(data),
+        json_payload=create_payload,
         organization_id=org.id,
         scopes=[ONBOARDING_SCOPE_TEAMS_WRITE],
     )
