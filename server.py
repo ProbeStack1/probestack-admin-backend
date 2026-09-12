@@ -7090,6 +7090,26 @@ def extract_items(payload: Any, keys: Optional[List[str]] = None) -> List[dict]:
                 return nested_items
     return []
 
+def extract_named_items(payload: Any, keys: List[str]) -> List[dict]:
+    """Extract only explicitly named arrays without falling back to unrelated lists."""
+    if not isinstance(payload, dict):
+        return []
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested_items = extract_named_items(value, keys)
+            if nested_items:
+                return nested_items
+    for container_key in ["data", "content", "result"]:
+        container = payload.get(container_key)
+        if isinstance(container, dict):
+            nested_items = extract_named_items(container, keys)
+            if nested_items:
+                return nested_items
+    return []
+
 def normalize_catalog_resource(item: dict, expected_type: str) -> dict:
     resource = item.get("resource") if isinstance(item.get("resource"), dict) else item
     merged = {**resource}
@@ -7555,8 +7575,8 @@ def normalize_catalog_user(item: dict) -> dict:
     user_id = first_present(merged, ["id", "userId", "user_id", "principalId", "principal_id", "email", "principalEmail", "principal_email", "user_email"])
     email = first_present(merged, ["email", "principalEmail", "principal_email", "userEmail", "user_email"])
     name = first_present(merged, ["name", "principalName", "principal_name", "userName", "user_name", "displayName", "display_name"])
-    roles = extract_items(merged, ["roles", "assignedRoles", "assigned_roles"])
-    assignments = extract_items(merged, ["assignments", "roleAssignments", "role_assignments"])
+    roles = extract_named_items(merged, ["roles", "assignedRoles", "assigned_roles"])
+    assignments = extract_named_items(merged, ["assignments", "roleAssignments", "role_assignments"])
     role_names = [
         first_present(role, ["name", "roleName", "role_name", "roleCode", "role_code", "code"])
         for role in roles
@@ -7579,9 +7599,9 @@ def normalize_catalog_user(item: dict) -> dict:
     normalized["role_names"] = role_names or ([str(org_role)] if org_role else [])
     normalized["roles"] = roles
     normalized["assignments"] = assignments
-    normalized["business_units"] = extract_items(merged, ["business_units", "businessUnits"])
-    normalized["projects"] = extract_items(merged, ["projects"])
-    normalized["applications"] = extract_items(merged, ["applications"])
+    normalized["business_units"] = extract_named_items(merged, ["business_units", "businessUnits"])
+    normalized["projects"] = extract_named_items(merged, ["projects"])
+    normalized["applications"] = extract_named_items(merged, ["applications"])
     return normalized
 
 def normalize_catalog_users(payload: Any) -> List[dict]:
@@ -7634,6 +7654,7 @@ def normalize_catalog_assignment(item: dict) -> dict:
     normalized["role_code"] = first_present(assignment, ["roleCode", "role_code", "code", "roleName", "role_name"])
     normalized["scope_type"] = first_present(assignment, ["scopeType", "scope_type", "resourceType", "resource_type"])
     normalized["scope_id"] = first_present(assignment, ["scopeId", "scope_id", "resourceId", "resource_id"])
+    normalized["scope_name"] = first_present(assignment, ["scopeName", "scope_name", "resourceName", "resource_name"])
     return normalized
 
 def normalize_catalog_assignments(payload: Any) -> List[dict]:
@@ -7691,8 +7712,12 @@ def add_onboarding_role(role_names: List[str], role_name: Optional[str]) -> None
 
 def add_onboarding_business_unit(business_units_by_key: dict, business_unit: dict, role: str) -> dict:
     name = business_unit.get("name") or business_unit.get("business_unit_name") or business_unit.get("id")
+    business_unit_id = business_unit.get("id") or business_unit.get("business_unit_id")
     key = context_item_key(business_unit.get("id"), name)
     entry = business_units_by_key.setdefault(key, {
+        "id": business_unit_id,
+        "business_unit_id": business_unit_id,
+        "name": name,
         "bu_name": name,
         "bu_role": role or "member",
         "source": "onboarding",
@@ -7710,9 +7735,14 @@ def add_onboarding_project(
     business_unit: Optional[dict] = None,
 ) -> dict:
     name = project.get("name") or project.get("project_name") or project.get("id")
+    project_id = project.get("id") or project.get("project_id")
     key = context_item_key(project.get("id"), name)
     project_entry = projects_by_key.setdefault(key, {
+        "id": project_id,
+        "project_id": project_id,
+        "name": name,
         "project_name": name,
+        "business_unit_id": project.get("business_unit_id"),
         "project_role": role or "member",
         "source": "onboarding",
     })
@@ -7786,8 +7816,18 @@ def build_onboarding_access_context(
     projects = projects or []
     applications = applications or []
     assignments = assignments or []
-    business_units_by_id = {str(item.get("id")): item for item in business_units if item.get("id")}
-    projects_by_id = {str(item.get("id")): item for item in projects if item.get("id")}
+    business_units_by_id = {
+        str(value): business_unit
+        for business_unit in business_units
+        for value in [business_unit.get("id"), business_unit.get("business_unit_id"), business_unit.get("businessUnitId")]
+        if value
+    }
+    projects_by_id = {
+        str(value): project
+        for project in projects
+        for value in [project.get("id"), project.get("project_id"), project.get("projectId")]
+        if value
+    }
     applications_by_id = {
         str(value): application
         for application in applications
@@ -7825,34 +7865,92 @@ def build_onboarding_access_context(
                 add_onboarding_application(applications_by_key, application, role_from_catalog_member(member), project, business_unit)
 
     if catalog_user:
+        for business_unit in catalog_user.get("business_units") or []:
+            scope_type = str(first_present(business_unit, ["scopeType", "scope_type"]) or "").upper()
+            if scope_type and "BUSINESS" not in scope_type and scope_type != "BU":
+                continue
+            normalized_business_unit = normalize_business_unit_response(business_unit)
+            add_onboarding_business_unit(
+                business_units_by_key,
+                normalized_business_unit,
+                role_from_catalog_member(business_unit),
+            )
         for project in catalog_user.get("projects") or []:
+            scope_type = str(first_present(project, ["scopeType", "scope_type"]) or "").upper()
+            if scope_type and "PROJECT" not in scope_type and "TEAM" not in scope_type:
+                continue
             normalized_project = normalize_project_response(project)
             business_unit = business_units_by_id.get(str(normalized_project.get("business_unit_id"))) if normalized_project.get("business_unit_id") else None
             add_onboarding_project(projects_by_key, business_units_by_key, normalized_project, role_from_catalog_member(project), business_unit)
         for application in catalog_user.get("applications") or []:
+            scope_type = str(first_present(application, ["scopeType", "scope_type"]) or "").upper()
+            if scope_type and "APPLICATION" not in scope_type and scope_type != "APP":
+                continue
             normalized_application = normalize_application_response(application)
             project = projects_by_id.get(str(normalized_application.get("project_id"))) if normalized_application.get("project_id") else None
             business_unit = business_units_by_id.get(str(normalized_application.get("business_unit_id"))) if normalized_application.get("business_unit_id") else None
             add_onboarding_application(applications_by_key, normalized_application, role_from_catalog_member(application), project, business_unit)
 
-    for assignment in assignments:
-        if not assignment_matches_context_user(assignment, user_context):
+    catalog_assignments = [
+        normalize_catalog_assignment(assignment)
+        for assignment in ((catalog_user or {}).get("assignments") or [])
+    ]
+    assignment_entries = [
+        (assignment, True) for assignment in catalog_assignments if assignment
+    ] + [
+        (assignment, False) for assignment in assignments if assignment
+    ]
+    scope_priority = {"APPLICATION": 0, "APP": 0, "PROJECT": 1, "TEAM": 1, "BUSINESS_UNIT": 2, "BU": 2, "ORGANIZATION": 3}
+    assignment_entries.sort(
+        key=lambda item: scope_priority.get(str(item[0].get("scope_type") or "").upper(), 4)
+    )
+
+    for assignment, belongs_to_catalog_user in assignment_entries:
+        if not belongs_to_catalog_user and not assignment_matches_context_user(assignment, user_context):
             continue
         role_code = str(assignment.get("role_code") or "member")
         add_onboarding_role(role_names, role_code)
         scope_type = str(assignment.get("scope_type") or "").upper()
         scope_id = str(assignment.get("scope_id") or "")
+        scope_name = str(assignment.get("scope_name") or scope_id)
+        if scope_type == "ORGANIZATION" or scope_type == "ORG":
+            for business_unit in business_units:
+                add_onboarding_business_unit(business_units_by_key, business_unit, role_code)
+            for project in projects:
+                business_unit = business_units_by_id.get(str(project.get("business_unit_id"))) if project.get("business_unit_id") else None
+                add_onboarding_project(projects_by_key, business_units_by_key, project, role_code, business_unit)
+            for application in applications:
+                project = projects_by_id.get(str(application.get("project_id"))) if application.get("project_id") else None
+                business_unit = business_units_by_id.get(str(application.get("business_unit_id"))) if application.get("business_unit_id") else None
+                if not business_unit and project and project.get("business_unit_id"):
+                    business_unit = business_units_by_id.get(str(project.get("business_unit_id")))
+                add_onboarding_application(applications_by_key, application, role_code, project, business_unit)
         if "BUSINESS" in scope_type or scope_type == "BU":
-            business_unit = business_units_by_id.get(scope_id) or {"id": scope_id, "name": scope_id}
+            business_unit = business_units_by_id.get(scope_id) or {"id": scope_id, "name": scope_name}
             add_onboarding_business_unit(business_units_by_key, business_unit, role_code)
+            scoped_projects = [
+                project for project in projects
+                if str(project.get("business_unit_id") or "") == scope_id
+            ]
+            for project in scoped_projects:
+                add_onboarding_project(projects_by_key, business_units_by_key, project, role_code, business_unit)
+                project_id = str(project.get("id") or project.get("project_id") or "")
+                for application in applications:
+                    if str(application.get("project_id") or "") == project_id:
+                        add_onboarding_application(applications_by_key, application, role_code, project, business_unit)
         elif "PROJECT" in scope_type or "TEAM" in scope_type:
-            project = projects_by_id.get(scope_id) or {"id": scope_id, "name": scope_id}
+            project = projects_by_id.get(scope_id) or {"id": scope_id, "name": scope_name}
             business_unit = business_units_by_id.get(str(project.get("business_unit_id"))) if project.get("business_unit_id") else None
             add_onboarding_project(projects_by_key, business_units_by_key, project, role_code, business_unit)
+            for application in applications:
+                if str(application.get("project_id") or "") == scope_id:
+                    add_onboarding_application(applications_by_key, application, role_code, project, business_unit)
         elif "APPLICATION" in scope_type or scope_type == "APP":
-            application = applications_by_id.get(scope_id) or {"id": scope_id, "name": scope_id}
+            application = applications_by_id.get(scope_id) or {"id": scope_id, "name": scope_name}
             project = projects_by_id.get(str(application.get("project_id"))) if application.get("project_id") else None
             business_unit = business_units_by_id.get(str(application.get("business_unit_id"))) if application.get("business_unit_id") else None
+            if not business_unit and project and project.get("business_unit_id"):
+                business_unit = business_units_by_id.get(str(project.get("business_unit_id")))
             add_onboarding_application(applications_by_key, application, role_code, project, business_unit)
 
     role_claims = [
