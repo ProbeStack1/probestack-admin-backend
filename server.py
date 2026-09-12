@@ -7880,7 +7880,8 @@ async def enrich_user_context_with_onboarding_access(request: Request, user_cont
         return apply_access_sources_to_user_context(user_context, empty_onboarding_access_context())
 
     user = user_context.get("user") or {}
-    principal_id = user.get("id") or user.get("email")
+    principal_email = str(user.get("email") or "").strip().lower()
+    principal_id = principal_email or user.get("id")
     try:
         business_units_payload = await onboarding_api_get_with_local_fallback(
             request,
@@ -7917,12 +7918,20 @@ async def enrich_user_context_with_onboarding_access(request: Request, user_cont
         )
         catalog_user_payload = None
         if principal_id:
-            catalog_user_payload = await onboarding_api_get_with_local_fallback(
-                request,
-                f"/admin/access-catalog/users/{principal_id}",
-                organization_id=organization_id,
-                scopes=[ONBOARDING_SCOPE_ACCESS_READ],
-            )
+            try:
+                catalog_user_payload = await onboarding_api_get_with_local_fallback(
+                    request,
+                    f"/admin/access-catalog/users/{quote(str(principal_id), safe='')}",
+                    organization_id=organization_id,
+                    scopes=[ONBOARDING_SCOPE_ACCESS_READ],
+                )
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                logger.info(
+                    f"No onboarding access-catalog record for {principal_id}; "
+                    "using resource and assignment data"
+                )
     except HTTPException as exc:
         if exc.status_code in {401, 403, 404, 502, 503, 504}:
             logger.info(f"Using admin-backend-only context because onboarding access is unavailable: {exc.detail}")
