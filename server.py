@@ -222,6 +222,14 @@ TOKEN_ISSUER_AUDIENCE = os.environ.get(
     "TOKEN_ISSUER_AUDIENCE",
     os.environ.get("ONBOARDING_SERVICE_AUDIENCE", "probestack-api"),
 )
+TOKEN_ISSUER_ISSUER = os.environ.get(
+    "TOKEN_ISSUER_ISSUER",
+    "https://probestack.io/token-issuer-api",
+).rstrip("/")
+TOKEN_ISSUER_JWKS_URL = os.environ.get(
+    "TOKEN_ISSUER_JWKS_URL",
+    f"{TOKEN_ISSUER_TOKEN_URL}/jwks",
+).strip()
 TOKEN_ISSUER_ORGANIZATION_ID = os.environ.get("TOKEN_ISSUER_ORGANIZATION_ID", "").strip()
 TOKEN_ISSUER_AUTH_MODE = os.environ.get("TOKEN_ISSUER_AUTH_MODE", "form").strip().lower()
 ONBOARDING_SERVICE_TOKEN_URL = TOKEN_ISSUER_TOKEN_URL
@@ -6304,6 +6312,54 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+def service_token_scopes(payload: dict) -> set[str]:
+    raw_scopes = (
+        payload.get("scope")
+        or payload.get("scopes")
+        or payload.get("scp")
+        or payload.get("permissions")
+        or []
+    )
+    if isinstance(raw_scopes, str):
+        return {scope for scope in raw_scopes.split() if scope}
+    if isinstance(raw_scopes, (list, tuple, set)):
+        return {str(scope).strip() for scope in raw_scopes if str(scope).strip()}
+    return set()
+
+def service_token_organization_id(payload: dict) -> Optional[str]:
+    organization_id = (
+        payload.get("organization_id")
+        or payload.get("organizationId")
+        or payload.get("org_id")
+        or payload.get("orgId")
+    )
+    return str(organization_id).strip() if organization_id else None
+
+def verify_token_issuer_service_token(credentials: HTTPAuthorizationCredentials) -> dict:
+    token = credentials.credentials
+    try:
+        jwks_client = _jwks_clients.get(TOKEN_ISSUER_JWKS_URL)
+        if jwks_client is None:
+            jwks_client = jwt.PyJWKClient(TOKEN_ISSUER_JWKS_URL)
+            _jwks_clients[TOKEN_ISSUER_JWKS_URL] = jwks_client
+        signing_key = jwks_client.get_signing_key_from_jwt(token).key
+        return jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=TOKEN_ISSUER_AUDIENCE,
+            issuer=TOKEN_ISSUER_ISSUER,
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Service token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid service token")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(f"Unable to validate token-issuer service token: {exc}")
+        raise HTTPException(status_code=401, detail="Unable to validate service token")
+
 def optional_verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security)):
     if not credentials:
         return None
@@ -6438,6 +6494,29 @@ def require_any_admin(payload: dict = Depends(verify_token)):
     if payload.get("role") != "super_admin" and not payload_has_org_admin_role(payload):
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload
+
+def require_admin_or_onboarding_members_service(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    token = credentials.credentials
+    try:
+        unverified_payload = jwt.decode(token, options={"verify_signature": False})
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    token_issuer = str(unverified_payload.get("iss") or "").rstrip("/")
+    if token_issuer == TOKEN_ISSUER_ISSUER:
+        payload = verify_token_issuer_service_token(credentials)
+        if ONBOARDING_SCOPE_MEMBERS_READ not in service_token_scopes(payload):
+            raise HTTPException(status_code=403, detail="Service token is missing onboarding:members:read")
+        result = dict(payload)
+        result["_service_token_authenticated"] = True
+        return result
+
+    payload = require_any_admin(verify_token(credentials))
+    result = dict(payload)
+    result["_service_token_authenticated"] = False
+    return result
 
 async def get_subscription_access_scope(db: AsyncSession, payload: dict) -> dict:
     """Resolve what subscriptions this token is allowed to read."""
@@ -7326,6 +7405,137 @@ def onboarding_role_assignment_update_payload(data: dict) -> dict:
                 break
     return payload
 
+def paginate_onboarding_items(items: List[dict], page: int, size: int) -> List[dict]:
+    safe_page = max(0, page)
+    safe_size = max(1, size)
+    start = safe_page * safe_size
+    return items[start:start + safe_size]
+
+async def list_onboarding_projects_from_contract(
+    request: Request,
+    organization_id: str,
+    *,
+    business_unit_id: Optional[str] = None,
+    page: int = 0,
+    size: int = 500,
+    business_units: Optional[List[dict]] = None,
+) -> List[dict]:
+    if business_unit_id:
+        payload = await onboarding_api_request(
+            request,
+            "GET",
+            "/projects",
+            params={"businessUnitId": business_unit_id, "page": page, "size": size},
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+        )
+        return normalize_projects_response(payload)
+
+    if business_units is None:
+        business_units_payload = await onboarding_api_request(
+            request,
+            "GET",
+            "/business-units",
+            params={"page": 0, "size": 500},
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
+        )
+        business_units = normalize_business_units_response(business_units_payload)
+
+    projects_by_id = {}
+    for business_unit in business_units:
+        resolved_business_unit_id = business_unit.get("id") or business_unit.get("business_unit_id")
+        if not resolved_business_unit_id:
+            continue
+        projects_payload = await onboarding_api_request(
+            request,
+            "GET",
+            "/projects",
+            params={"businessUnitId": resolved_business_unit_id, "page": 0, "size": 500},
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+        )
+        for project in normalize_projects_response(projects_payload):
+            project_key = project.get("id") or project.get("project_id")
+            if project_key:
+                projects_by_id[str(project_key)] = project
+    return paginate_onboarding_items(list(projects_by_id.values()), page, size)
+
+async def list_onboarding_applications_from_contract(
+    request: Request,
+    organization_id: str,
+    *,
+    business_unit_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    page: int = 0,
+    size: int = 500,
+    business_units: Optional[List[dict]] = None,
+    projects: Optional[List[dict]] = None,
+) -> List[dict]:
+    if project_id:
+        resolved_business_unit_id = business_unit_id
+        if not resolved_business_unit_id:
+            project_payload = await onboarding_api_request(
+                request,
+                "GET",
+                f"/projects/{project_id}",
+                organization_id=organization_id,
+                scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+            )
+            project = normalize_project_response(project_payload)
+            resolved_business_unit_id = project.get("business_unit_id")
+        if not resolved_business_unit_id:
+            raise HTTPException(status_code=502, detail="Onboarding project did not include its business unit ID")
+        payload = await onboarding_api_request(
+            request,
+            "GET",
+            "/applications",
+            params={
+                "businessUnitId": resolved_business_unit_id,
+                "projectId": project_id,
+                "page": page,
+                "size": size,
+            },
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
+        )
+        return normalize_applications_response(payload)
+
+    if projects is None:
+        projects = await list_onboarding_projects_from_contract(
+            request,
+            organization_id,
+            business_unit_id=business_unit_id,
+            page=0,
+            size=500,
+            business_units=business_units,
+        )
+
+    applications_by_id = {}
+    for project in projects:
+        resolved_project_id = project.get("id") or project.get("project_id")
+        resolved_business_unit_id = project.get("business_unit_id") or business_unit_id
+        if not resolved_project_id or not resolved_business_unit_id:
+            continue
+        applications_payload = await onboarding_api_request(
+            request,
+            "GET",
+            "/applications",
+            params={
+                "businessUnitId": resolved_business_unit_id,
+                "projectId": resolved_project_id,
+                "page": 0,
+                "size": 500,
+            },
+            organization_id=organization_id,
+            scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
+        )
+        for application in normalize_applications_response(applications_payload):
+            application_key = application.get("id") or application.get("application_id")
+            if application_key:
+                applications_by_id[str(application_key)] = application
+    return paginate_onboarding_items(list(applications_by_id.values()), page, size)
+
 def normalize_catalog_resources(payload: Any, expected_type: str) -> List[dict]:
     items = extract_items(payload, ["resources", "data", "content", "items", "results"])
     if not items and isinstance(unwrap_single_payload(payload), dict):
@@ -7679,19 +7889,25 @@ async def enrich_user_context_with_onboarding_access(request: Request, user_cont
             organization_id=organization_id,
             scopes=[ONBOARDING_SCOPE_BUSINESS_UNITS_READ],
         )
-        projects_payload = await onboarding_api_get_with_local_fallback(
-            request,
-            "/projects",
-            params={"page": 0, "size": 500},
-            organization_id=organization_id,
-            scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+        business_units = (
+            normalize_business_units_response(business_units_payload)
+            if business_units_payload is not None
+            else []
         )
-        applications_payload = await onboarding_api_get_with_local_fallback(
+        projects_payload = await list_onboarding_projects_from_contract(
             request,
-            "/applications",
-            params={"page": 0, "size": 500},
-            organization_id=organization_id,
-            scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
+            organization_id,
+            page=0,
+            size=500,
+            business_units=business_units,
+        )
+        applications_payload = await list_onboarding_applications_from_contract(
+            request,
+            organization_id,
+            page=0,
+            size=500,
+            business_units=business_units,
+            projects=projects_payload,
         )
         assignments_payload = await onboarding_api_get_with_local_fallback(
             request,
@@ -7716,7 +7932,7 @@ async def enrich_user_context_with_onboarding_access(request: Request, user_cont
     onboarding_access = build_onboarding_access_context(
         user_context,
         catalog_user=normalize_catalog_user(unwrap_single_payload(catalog_user_payload)) if catalog_user_payload is not None else None,
-        business_units=normalize_business_units_response(business_units_payload) if business_units_payload is not None else [],
+        business_units=business_units,
         projects=normalize_projects_response(projects_payload) if projects_payload is not None else [],
         applications=normalize_applications_response(applications_payload) if applications_payload is not None else [],
         assignments=normalize_catalog_assignments(assignments_payload) if assignments_payload is not None else [],
@@ -10659,15 +10875,12 @@ async def get_my_business_units(
     )
     response = normalize_business_units_response(upstream_payload)
     if include_projects:
-        catalog_projects = normalize_projects_response(
-            await onboarding_api_request(
-                request,
-                "GET",
-                "/projects",
-                params={"page": 0, "size": 500},
-                organization_id=org.id,
-                scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
-            )
+        catalog_projects = await list_onboarding_projects_from_contract(
+            request,
+            org.id,
+            page=0,
+            size=500,
+            business_units=response,
         )
         projects_by_bu = {}
         for project in catalog_projects:
@@ -10826,15 +11039,13 @@ async def get_my_projects(
 ):
     """Get projects for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_request(
+    catalog_projects = await list_onboarding_projects_from_contract(
         request,
-        "GET",
-        "/projects",
-        params={"businessUnitId": business_unit_id, "page": page, "size": size},
-        organization_id=org.id,
-        scopes=[ONBOARDING_SCOPE_PROJECTS_READ],
+        org.id,
+        business_unit_id=business_unit_id,
+        page=page,
+        size=size,
     )
-    catalog_projects = normalize_projects_response(upstream_payload)
     if business_unit_id:
         return [project for project in catalog_projects if project.get("business_unit_id") == business_unit_id]
     return catalog_projects
@@ -10943,20 +11154,14 @@ async def get_my_applications(
 ):
     """Get applications for the current approved organization."""
     org = await get_approved_org_for_admin(payload, db)
-    upstream_payload = await onboarding_api_request(
+    applications = await list_onboarding_applications_from_contract(
         request,
-        "GET",
-        "/applications",
-        params={
-            "businessUnitId": business_unit_id,
-            "projectId": project_id,
-            "page": page,
-            "size": size,
-        },
-        organization_id=org.id,
-        scopes=[ONBOARDING_SCOPE_APPLICATIONS_READ],
+        org.id,
+        business_unit_id=business_unit_id,
+        project_id=project_id,
+        page=page,
+        size=size,
     )
-    applications = normalize_applications_response(upstream_payload)
     if business_unit_id:
         applications = [
             application for application in applications
@@ -12835,11 +13040,14 @@ async def get_organization_teams(
 async def get_organization_users_with_roles(
     org_id: str,
     status: Optional[str] = None,
-    payload: dict = Depends(require_any_admin),
+    payload: dict = Depends(require_admin_or_onboarding_members_service),
     db: AsyncSession = Depends(get_db)
 ):
     """Get organization users with compact org, Business unit, and team role details."""
-    if payload_has_org_admin_role(payload) and payload.get("organization_id") != org_id:
+    if payload.get("_service_token_authenticated"):
+        if service_token_organization_id(payload) != org_id:
+            raise HTTPException(status_code=403, detail="Service token organization does not match requested organization")
+    elif payload_has_org_admin_role(payload) and payload.get("organization_id") != org_id:
         raise HTTPException(status_code=403, detail="Organization admin access required for this organization")
 
     org_result = await db.execute(select(OrganizationModel).where(OrganizationModel.id == org_id))
