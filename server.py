@@ -6768,8 +6768,10 @@ async def get_onboarding_service_token(
 ) -> Optional[str]:
     target_organization_id = (organization_id or TOKEN_ISSUER_ORGANIZATION_ID or "").strip()
     scope_value = configured_onboarding_service_scope(scopes)
-    if not target_organization_id or not scope_value or not TOKEN_ISSUER_CLIENT_SECRET:
-        return None
+    if not target_organization_id:
+        raise HTTPException(status_code=502, detail="Onboarding service token organization ID is missing")
+    if not scope_value:
+        raise HTTPException(status_code=502, detail="Onboarding service token scopes are missing")
 
     cache_key = (target_organization_id, scope_value)
     now = int(datetime.now(timezone.utc).timestamp())
@@ -6777,16 +6779,24 @@ async def get_onboarding_service_token(
     if cached and not force_refresh and cached.get("expires_at", 0) > now + 30:
         return cached.get("token")
 
-    basic_value = base64.b64encode(
-        f"{TOKEN_ISSUER_CLIENT_ID}:{TOKEN_ISSUER_CLIENT_SECRET}".encode("utf-8")
-    ).decode("ascii")
+    token_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if TOKEN_ISSUER_CLIENT_SECRET:
+        basic_value = base64.b64encode(
+            f"{TOKEN_ISSUER_CLIENT_ID}:{TOKEN_ISSUER_CLIENT_SECRET}".encode("utf-8")
+        ).decode("ascii")
+        token_headers["Authorization"] = f"Basic {basic_value}"
+
     json_payload = {
-        "client_id": TOKEN_ISSUER_CLIENT_ID,
-        "client_secret": TOKEN_ISSUER_CLIENT_SECRET,
         "audience": TOKEN_ISSUER_AUDIENCE,
         "organization_id": target_organization_id,
         "scope": scope_value,
     }
+    if TOKEN_ISSUER_CLIENT_SECRET:
+        json_payload["client_id"] = TOKEN_ISSUER_CLIENT_ID
+        json_payload["client_secret"] = TOKEN_ISSUER_CLIENT_SECRET
     form_data = {
         "grant_type": "client_credentials",
         "audience": TOKEN_ISSUER_AUDIENCE,
@@ -6798,11 +6808,7 @@ async def get_onboarding_service_token(
             if TOKEN_ISSUER_AUTH_MODE == "form":
                 response = await client.post(
                     TOKEN_ISSUER_TOKEN_URL,
-                    headers={
-                        "Accept": "application/json",
-                        "Authorization": f"Basic {basic_value}",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
+                    headers=token_headers,
                     data=form_data,
                 )
             else:
@@ -6817,11 +6823,7 @@ async def get_onboarding_service_token(
                 if TOKEN_ISSUER_AUTH_MODE == "auto" and response.status_code in {400, 401, 404, 405, 415, 422}:
                     response = await client.post(
                         TOKEN_ISSUER_TOKEN_URL,
-                        headers={
-                            "Accept": "application/json",
-                            "Authorization": f"Basic {basic_value}",
-                            "Content-Type": "application/x-www-form-urlencoded",
-                        },
+                        headers=token_headers,
                         data=form_data,
                     )
     except httpx.RequestError as exc:
@@ -6834,7 +6836,7 @@ async def get_onboarding_service_token(
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "message": "Onboarding API authorization failed",
+                    "message": "Onboarding service token request was rejected",
                     "upstream_status": response.status_code,
                     "upstream_detail": detail,
                 },
