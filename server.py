@@ -203,9 +203,6 @@ ONBOARDING_API_BASE_URL = os.environ.get(
 ).rstrip("/")
 ONBOARDING_API_TIMEOUT_SECONDS = float(os.environ.get("ONBOARDING_API_TIMEOUT_SECONDS", "8"))
 ONBOARDING_API_LOCAL_FALLBACK = os.environ.get("ONBOARDING_API_LOCAL_FALLBACK", "false").lower() in ["1", "true", "yes"]
-ONBOARDING_API_BEARER_TOKEN = os.environ.get("ONBOARDING_API_BEARER_TOKEN", "").strip()
-ONBOARDING_API_CONTEXT_HEADER = os.environ.get("ONBOARDING_API_CONTEXT_HEADER", "X-ProbeStack-Context-Token")
-ONBOARDING_API_FORWARD_AUTHORIZATION = os.environ.get("ONBOARDING_API_FORWARD_AUTHORIZATION", "true").lower() in ["1", "true", "yes"]
 TOKEN_ISSUER_TOKEN_URL = os.environ.get(
     "TOKEN_ISSUER_TOKEN_URL",
     os.environ.get(
@@ -226,7 +223,6 @@ TOKEN_ISSUER_AUDIENCE = os.environ.get(
     os.environ.get("ONBOARDING_SERVICE_AUDIENCE", "probestack-api"),
 )
 TOKEN_ISSUER_ORGANIZATION_ID = os.environ.get("TOKEN_ISSUER_ORGANIZATION_ID", "").strip()
-TOKEN_ISSUER_SCOPE = os.environ.get("TOKEN_ISSUER_SCOPE", "").strip()
 TOKEN_ISSUER_AUTH_MODE = os.environ.get("TOKEN_ISSUER_AUTH_MODE", "form").strip().lower()
 ONBOARDING_SERVICE_TOKEN_URL = TOKEN_ISSUER_TOKEN_URL
 ONBOARDING_SERVICE_CLIENT_ID = TOKEN_ISSUER_CLIENT_ID
@@ -249,6 +245,29 @@ ONBOARDING_SCOPE_DEVELOPERS_READ = "onboarding:developers:read"
 ONBOARDING_SCOPE_DEVELOPERS_WRITE = "onboarding:developers:write"
 ONBOARDING_SCOPE_TEAMS_READ = "onboarding:teams:read"
 ONBOARDING_SCOPE_TEAMS_WRITE = "onboarding:teams:write"
+ONBOARDING_SERVICE_SCOPES = [
+    ONBOARDING_SCOPE_MEMBERS_READ,
+    ONBOARDING_SCOPE_ACCESS_READ,
+    ONBOARDING_SCOPE_BOOTSTRAP_READ,
+    ONBOARDING_SCOPE_ASSIGNMENTS_READ,
+    ONBOARDING_SCOPE_ASSIGNMENTS_WRITE,
+    ONBOARDING_SCOPE_BUSINESS_UNITS_READ,
+    ONBOARDING_SCOPE_BUSINESS_UNITS_WRITE,
+    ONBOARDING_SCOPE_PROJECTS_READ,
+    ONBOARDING_SCOPE_PROJECTS_WRITE,
+    ONBOARDING_SCOPE_APPLICATIONS_READ,
+    ONBOARDING_SCOPE_APPLICATIONS_WRITE,
+    ONBOARDING_SCOPE_CONSUMERS_READ,
+    ONBOARDING_SCOPE_CONSUMERS_WRITE,
+    ONBOARDING_SCOPE_DEVELOPERS_READ,
+    ONBOARDING_SCOPE_DEVELOPERS_WRITE,
+    ONBOARDING_SCOPE_TEAMS_READ,
+    ONBOARDING_SCOPE_TEAMS_WRITE,
+]
+TOKEN_ISSUER_SCOPE = (
+    os.environ.get("TOKEN_ISSUER_SCOPE", "").strip()
+    or " ".join(ONBOARDING_SERVICE_SCOPES)
+)
 _onboarding_service_token_cache = {}
 PROBESTACK_TOKEN_ISSUER = os.environ.get("PROBESTACK_TOKEN_ISSUER", "https://auth.probestack.io")
 _PROBESTACK_TOKEN_AUDIENCE_RAW = os.environ.get("PROBESTACK_TOKEN_AUDIENCE", '["probestack-api", "probestack-ui"]')
@@ -6689,43 +6708,6 @@ def clean_bearer_token(value: Optional[str]) -> Optional[str]:
         token = token[7:].strip()
     return token or None
 
-def get_request_onboarding_context_token(request: Request) -> Optional[str]:
-    header_candidates = [
-        ONBOARDING_API_CONTEXT_HEADER,
-        "X-ProbeStack-Context-Token",
-        "X-Onboarding-Context-Token",
-        "X-Context-Token",
-    ]
-    seen_headers = set()
-    for header_name in header_candidates:
-        normalized_header = header_name.lower()
-        if normalized_header in seen_headers:
-            continue
-        seen_headers.add(normalized_header)
-        token = clean_bearer_token(request.headers.get(header_name))
-        if token:
-            return token
-
-    for cookie_name in ["ps_auth_token", "contextToken", "context_token", "onboarding_context_token"]:
-        token = clean_bearer_token(request.cookies.get(cookie_name))
-        if token:
-            return token
-    return None
-
-def get_forward_auth_headers(request: Request) -> dict:
-    headers = {"Accept": "application/json"}
-    context_token = get_request_onboarding_context_token(request)
-    configured_token = clean_bearer_token(ONBOARDING_API_BEARER_TOKEN)
-    if context_token:
-        headers["Authorization"] = f"Bearer {context_token}"
-    elif configured_token:
-        headers["Authorization"] = f"Bearer {configured_token}"
-    elif ONBOARDING_API_FORWARD_AUTHORIZATION:
-        authorization = request.headers.get("authorization")
-        if authorization:
-            headers["Authorization"] = authorization
-    return headers
-
 def configured_onboarding_service_scope(scopes: Optional[List[str]]) -> Optional[str]:
     if TOKEN_ISSUER_SCOPE:
         return " ".join([scope for scope in TOKEN_ISSUER_SCOPE.split() if scope])
@@ -6876,7 +6858,6 @@ async def get_onboarding_service_token(
     return token
 
 async def get_onboarding_auth_headers(
-    request: Request,
     *,
     organization_id: Optional[str] = None,
     scopes: Optional[List[str]] = None,
@@ -6887,9 +6868,12 @@ async def get_onboarding_auth_headers(
         scopes,
         force_refresh=force_refresh,
     )
-    if service_token:
-        return {"Accept": "application/json", "Authorization": f"Bearer {service_token}"}
-    return get_forward_auth_headers(request)
+    if not service_token:
+        raise HTTPException(
+            status_code=502,
+            detail="Onboarding service token could not be issued; verify token issuer credentials, organization ID, and scopes",
+        )
+    return {"Accept": "application/json", "Authorization": f"Bearer {service_token}"}
 
 def extract_response_detail(response: httpx.Response) -> Any:
     try:
@@ -6917,7 +6901,6 @@ async def onboarding_api_request(
     try:
         async with httpx.AsyncClient(timeout=ONBOARDING_API_TIMEOUT_SECONDS) as client:
             auth_headers = await get_onboarding_auth_headers(
-                request,
                 organization_id=organization_id,
                 scopes=scopes,
                 force_refresh=force_token_refresh,
@@ -6931,7 +6914,6 @@ async def onboarding_api_request(
             )
             if response.status_code == 401 and organization_id and scopes and not force_token_refresh:
                 refreshed_headers = await get_onboarding_auth_headers(
-                    request,
                     organization_id=organization_id,
                     scopes=scopes,
                     force_refresh=True,
@@ -6943,19 +6925,6 @@ async def onboarding_api_request(
                     params={key: value for key, value in (params or {}).items() if value is not None},
                     json=json_payload,
                 )
-                forwarded_headers = get_forward_auth_headers(request)
-                if (
-                    response.status_code == 401
-                    and forwarded_headers.get("Authorization")
-                    and forwarded_headers.get("Authorization") != refreshed_headers.get("Authorization")
-                ):
-                    response = await client.request(
-                        method,
-                        target_url,
-                        headers=forwarded_headers,
-                        params={key: value for key, value in (params or {}).items() if value is not None},
-                        json=json_payload,
-                    )
     except httpx.RequestError as exc:
         logger.warning(f"Onboarding API request failed for {method} {path}: {exc}")
         raise HTTPException(status_code=502, detail="Onboarding API is unavailable")
@@ -6966,7 +6935,7 @@ async def onboarding_api_request(
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "message": "Onboarding auth service authorization failed",
+                    "message": "Onboarding API service-token authorization failed",
                     "upstream_status": response.status_code,
                     "upstream_detail": detail,
                 },
